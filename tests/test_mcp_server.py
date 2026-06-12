@@ -168,6 +168,42 @@ def test_memory_retain_rejects_bad_target(store):
         )
 
 
+def test_empty_string_target_defaults_to_both_stores(store):
+    """MCP clients often send default string fields as '' rather than
+    omitting them. Empty target should mean 'both memory and user'."""
+    from mcp_server import tools
+
+    tools.memory_retain(
+        store,
+        {
+            "contents": ["Postgres + pgvector is great for semantic search."],
+            "target": "memory",
+            "agent_identity": agent_of(store),  # noqa: SLF001
+        },
+    )
+
+    out = tools.memory_recall(
+        store,
+        {
+            "query": "pgvector semantic search",
+            "top_k": 3,
+            "agent_identity": agent_of(store),  # noqa: SLF001
+            "target": "",
+        },
+    )
+    assert out["count"] == 1
+    assert "pgvector" in out["results"][0]["content"]
+
+    count = tools.memory_count(
+        store,
+        {
+            "agent_identity": agent_of(store),  # noqa: SLF001
+            "target": "",
+        },
+    )
+    assert count["memory_entries"] == 1
+
+
 def test_memory_recall_round_trip(store):
     """Retain 3 related docs, recall with a related query, expect top hit
     to be one of the 3."""

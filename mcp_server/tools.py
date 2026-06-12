@@ -101,9 +101,13 @@ def _coerce_agent_identity(args: Dict[str, Any]) -> str:
 
 
 def _coerce_target(args: Dict[str, Any]) -> Optional[str]:
-    """target ∈ {'memory', 'user', None}. Anything else is rejected."""
+    """target ∈ {'memory', 'user', None}. Anything else is rejected.
+    
+    Empty string is treated as None to match MCP clients that send
+    default values as '' rather than omitting the field.
+    """
     t = args.get("target")
-    if t is None:
+    if t is None or (isinstance(t, str) and not t.strip()):
         return None
     if t not in ("memory", "user"):
         raise ValueError(f"target must be 'memory' or 'user' (got {t!r})")
@@ -251,7 +255,7 @@ def memory_search(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
     Returns: {"count": N, "rows": [...], "limit": L, "offset": O}
     """
     agent = args.get("agent_identity")
-    if agent is None:
+    if agent is None or (isinstance(agent, str) and not agent.strip()):
         agent = _coerce_agent_identity(args)
     target = _coerce_target(args)
     limit = int(args.get("limit", 20))
@@ -417,7 +421,7 @@ def memory_count(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
     Returns: {"memory_entries": N, "conversations": M, "agent_identity": ..., "target": ...}
     """
     agent = args.get("agent_identity")
-    if agent is None:
+    if agent is None or (isinstance(agent, str) and not agent.strip()):
         agent = _coerce_agent_identity(args)
     target = _coerce_target(args)
     session_id = args.get("session_id")

@@ -74,6 +74,7 @@ services:
         condition: service_healthy
     environment:
       CMD_PROFILE: mcp
+      PYTHONPATH: /app            # the COPY'd source dirs (pgvector, mcp_server) live here
       MEMORY_PGVECTOR_TRANSPORT: http
       MEMORY_PGVECTOR_DSN: "dbname=hermes_test user=postgres password=postgres host=pg"
       # Default agent_identity for tool calls that don't supply one.
