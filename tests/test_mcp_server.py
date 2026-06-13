@@ -240,6 +240,78 @@ def test_memory_recall_round_trip(store):
         assert -0.01 <= r["score"] <= 1.0
 
 
+def test_memory_hybrid_search_round_trip(store):
+    from mcp_server import tools
+
+    docs = [
+        "Postgres + hexus is great for semantic search.",
+        "The weather in Austin is warm in June.",
+        "Sentence-transformers provides local BERT embeddings.",
+    ]
+    tools.memory_retain(
+        store,
+        {
+            "contents": docs,
+            "agent_identity": agent_of(store),  # noqa: SLF001
+        },
+    )
+
+    out = tools.memory_hybrid_search(
+        store,
+        {
+            "query": "weather in Austin",
+            "top_k": 3,
+            "vector_weight": 0.5,
+            "text_weight": 0.5,
+            "agent_identity": agent_of(store),  # noqa: SLF001
+        },
+    )
+    assert out["count"] >= 1
+    assert "Austin" in out["results"][0]["content"]
+    assert "vector_score" in out["results"][0]
+    assert "text_score" in out["results"][0]
+    assert out["results"][0]["text_score"] > 0.0
+
+
+def test_memory_hybrid_recall_turns_round_trip(store):
+    from mcp_server import tools
+
+    tools.memory_append_turn(
+        store,
+        {
+            "session_id": "session-123",
+            "role": "user",
+            "content": "My favorite database is Postgres.",
+            "agent_identity": agent_of(store),  # noqa: SLF001
+        },
+    )
+    tools.memory_append_turn(
+        store,
+        {
+            "session_id": "session-123",
+            "role": "assistant",
+            "content": "I prefer local BERT embeddings.",
+            "agent_identity": agent_of(store),  # noqa: SLF001
+        },
+    )
+
+    out = tools.memory_hybrid_recall_turns(
+        store,
+        {
+            "query": "favorite database Postgres",
+            "top_k": 2,
+            "vector_weight": 0.5,
+            "text_weight": 0.5,
+            "agent_identity": agent_of(store),  # noqa: SLF001
+        },
+    )
+    assert out["count"] >= 1
+    assert "Postgres" in out["results"][0]["content"]
+    assert "vector_score" in out["results"][0]
+    assert "text_score" in out["results"][0]
+    assert out["results"][0]["text_score"] > 0.0
+
+
 def test_memory_recall_respects_min_similarity(store):
     from mcp_server import tools
 
@@ -584,7 +656,7 @@ class TestMcpWiring:
         mcp = self._server(store)
         cache = self._get_tool_cache(mcp)
         names = set(cache.keys())
-        # The eight tools the server is supposed to expose.
+        # The ten tools the server is supposed to expose.
         assert {
             "memory_health",
             "memory_retain",
@@ -594,6 +666,8 @@ class TestMcpWiring:
             "memory_recall_turns",
             "memory_append_turn",
             "memory_count",
+            "memory_hybrid_search",
+            "memory_hybrid_recall_turns",
         }.issubset(names), f"missing tools: {names - {n for n in names if n.startswith('memory_')}}"
 
     def test_every_tool_has_description_and_input_schema(self, store):

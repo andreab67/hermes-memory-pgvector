@@ -458,3 +458,114 @@ def _row_to_dict(row: Any, *, include_embedding: bool = False) -> Dict[str, Any]
         if hasattr(v, "isoformat"):
             d[k] = v.isoformat()
     return d
+
+
+def memory_hybrid_search(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Blend semantic vector search and full-text search over memory_entries.
+
+    args:
+      query:   str
+      top_k:   int (default 5, cap 100)
+      vector_weight: float (default 0.7)
+      text_weight: float (default 0.3)
+      agent_identity: str | None — if None, search ALL agents
+      target:  'memory' | 'user' | None
+      min_similarity: float ∈ [0, 1] (default 0)
+
+    Returns: {"query": str, "count": N, "results": [{id, agent_identity, target, content, score, vector_score, text_score, metadata, ...}]}
+    """
+    query = args.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
+
+    top_k = int(args.get("top_k", 5))
+    top_k = max(1, min(top_k, 100))
+
+    vector_weight = float(args.get("vector_weight", 0.7))
+    text_weight = float(args.get("text_weight", 0.3))
+
+    agent = args.get("agent_identity")
+    if isinstance(agent, str) and agent.strip() == "":
+        agent = None
+
+    target = _coerce_target(args)
+    min_similarity = float(args.get("min_similarity", 0.0))
+    min_similarity = max(0.0, min(min_similarity, 1.0))
+
+    try:
+        vec = embed(query)
+    except EmbeddingError as exc:
+        return {"query": query, "count": 0, "results": [], "error": str(exc)}
+
+    rows = store.hybrid_search(
+        query_embedding=vec,
+        query_text=query,
+        agent_identity=agent,
+        target=target,
+        limit=top_k,
+        vector_weight=vector_weight,
+        text_weight=text_weight,
+        min_similarity=min_similarity,
+    )
+    return {
+        "query": query,
+        "count": len(rows),
+        "results": [_row_to_dict(r) for r in rows],
+    }
+
+
+def memory_hybrid_recall_turns(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
+    """Blend semantic vector search and full-text search over conversation turns.
+
+    args:
+      query:   str
+      top_k:   int (default 5, cap 100)
+      vector_weight: float (default 0.7)
+      text_weight: float (default 0.3)
+      agent_identity: str | None
+      session_id: str | None
+      min_similarity: float ∈ [0, 1] (default 0)
+
+    Returns: {"query": str, "count": N, "results": [{id, session_id, agent_identity, role, content, score, vector_score, text_score, ts, metadata}]}
+    """
+    query = args.get("query")
+    if not isinstance(query, str) or not query.strip():
+        raise ValueError("query must be a non-empty string")
+
+    top_k = int(args.get("top_k", 5))
+    top_k = max(1, min(top_k, 100))
+
+    vector_weight = float(args.get("vector_weight", 0.7))
+    text_weight = float(args.get("text_weight", 0.3))
+
+    agent = args.get("agent_identity")
+    if isinstance(agent, str) and agent.strip() == "":
+        agent = None
+
+    session_id = args.get("session_id")
+    if isinstance(session_id, str) and session_id.strip() == "":
+        session_id = None
+
+    min_similarity = float(args.get("min_similarity", 0.0))
+    min_similarity = max(0.0, min(min_similarity, 1.0))
+
+    try:
+        vec = embed(query)
+    except EmbeddingError as exc:
+        return {"query": query, "count": 0, "results": [], "error": str(exc)}
+
+    rows = store.hybrid_search_turns(
+        query_embedding=vec,
+        query_text=query,
+        agent_identity=agent,
+        session_id=session_id,
+        limit=top_k,
+        vector_weight=vector_weight,
+        text_weight=text_weight,
+        min_similarity=min_similarity,
+    )
+    return {
+        "query": query,
+        "count": len(rows),
+        "results": [_row_to_dict(r) for r in rows],
+    }

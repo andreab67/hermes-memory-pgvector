@@ -141,6 +141,44 @@ def _build_server(
         )
 
     @mcp.tool()
+    def memory_hybrid_search(
+        query: str,
+        top_k: int = 5,
+        vector_weight: float = 0.7,
+        text_weight: float = 0.3,
+        agent_identity: str = "",
+        target: str = "",
+        min_similarity: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Hybrid search blending semantic vector search and full-text search over memory entries.
+
+        Args:
+          query: the natural-language search query.
+          top_k: 1..100, default 5.
+          vector_weight: weight for semantic similarity (0..1, default 0.7).
+          text_weight: weight for full-text search rank (0..1, default 0.3).
+          agent_identity: scope to one agent, or empty / None to search all.
+          target: 'memory' | 'user' | '' (both).
+          min_similarity: 0..1, default 0. Filter out lower-scored hits.
+
+        Returns: {"query", "count", "results": [{id, agent_identity, target,
+                                                  content, score, vector_score,
+                                                  text_score, metadata, ...}]}
+        """
+        return tools.memory_hybrid_search(
+            store,
+            {
+                "query": query,
+                "top_k": top_k,
+                "vector_weight": vector_weight,
+                "text_weight": text_weight,
+                "agent_identity": agent_identity,
+                "target": target,
+                "min_similarity": min_similarity,
+            },
+        )
+
+    @mcp.tool()
     def memory_search(
         agent_identity: str = "",
         target: str = "",
@@ -208,6 +246,45 @@ def _build_server(
             {
                 "query": query,
                 "top_k": top_k,
+                "agent_identity": agent_identity,
+                "session_id": session_id,
+                "min_similarity": min_similarity,
+            },
+        )
+
+    @mcp.tool()
+    def memory_hybrid_recall_turns(
+        query: str,
+        top_k: int = 5,
+        vector_weight: float = 0.7,
+        text_weight: float = 0.3,
+        agent_identity: str = "",
+        session_id: str = "",
+        min_similarity: float = 0.0,
+    ) -> Dict[str, Any]:
+        """Hybrid search blending semantic vector search and full-text search over conversation turns.
+
+        Args:
+          query: natural-language search.
+          top_k: 1..100, default 5.
+          vector_weight: weight for semantic similarity (0..1, default 0.7).
+          text_weight: weight for full-text search rank (0..1, default 0.3).
+          agent_identity: scope to one agent, or '' / None to search all.
+          session_id: optional — restrict to one session id.
+          min_similarity: 0..1, default 0.
+
+        Returns: {"query", "count", "results": [{id, session_id,
+                                                  agent_identity, role,
+                                                  content, score, vector_score,
+                                                  text_score, ts, ...}]}
+        """
+        return tools.memory_hybrid_recall_turns(
+            store,
+            {
+                "query": query,
+                "top_k": top_k,
+                "vector_weight": vector_weight,
+                "text_weight": text_weight,
                 "agent_identity": agent_identity,
                 "session_id": session_id,
                 "min_similarity": min_similarity,

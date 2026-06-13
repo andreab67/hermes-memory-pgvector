@@ -324,6 +324,102 @@ class MemoryStore:
             rows = [r for r in rows if (r.get("score") or 0) >= min_similarity]
         return rows
 
+    def hybrid_search(
+        self,
+        *,
+        query_embedding: List[float],
+        query_text: str,
+        agent_identity: Optional[str] = None,
+        target: Optional[str] = None,
+        limit: int = 5,
+        vector_weight: float = 0.7,
+        text_weight: float = 0.3,
+        min_similarity: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """Blend semantic vector search and full-text search.
+
+        Uses CTEs to fetch top matches from each, full joins them,
+        and scores via (vector_weight * semantic_score) + (text_weight * text_rank).
+        """
+        if not query_text or not query_text.strip():
+            rows = self.search(
+                query_embedding=query_embedding,
+                agent_identity=agent_identity,
+                target=target,
+                limit=limit,
+                min_similarity=min_similarity,
+            )
+            for r in rows:
+                r["vector_score"] = r["score"]
+                r["text_score"] = 0.0
+                r["score"] = vector_weight * r["score"]
+            return rows
+
+        vec_literal = to_hexus_literal(query_embedding)
+        
+        clauses: List[str] = []
+        params: List[Any] = []
+        if agent_identity:
+            clauses.append("agent_identity = %s")
+            params.append(agent_identity)
+        if target:
+            clauses.append("target = %s")
+            params.append(target)
+            
+        where = ("AND " + " AND ".join(clauses)) if clauses else ""
+
+        sql = f"""
+        WITH vector_search AS (
+            SELECT id, agent_identity, target, content, created_at, updated_at, metadata,
+                   1 - (embedding <=> %s::vector) AS vector_score
+            FROM memory_entries
+            WHERE 1=1 {where}
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        ),
+        text_search AS (
+            SELECT id, agent_identity, target, content, created_at, updated_at, metadata,
+                   ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', %s)) AS text_score
+            FROM memory_entries
+            WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', %s)
+              {where}
+            ORDER BY text_score DESC
+            LIMIT %s
+        )
+        SELECT COALESCE(v.id, t.id) AS id,
+               COALESCE(v.agent_identity, t.agent_identity) AS agent_identity,
+               COALESCE(v.target, t.target) AS target,
+               COALESCE(v.content, t.content) AS content,
+               COALESCE(v.created_at, t.created_at) AS created_at,
+               COALESCE(v.updated_at, t.updated_at) AS updated_at,
+               COALESCE(v.metadata, t.metadata) AS metadata,
+               COALESCE(v.vector_score, 0.0) AS vector_score,
+               COALESCE(t.text_score, 0.0) AS text_score,
+               (%s * COALESCE(v.vector_score, 0.0)) + (%s * COALESCE(t.text_score, 0.0)) AS score
+        FROM vector_search v
+        FULL OUTER JOIN text_search t ON v.id = t.id
+        ORDER BY score DESC
+        LIMIT %s
+        """
+
+        v_params = [vec_literal]
+        for p in params:
+            v_params.append(p)
+        v_params.extend([vec_literal, limit])
+        
+        t_params = [query_text, query_text] + params + [limit]
+        
+        all_params = v_params + t_params + [vector_weight, text_weight, limit]
+
+        with self._get_pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, all_params)
+                rows = list(cur.fetchall())
+
+        if min_similarity > 0:
+            rows = [r for r in rows if (r.get("score") or 0) >= min_similarity]
+        return rows
+
     # -- Bulk import from MEMORY.md / USER.md (v0.1.1) ----------------------
 
     # Matches tools/memory_tool.py:ENTRY_DELIMITER. Keep in sync if upstream
@@ -466,6 +562,97 @@ class MemoryStore:
                     """,
                     [vec_literal, *params, vec_literal, limit],
                 )
+                rows = list(cur.fetchall())
+
+        if min_similarity > 0:
+            rows = [r for r in rows if (r.get("score") or 0) >= min_similarity]
+        return rows
+
+    def hybrid_search_turns(
+        self,
+        *,
+        query_embedding: List[float],
+        query_text: str,
+        agent_identity: Optional[str] = None,
+        session_id: Optional[str] = None,
+        limit: int = 5,
+        vector_weight: float = 0.7,
+        text_weight: float = 0.3,
+        min_similarity: float = 0.0,
+    ) -> List[Dict[str, Any]]:
+        """Blend semantic vector search and full-text search over conversation turns."""
+        if not query_text or not query_text.strip():
+            rows = self.search_turns(
+                query_embedding=query_embedding,
+                agent_identity=agent_identity,
+                session_id=session_id,
+                limit=limit,
+                min_similarity=min_similarity,
+            )
+            for r in rows:
+                r["vector_score"] = r["score"]
+                r["text_score"] = 0.0
+                r["score"] = vector_weight * r["score"]
+            return rows
+
+        vec_literal = to_hexus_literal(query_embedding)
+        clauses: List[str] = []
+        params: List[Any] = []
+        if agent_identity:
+            clauses.append("agent_identity = %s")
+            params.append(agent_identity)
+        if session_id:
+            clauses.append("session_id = %s")
+            params.append(session_id)
+            
+        where = ("AND " + " AND ".join(clauses)) if clauses else ""
+
+        sql = f"""
+        WITH vector_search AS (
+            SELECT id, session_id, agent_identity, role, content, ts, metadata,
+                   1 - (embedding <=> %s::vector) AS vector_score
+            FROM conversations
+            WHERE 1=1 {where}
+            ORDER BY embedding <=> %s::vector
+            LIMIT %s
+        ),
+        text_search AS (
+            SELECT id, session_id, agent_identity, role, content, ts, metadata,
+                   ts_rank(to_tsvector('english', content), websearch_to_tsquery('english', %s)) AS text_score
+            FROM conversations
+            WHERE to_tsvector('english', content) @@ websearch_to_tsquery('english', %s)
+              {where}
+            ORDER BY text_score DESC
+            LIMIT %s
+        )
+        SELECT COALESCE(v.id, t.id) AS id,
+               COALESCE(v.session_id, t.session_id) AS session_id,
+               COALESCE(v.agent_identity, t.agent_identity) AS agent_identity,
+               COALESCE(v.role, t.role) AS role,
+               COALESCE(v.content, t.content) AS content,
+               COALESCE(v.ts, t.ts) AS ts,
+               COALESCE(v.metadata, t.metadata) AS metadata,
+               COALESCE(v.vector_score, 0.0) AS vector_score,
+               COALESCE(t.text_score, 0.0) AS text_score,
+               (%s * COALESCE(v.vector_score, 0.0)) + (%s * COALESCE(t.text_score, 0.0)) AS score
+        FROM vector_search v
+        FULL OUTER JOIN text_search t ON v.id = t.id
+        ORDER BY score DESC
+        LIMIT %s
+        """
+
+        v_params = [vec_literal]
+        for p in params:
+            v_params.append(p)
+        v_params.extend([vec_literal, limit])
+        
+        t_params = [query_text, query_text] + params + [limit]
+        
+        all_params = v_params + t_params + [vector_weight, text_weight, limit]
+
+        with self._get_pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, all_params)
                 rows = list(cur.fetchall())
 
         if min_similarity > 0:

@@ -69,6 +69,10 @@ CREATE INDEX IF NOT EXISTS ix_memory_entries_embedding_hnsw
   ON memory_entries USING hnsw (embedding vector_cosine_ops)
   WITH (m = 16, ef_construction = 64);
 
+-- Full-text search index for hybrid search
+CREATE INDEX IF NOT EXISTS ix_memory_entries_content_tsvector
+  ON memory_entries USING gin (to_tsvector('english', content));
+
 
 -- ---------------------------------------------------------------------------
 -- conversations
@@ -100,3 +104,7 @@ CREATE INDEX IF NOT EXISTS ix_conversations_agent_ts
 CREATE INDEX IF NOT EXISTS ix_conversations_embedding_hnsw
   ON conversations USING hnsw (embedding vector_cosine_ops)
   WITH (m = 16, ef_construction = 64);
+
+-- Full-text search index for hybrid search
+CREATE INDEX IF NOT EXISTS ix_conversations_content_tsvector
+  ON conversations USING gin (to_tsvector('english', content));
