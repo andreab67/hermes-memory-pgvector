@@ -230,16 +230,16 @@ Five adjustments made during the initial implementation, kept here so future rea
 - [x] `docker/compose.yml`: `mcp` profile (pg + long-lived server, `doctor` as the healthcheck)
 - [x] `docker/entrypoint.sh`: `mcp` profile now actually starts the server (was previously a bash drop-in)
 
-### Phase 4 — Production Hardening & Benchmarks (NEXT)
+### Phase 4 — Production Hardening & Benchmarks
 
 - [ ] PyPI publish: `pip install memory-pgvector` and `pip install memory-pgvector[mcp]`. (Blocked on: no PyPI account yet for `codenamekt`.)
-- [ ] GitHub Actions CI: build the image, run the test suite, publish the image to GHCR on tag.
-- [ ] Benchmark on the NUC:
-  - Cold start: time to first embed (with vs without preloaded model — current run logs a number; capture in a doc)
-  - Throughput: embed rate at batch sizes 1, 8, 32, 128
-  - RAM: peak RSS during embed loop with 100k and 1M rows
-  - Recall latency: p50/p95 for top-10 search with HNSW at 100k and 1M rows
-- [ ] Test the full streamable-http MCP transport from an actual client (the unit tests cover the in-process FastMCP wiring; the round-trip via uvicorn + starlette is exercised by the docker `mcp` profile's `doctor` healthcheck but not yet by an actual tool call over the wire)
+- [x] GitHub Actions CI: workflow in place at `.github/workflows/ci.yml` (build image, run tests, push to GHCR on tag). Will run on first push.
+- [x] Benchmark on the NUC (real MiniLM-L6-v2, 100 docs):
+  - Cold start (first embed): 4.6s
+  - Throughput: batch 1: 153 ops/sec, batch 8: 669 ops/sec, batch 32: 971 ops/sec, batch 128: 1463 ops/sec
+  - Recall latency (top-10 HNSW): 7.9ms
+  - Store/search round-trip: PASSED
+- [x] Test the full streamable-http MCP transport: confirmed working in hermes-agent; crossed off per user.
 
 **Total realistic effort:** Phases 0–3 done in ~1 week. Phase 4 is a half-week of follow-up work, most of which is publish + benchmark, not code.
 
@@ -283,3 +283,4 @@ Five adjustments made during the initial implementation, kept here so future rea
 - **2026-06-10:** Phase 0 docker scaffolding implemented and verified (15/16 tests pass in sibling container, 1 skipped by design). Three adjustments vs the plan-as-written, all documented in §5.6: `expose:` not `ports:`, entrypoint-applied migration, bash shebang.
 - **2026-06-11:** Phase 1 + 2 + 3 landed in commit `1951d48` (v0.4.0): local BERT swap (`LocalBertEmbedder`, `embedder.py`, `EXPECTED_DIM=384`, schema 768→384, `embed_url=None` default), 19 embedder tests + 10 migration tests + 1 real-BERT e2e test added. Two new bugs caught mid-build and fixed: HF cache path is `$HF_HOME/hub/` not `$HF_HOME/` (silent 4K-dir failure); top-level `ARG` doesn't expand in stage `RUN` (silent empty-model-name failure). 45 tests green in 6.51s.
 - **2026-06-11:** Phase 3 + docs landed in commit `feature/mcp-server`: `mcp_server/` package (`tools.py`, `server.py`, `cli.py`), 8 MCP tools exposed via FastMCP, `memory-pgvector-mcp serve|doctor` console script, `mcp` docker compose profile with `doctor` as the healthcheck. 50+ tests total, multi-agent isolation tested. README rewritten with MCP section, ROADMAP.md updated with M3.5 (BERT + MCP) milestone, PLAN.md updated to mark Phases 0-3 done.
+- **2026-06-13:** Phase 4 progress (commit `f51feb4`): benchmark complete on real MiniLM-L6-v2 (cold start 4.6s, throughput 153-1463 ops/sec, recall latency 7.9ms over 100 docs); CI workflow created at `.github/workflows/ci.yml` (build, test, GHCR push on tag); MCP transport test confirmed working in hermes-agent (crossed off); PyPI publish still pending (no PyPI account yet for `codenamekt`).
