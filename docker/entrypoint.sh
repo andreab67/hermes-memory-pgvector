@@ -42,11 +42,11 @@ wait_for_tcp() {
 
 wait_for_schema() {
     dsn="$1"
-    log "waiting for schema (memory_entries and delegations tables) ..."
+    log "waiting for schema (memory_entries and conversations tables) ..."
     i=0
     while [ "$i" -lt 60 ]; do
         if psql "$dsn" -tAc "SELECT to_regclass('memory_entries')" 2>/dev/null | grep -q memory_entries; then
-            if psql "$dsn" -tAc "SELECT to_regclass('delegations')" 2>/dev/null | grep -q delegations; then
+            if psql "$dsn" -tAc "SELECT to_regclass('conversations')" 2>/dev/null | grep -q conversations; then
                 log "schema ready after ${i}s"
                 return 0
             fi
@@ -74,12 +74,8 @@ apply_migration() {
 case "$PROFILE" in
     test)
         wait_for_tcp "$PG_TEST_HOST" "$PG_TEST_PORT"
-        # Apply migrations if not already applied.
-        if psql "$PG_TEST_DSN" -tAc "SELECT to_regclass('delegations')" 2>/dev/null | grep -q delegations; then
-            log "schema already applied"
-        else
-            apply_migration "$PG_TEST_DSN"
-        fi
+        # Apply migrations (fully idempotent)
+        apply_migration "$PG_TEST_DSN"
         log "running pytest"
         exec pytest tests/ -v --tb=short
         ;;
@@ -92,12 +88,8 @@ case "$PROFILE" in
         # use the same psql -f path the test profile uses, since we
         # have admin creds via PG_TEST_DSN anyway).
         wait_for_tcp "$PG_TEST_HOST" "${PG_MCP_PORT:-5432}"
-        if psql "${HEXUS_DSN:-$PG_TEST_DSN}" -tAc "SELECT to_regclass('delegations')" 2>/dev/null | grep -q delegations; then
-            log "schema already applied"
-        else
-            log "applying migrations to MCP DB"
-            apply_migration "${HEXUS_DSN:-$PG_TEST_DSN}"
-        fi
+        # Apply migrations (fully idempotent)
+        apply_migration "${HEXUS_DSN:-$PG_TEST_DSN}"
         log "starting MCP server (transport=${HEXUS_TRANSPORT:-http})"
         exec hexus-mcp serve \
             --transport "${HEXUS_TRANSPORT:-http}" \
