@@ -37,11 +37,32 @@ import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-from agent.memory_provider import MemoryProvider
-from tools.registry import tool_error
-from hermes_cli.config import cfg_get
+try:
+    from agent.memory_provider import MemoryProvider
+    from tools.registry import tool_error
+    from hermes_cli.config import cfg_get
+except ImportError:  # pragma: no cover
+    # Standalone context (the `python -m pgvector` CLI / unit tests) — hermes-agent
+    # is not importable. Provide minimal fallbacks so the package still imports;
+    # the provider class is never instantiated outside the agent, only the store/
+    # embed/identity helpers + the maintenance CLI are used here.
+    MemoryProvider = object  # type: ignore[assignment,misc]
+
+    def tool_error(msg: str) -> str:  # type: ignore[misc]
+        return json.dumps({"error": msg})
+
+    def cfg_get(data, *keys, default=None):  # type: ignore[misc]
+        cur = data
+        for k in keys:
+            if not isinstance(cur, dict):
+                return default
+            cur = cur.get(k)
+            if cur is None:
+                return default
+        return cur
 
 from .embed import embed, EmbeddingError
+from .identity import classify_kind, normalize_identity
 from .store import MemoryStore
 from .writer import AsyncWriter, _PendingWrite
 
@@ -167,6 +188,16 @@ DEFAULTS = {
     # v0.2 — conversation turn capture
     "sync_turns": True,
     "turn_min_chars": 40,  # turns shorter than this are noise unless > 200 chars or contain tool refs
+    # v0.4 — identity governance
+    "allowed_themes": None,        # None/empty = governance off; set a list to enforce an allow-list
+    "identity_aliases": {},        # {raw: canonical} remaps applied before normalization
+    "bench_mode": "bucket",        # 'bucket' -> _bench (isolated) | 'reject' -> default
+    # v0.4 — conversation embedding policy + TTL
+    "conversation_embed_policy": "all",   # all | substantive_only | none
+    "ttl_days": 0,                 # 0 = TTL off; prune is CLI-only regardless of this value
+    # v0.4 — writer-path embed retries (hot path stays single-attempt)
+    "embed_write_retries": 2,
+    "embed_write_backoff": 0.1,
 }
 
 
@@ -196,8 +227,11 @@ class PgvectorMemoryProvider(MemoryProvider):
         self._store: Optional[MemoryStore] = None
         self._writer: Optional[AsyncWriter] = None
         self._agent_identity: str = "default"
+        self._raw_identity: str = "default"          # pre-normalization (for metadata/trace)
+        self._parent_session_id: Optional[str] = None
         self._session_id: str = ""
         self._healthy: bool = False
+        self._delegation_enabled: bool = False        # set in initialize() iff migration 002 applied
         self._embed_warned: bool = False
 
     @property
@@ -240,6 +274,27 @@ class PgvectorMemoryProvider(MemoryProvider):
             or "default"
         )
 
+        # v0.4 identity governance — normalize the resolved identity ONCE, here,
+        # AFTER the priority chain (so a typo'd header still reaches the allow-list)
+        # and never at read time (rows keep their historical identity, else they
+        # become unrecallable). Strips PII/cardinality DM keys, isolates bench
+        # traffic, and enforces the optional allow-list. See identity.py.
+        self._raw_identity = self._agent_identity
+        canonical, normalized, reason = normalize_identity(
+            self._agent_identity,
+            allowed_themes=self._config.get("allowed_themes"),
+            aliases=self._config.get("identity_aliases") or {},
+            bench_mode=self._config.get("bench_mode", "bucket"),
+        )
+        if normalized:
+            logger.info(
+                "pgvector identity normalized: %r -> %r (%s)",
+                self._raw_identity, canonical, reason,
+            )
+        self._agent_identity = canonical
+        # Parent-session linkage for delegation traceback (subagents only).
+        self._parent_session_id = kwargs.get("parent_session_id") or None
+
         # Re-initialization guard (v0.3.1): one registered provider instance
         # can have initialize() called again for a new session — the gateway
         # reuses the registered provider rather than constructing a fresh one
@@ -276,6 +331,32 @@ class PgvectorMemoryProvider(MemoryProvider):
             self._worker,
             maxsize=int(self._config.get("write_queue_maxsize", 256)),
         )
+
+        # v0.4: agent attribution + delegation require migration 002. Probe it
+        # SEPARATELY from ensure_schema() (which stays 001-only) so a v0.4 binary
+        # on a not-yet-migrated v0.3 schema runs degraded — the delegation hooks
+        # become no-ops — instead of crashing at the first write.
+        self._delegation_enabled = False
+        if self._healthy and self._store is not None:
+            try:
+                self._delegation_enabled = self._store.ensure_migration_002_applied()
+            except Exception:  # noqa: BLE001
+                self._delegation_enabled = False
+            if not self._delegation_enabled:
+                logger.info(
+                    "pgvector: migration 002 not applied — agent attribution/"
+                    "delegation disabled (apply 002_agent_attribution.sql to enable)"
+                )
+            else:
+                # Register this agent in the provenance registry (best-effort, async).
+                self._writer.enqueue(
+                    action="register_agent",
+                    agent_identity=self._agent_identity,
+                    target="memory_agents",
+                    content="",
+                    extra={"kind": classify_kind(self._agent_identity)},
+                    metadata={},
+                )
 
         # v0.1.1: bulk import existing MEMORY.md / USER.md content so the
         # plugin sees pre-plugin entries + direct file edits, not just the
@@ -382,19 +463,29 @@ class PgvectorMemoryProvider(MemoryProvider):
 
         sid = session_id or self._session_id or "default"
         min_chars = int(self._config.get("turn_min_chars", 40))
+        policy = self._config.get("conversation_embed_policy", "all")
+        psid = self._parent_session_id if self._delegation_enabled else None
 
         for role, content in (("user", user_content), ("assistant", assistant_content)):
             if not content:
                 continue
             if self._is_noise(content, min_chars=min_chars):
                 continue
+            meta = {"session_id": sid}
+            if self._raw_identity != self._agent_identity:
+                meta["raw_identity"] = self._raw_identity
             self._writer.enqueue(
                 action="turn",
                 agent_identity=self._agent_identity,
                 target="conversations",  # synthetic; worker dispatches on action
                 content=content,
-                extra={"role": role, "session_id": sid},
-                metadata={"session_id": sid},
+                extra={
+                    "role": role,
+                    "session_id": sid,
+                    "embed": self._should_embed_turn(role, content, policy),
+                    "parent_session_id": psid,
+                },
+                metadata=meta,
             )
 
     @staticmethod
@@ -408,6 +499,90 @@ class PgvectorMemoryProvider(MemoryProvider):
         if _NOISE_RE.match(stripped):
             return True
         return False
+
+    @staticmethod
+    def _should_embed_turn(role: str, content: str, policy: str) -> bool:
+        """Whether to embed a captured turn, per conversation_embed_policy.
+
+        'all' (default) embeds every turn that already passed the noise filter
+        — recall-safe. 'substantive_only' embeds user turns + assistant turns
+        >= 120 chars (skips short acks/replies to cap HNSW growth). 'none'
+        stores text-only (conversation recall disabled). The turn is ALWAYS
+        stored regardless; this only controls embedding.
+        """
+        if policy == "none":
+            return False
+        if policy == "substantive_only":
+            return role == "user" or len(content or "") >= 120
+        return True
+
+    # -- Agent attribution + delegation hooks (v0.4 — M4) -------------------
+
+    def on_delegation(self, task: str, result: str, **kwargs) -> None:
+        """Parent-side capture of a subagent delegation (task -> result).
+
+        Records a provenance edge (memory_agent_edges) and stores the
+        delegation as a recallable conversation turn under the parent's theme,
+        linked to the child session via parent_session_id. STRICTLY non-blocking
+        and fail-soft (invariants #2/#4): enqueue-only, never an inline DB/embed
+        call, never raises into the agent loop. No-op until migration 002 is
+        applied (self._delegation_enabled)."""
+        if not self._healthy or not self._writer or not self._delegation_enabled:
+            return
+        try:
+            child_identity = kwargs.get("child_identity") or kwargs.get("agent_identity")
+            child_session_id = kwargs.get("child_session_id") or kwargs.get("session_id")
+            self._writer.enqueue(
+                action="edge",
+                agent_identity=self._agent_identity,
+                target="memory_agent_edges",
+                content="",
+                extra={
+                    "parent_identity": self._agent_identity,
+                    "child_identity": child_identity,
+                    "parent_session_id": self._session_id,
+                    "child_session_id": child_session_id,
+                    "kind": "delegated",
+                    "attrs": {"task": (task or "")[:500], "result_chars": len(result or "")},
+                },
+                metadata={},
+            )
+            # Store the delegation as a searchable turn under the parent theme.
+            combined = f"[delegation] task: {task}\nresult: {result}".strip()
+            if combined and not self._is_noise(combined, min_chars=1):
+                policy = self._config.get("conversation_embed_policy", "all")
+                self._writer.enqueue(
+                    action="turn",
+                    agent_identity=self._agent_identity,
+                    target="conversations",
+                    content=combined[:8000],
+                    extra={
+                        "role": "assistant",
+                        "session_id": self._session_id or "default",
+                        "embed": self._should_embed_turn("assistant", combined, policy),
+                        "parent_session_id": child_session_id,
+                    },
+                    metadata={"kind": "delegation", "child_session_id": child_session_id},
+                )
+        except Exception as exc:  # noqa: BLE001 — never escape into the agent loop
+            logger.debug("pgvector on_delegation failed (ignored): %s", exc)
+
+    def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
+        """Best-effort: bump this agent's last_seen in the registry. Fail-soft,
+        non-blocking. No LLM summary (invariant #2). No-op until 002 applied."""
+        if not self._healthy or not self._writer or not self._delegation_enabled:
+            return
+        try:
+            self._writer.enqueue(
+                action="register_agent",
+                agent_identity=self._agent_identity,
+                target="memory_agents",
+                content="",
+                extra={"kind": classify_kind(self._agent_identity)},
+                metadata={},
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("pgvector on_session_end failed (ignored): %s", exc)
 
     # -- Built-in memory mirror (THE main integration point) ----------------
 
@@ -436,6 +611,10 @@ class PgvectorMemoryProvider(MemoryProvider):
 
         meta = dict(metadata or {})
         meta.setdefault("session_id", self._session_id)
+        if self._delegation_enabled and self._parent_session_id:
+            meta.setdefault("parent_session_id", self._parent_session_id)
+        if self._raw_identity != self._agent_identity:
+            meta.setdefault("raw_identity", self._raw_identity)
         old_text = meta.get("old_text") or meta.get("replaces")
 
         self._writer.enqueue(
@@ -506,7 +685,7 @@ class PgvectorMemoryProvider(MemoryProvider):
             elif item.action == "turn":
                 role = item.extra.get("role") or "user"
                 sid = item.extra.get("session_id") or "default"
-                vec = self._maybe_embed(item.content)
+                vec = self._maybe_embed(item.content) if item.extra.get("embed", True) else None
                 self._store.append_turn(
                     session_id=sid,
                     agent_identity=item.agent_identity,
@@ -514,6 +693,21 @@ class PgvectorMemoryProvider(MemoryProvider):
                     content=item.content,
                     embedding=vec,
                     metadata=item.metadata,
+                    parent_session_id=item.extra.get("parent_session_id"),
+                )
+            elif item.action == "register_agent":
+                self._store.register_agent(
+                    agent_identity=item.agent_identity,
+                    kind=item.extra.get("kind", "theme"),
+                )
+            elif item.action == "edge":
+                self._store.record_delegation(
+                    parent_identity=item.extra.get("parent_identity"),
+                    child_identity=item.extra.get("child_identity"),
+                    parent_session_id=item.extra.get("parent_session_id"),
+                    child_session_id=item.extra.get("child_session_id"),
+                    kind=item.extra.get("kind", "delegated"),
+                    attrs=item.extra.get("attrs") or {},
                 )
         except Exception as exc:  # noqa: BLE001
             logger.debug(
@@ -773,6 +967,33 @@ class PgvectorMemoryProvider(MemoryProvider):
                 "description": "Turns shorter than this (after strip) are treated as boilerplate and skipped",
                 "default": str(DEFAULTS["turn_min_chars"]),
             },
+            {
+                "key": "allowed_themes",
+                "description": "v0.4 identity governance: optional allow-list of theme names. Empty/unset = allow any. When set, an unknown X-Hermes-Session-Key falls back to 'default' with a one-time warning (the whatsapp-dm / _bench / default sinks are always permitted).",
+                "default": "",
+            },
+            {
+                "key": "bench_mode",
+                "description": "v0.4: how to handle benchmark identities (skill-bench, *-bench): 'bucket' isolates them to the '_bench' theme; 'reject' drops them to 'default'.",
+                "default": DEFAULTS["bench_mode"],
+                "choices": ["bucket", "reject"],
+            },
+            {
+                "key": "conversation_embed_policy",
+                "description": "v0.4: which captured turns get an embedding. 'all' (recall-safe; every turn that passed the noise filter) | 'substantive_only' (user turns + assistant turns >=120 chars; caps HNSW growth) | 'none' (text-only, conversation recall disabled).",
+                "default": DEFAULTS["conversation_embed_policy"],
+                "choices": ["all", "substantive_only", "none"],
+            },
+            {
+                "key": "ttl_days",
+                "description": "v0.4: advisory retention window for conversations (memory_entries are NEVER pruned). 0 = off. Pruning only ever happens when an operator runs `python -m pgvector prune` — this value is the default for that command, never an automatic background delete.",
+                "default": str(DEFAULTS["ttl_days"]),
+            },
+            {
+                "key": "embed_write_retries",
+                "description": "v0.4: bounded embed retries on the background writer path ONLY (the hot path — prefetch/recall/sync — always uses a single attempt). Durable recovery of missed embeddings is the `python -m pgvector backfill` sweep, not inline retries.",
+                "default": str(DEFAULTS["embed_write_retries"]),
+            },
         ]
 
     def save_config(self, values: Dict[str, Any], hermes_home: str) -> None:
@@ -797,10 +1018,16 @@ class PgvectorMemoryProvider(MemoryProvider):
         if not self._config.get("embed_on_write", True):
             return None
         try:
+            # This runs ONLY in the background AsyncWriter drain thread, so a
+            # bounded retry here is safe (it never blocks the agent loop). The
+            # hot-path callers (prefetch / recall tools / sync_turn) call embed()
+            # with the default retries=0.
             return embed(
                 content,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
+                retries=int(self._config.get("embed_write_retries", 2)),
+                backoff=float(self._config.get("embed_write_backoff", 0.1)),
             )
         except EmbeddingError as exc:
             if not self._embed_warned:

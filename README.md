@@ -62,6 +62,17 @@ connection slots. Fixed by:
    `max_idle=30s` / `max_lifetime=300s`, so connections are short-lived when idle and pooled only
    under active load.
 
+## New in v0.4.0
+
+Four capabilities, all storage-layer (still no LLM in the hot path):
+
+- **Identity governance.** The resolved `agent_identity` is normalized once at init: direct-message session keys like `agent:main:whatsapp:dm:<phone>` collapse to a single `whatsapp-dm` bucket (no PII, no per-contact theme explosion), benchmark traffic (`skill-bench*`) is isolated to `_bench`, and an optional `allowed_themes` allow-list routes typo'd/unknown themes to `default`. The M3 resolution priority is preserved — normalization runs *after* the chain, never at read time. See [`pgvector/identity.py`](pgvector/identity.py).
+- **Agent attribution + delegation (M4).** Migration `002` adds `memory_agents` (registry) and `memory_agent_edges` (parent→child delegation provenance) plus `conversations.parent_session_id`. The `on_delegation` / `on_session_end` hooks capture which agent delegated what to whom — strictly enqueue-only and fail-soft. **Provenance only** (who/when), never a fact-store ontology. Query it via the `v_agent_memory` view.
+- **Embedding backfill + writer resilience.** Rows written text-only during an embed-endpoint outage are no longer permanently unsearchable: `python -m pgvector backfill` re-embeds `NULL`-embedding rows (idempotent, 768-dim-guarded). The background writer gains a small bounded retry; the hot path stays single-attempt.
+- **Conversation TTL + embed policy.** `python -m pgvector prune --days N` trims old turns (operator-triggered only; `memory_entries` are never pruned). `conversation_embed_policy` (`all` default / `substantive_only` / `none`) tunes embedding cost.
+
+Maintenance CLI (`python -m pgvector`, installed as `hermes-pgvector`): `migrate · stats · backfill · prune · cleanup · remap` — destructive commands default to dry-run. v0.4.0 is a clean upgrade from v0.3.x: apply migration `002` to light up attribution/delegation; without it the new hooks no-op and everything else runs unchanged.
+
 ## Multi-agent / per-minion themes
 
 Each systemd-run minion sets one header on its OpenAI client; everything else flows automatically:
@@ -76,10 +87,13 @@ client = AsyncOpenAI(
 
 The gateway plumbs `X-Hermes-Session-Key` through as `gateway_session_key=…` in `MemoryProvider.initialize` kwargs. The plugin reads it with **priority over the profile default**, so `agent_identity='default'` from unprofiled API traffic does not collapse every minion into one shared scope.
 
-Convention: lowercase, dash-separated, stable. Examples that work well:
+Convention: lowercase, dash-separated, stable. Active themes in this deployment:
 
-- `marketing`, `sales`, `morning-report`, `incident`
-- `intraday-<agent_name>` for fan-out workers (e.g. `intraday-trading`, `intraday-sre`, `intraday-marketing`)
+- product/report themes: `marketing`, `sales`, `morning-report`, `morning-report-sr`, `sr-marketing`, `sr-cloud`
+- per-worker minions: `agent-trading`, `agent-sre`, `agent-marketing`, `agent-gitlab`, `agent-cloud`, `agent-hermes`
+- governed sinks (v0.4): `whatsapp-dm` (collapsed DM/session keys), `_bench` (benchmark traffic), `default` (last resort)
+
+Set `plugins.pgvector.allowed_themes` to that product/worker list to enforce it — an unknown or typo'd header then falls back to `default` (with a one-time warning) instead of silently minting a new theme.
 
 ## Install
 
@@ -115,7 +129,14 @@ cp -r pgvector ~/.hermes/plugins/pgvector
 sudo -u postgres psql -d <your-memory-db> \
      -f ~/.hermes/plugins/pgvector/migrations/001_schema.sql
 
-# Hand ownership of the new tables to the hermes runtime role
+# v0.4.0: apply the agent-attribution migration too (adds memory_agents /
+# memory_agent_edges / conversations.parent_session_id and the GRANTs the
+# runtime role needs — it self-grants, so no extra OWNER step for these).
+sudo -u postgres psql -d <your-memory-db> \
+     -f ~/.hermes/plugins/pgvector/migrations/002_agent_attribution.sql
+# (or apply every migration in order:  hermes-pgvector migrate --admin-dsn "user=postgres host=/var/run/postgresql dbname=<your-memory-db>")
+
+# Hand ownership of the v0.1 tables to the hermes runtime role
 sudo -u postgres psql -d <your-memory-db> -c "
 ALTER TABLE memory_entries OWNER TO hermes;
 ALTER SEQUENCE memory_entries_id_seq OWNER TO hermes;
@@ -147,6 +168,12 @@ plugins:
     bulk_sync_on_init: true
     sync_turns: true
     turn_min_chars: 40
+    # --- v0.4 identity governance + maintenance ---
+    allowed_themes: []            # empty = governance off; a list enforces an allow-list
+    bench_mode: "bucket"          # bucket -> _bench | reject -> default
+    conversation_embed_policy: "all"   # all | substantive_only | none
+    ttl_days: 0                   # 0 = off; only `pgvector prune` ever deletes (never automatic)
+    embed_write_retries: 2        # writer-path only; hot path stays single-attempt
 ```
 
 The embed endpoint can be any OpenAI-compatible `/v1/embeddings` or Ollama-native `/api/embed` URL that returns **768-dim vectors** (the schema is hard-coded to `vector(768)` to match `nomic-embed-text`). Use a different model only if it produces 768-dim output, or edit the migration before applying it.
@@ -203,8 +230,8 @@ See [`ROADMAP.md`](ROADMAP.md) for the full milestone table. Highlights:
 - **M1 (v0.1, v0.1.1)** ✅ Shared storage with per-agent themes, async writer, connection pool, bulk import from `MEMORY.md`/`USER.md`
 - **M2 (v0.2)** ✅ Conversation transcript table with `sync_turn` capture + `recall_conversation` tool
 - **M3 (v0.3)** ✅ Identity propagation for stateless API minions via `X-Hermes-Session-Key`
-- **M4 (v0.4)** ⏳ `on_delegation()` + `on_session_end()` capture for agent-of-agents observability
-- **M5 (v0.5–v0.6)** ⏳ TTL/decay, partial HNSW indexes per-theme, metrics, bulk-import CLI
+- **M4 (v0.4)** ✅ Identity governance + `on_delegation()`/`on_session_end()` capture + agent attribution (`memory_agents`/`memory_agent_edges`), embedding backfill, conversation TTL, maintenance CLI
+- **M5 (v0.5–v0.6)** ⏳ Decay scoring, partial HNSW indexes per-theme, Prometheus metrics, cross-provider bulk-import
 - **M6 (v1.0)** ⏳ Stable config schema, full docs, CI coverage
 
 The roadmap exists so the multi-agent positioning isn't a one-off claim — each milestone has to pass the test *"does this make N cooperating agents more capable?"* before it lands. The `What's not on the roadmap` section in `ROADMAP.md` lists what was deliberately rejected (LLM-mediated dialectic, fact-store ontologies, background derivers, in-plugin RBAC) so the boundaries are explicit.

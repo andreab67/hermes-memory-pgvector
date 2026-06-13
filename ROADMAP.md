@@ -73,7 +73,9 @@ The plugin is built around a clear separation of concerns:
 
 ---
 
-### M4 — Agent-of-agents observability (v0.4) ⏳ PROPOSED
+### M4 — Identity governance + agent-of-agents observability (v0.4.0) ✅ DONE
+
+Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolation, allow-list), an embedding backfill sweep + writer retry, conversation TTL/embed-policy, and the `python -m pgvector` maintenance CLI. `on_delegation` + `on_session_end` capture parent→child delegations into `memory_agents` / `memory_agent_edges` (provenance only). A dedicated `recall_delegation` tool was **deferred** — delegations are stored as conversation turns and surface through the existing `recall_conversation` tool, so a separate tool wasn't needed to ship the capability.
 
 **Goal:** when one minion delegates to another (subagent pattern), capture the task/result pair so the parent can recall "what did I ask my research subagent last week and what did it find."
 

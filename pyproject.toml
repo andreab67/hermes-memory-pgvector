@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-pgvector"
-version = "0.3.1"
-description = "Postgres + pgvector memory provider plugin for hermes-agent. Multi-agent storage layer with per-minion themes, async writer, no LLM in the memory hot path."
+version = "0.4.0"
+description = "Postgres + pgvector memory provider plugin for hermes-agent. Multi-agent storage layer with per-minion themes, identity governance, agent attribution + delegation provenance, async writer, no LLM in the memory hot path."
 readme = "README.md"
 requires-python = ">=3.11"
 license = { text = "BSD-3-Clause" }
@@ -48,6 +48,11 @@ dependencies = [
 test = [
     "pytest>=7.4,<9",
 ]
+
+# Operator maintenance CLI (migrate / backfill / prune / stats / cleanup / remap).
+# Shipped as source — no built artifacts committed (repo convention).
+[project.scripts]
+hermes-pgvector = "pgvector.__main__:main"
 
 [project.urls]
 Homepage      = "https://github.com/andreab67/hermes-memory-pgvector"
