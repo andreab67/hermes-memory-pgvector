@@ -568,7 +568,7 @@ class PgvectorMemoryProvider(MemoryProvider):
             logger.debug("pgvector on_delegation failed (ignored): %s", exc)
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
-        """Best-effort: bump this agent's last_seen in the registry. Fail-soft,
+        """Best-effort: capture session turns + bump last_seen. Fail-soft,
         non-blocking. No LLM summary (invariant #2). No-op until 002 applied."""
         if not self._healthy or not self._writer or not self._delegation_enabled:
             return
@@ -581,6 +581,36 @@ class PgvectorMemoryProvider(MemoryProvider):
                 extra={"kind": classify_kind(self._agent_identity)},
                 metadata={},
             )
+            # Capture substantive user/assistant turns for conversation recall.
+            if messages:
+                policy = self._config.get("conversation_embed_policy", "all")
+                for msg in messages:
+                    role = (msg.get("role") or "").lower()
+                    if role not in ("user", "assistant"):
+                        continue
+                    raw = msg.get("content") or ""
+                    content = (
+                        raw if isinstance(raw, str)
+                        else " ".join(
+                            p.get("text", "") for p in raw
+                            if isinstance(p, dict) and p.get("type") == "text"
+                        ) if isinstance(raw, list) else str(raw)
+                    )
+                    if self._is_noise(content, min_chars=40):
+                        continue
+                    self._writer.enqueue(
+                        action="turn",
+                        agent_identity=self._agent_identity,
+                        target="conversations",
+                        content=content[:8000],
+                        extra={
+                            "role": role,
+                            "session_id": self._session_id or "default",
+                            "embed": self._should_embed_turn(role, content, policy),
+                            "parent_session_id": self._parent_session_id,
+                        },
+                        metadata={},
+                    )
         except Exception as exc:  # noqa: BLE001
             logger.debug("pgvector on_session_end failed (ignored): %s", exc)
 
