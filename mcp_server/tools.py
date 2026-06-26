@@ -22,6 +22,7 @@ Design contract:
 from __future__ import annotations
 
 import logging
+import os
 from typing import Any, Dict, List, Optional
 
 from hexus.embed import EmbeddingError, embed
@@ -37,7 +38,7 @@ logger = logging.getLogger(__name__)
 # tool surface. The default can be overridden per-call.
 # -----------------------------------------------------------------------
 
-import os
+
 
 
 def default_agent_identity() -> str:
@@ -68,7 +69,6 @@ def memory_health(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
 
     try:
         store.ensure_schema()
-        schema_ok = True
     except Exception as exc:  # noqa: BLE001
         return {
             "status": "error",
@@ -241,6 +241,16 @@ def memory_recall(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
     min_confidence = float(args.get("min_confidence", 0.0))
     min_confidence = max(0.0, min(min_confidence, 1.0))
 
+    decay_val = args.get("decay_half_life_days")
+    if decay_val is None:
+        decay_val = os.environ.get("HEXUS_DECAY_HALF_LIFE_DAYS", 0.0)
+    decay_half_life_days = max(0.0, float(decay_val))
+
+    boost_val = args.get("recall_boost_weight")
+    if boost_val is None:
+        boost_val = os.environ.get("HEXUS_RECALL_BOOST_WEIGHT", 0.0)
+    recall_boost_weight = max(0.0, float(boost_val))
+
     try:
         vec = embed(query)
     except EmbeddingError as exc:
@@ -253,6 +263,8 @@ def memory_recall(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
         limit=top_k,
         min_similarity=min_similarity,
         min_confidence=min_confidence,
+        decay_half_life_days=decay_half_life_days,
+        recall_boost_weight=recall_boost_weight,
     )
     return {
         "query": query,
@@ -374,6 +386,16 @@ def memory_recall_turns(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, A
         session_id = None
     min_similarity = float(args.get("min_similarity", 0.0))
 
+    decay_val = args.get("decay_half_life_days")
+    if decay_val is None:
+        decay_val = os.environ.get("HEXUS_DECAY_HALF_LIFE_DAYS", 0.0)
+    decay_half_life_days = max(0.0, float(decay_val))
+
+    boost_val = args.get("recall_boost_weight")
+    if boost_val is None:
+        boost_val = os.environ.get("HEXUS_RECALL_BOOST_WEIGHT", 0.0)
+    recall_boost_weight = max(0.0, float(boost_val))
+
     try:
         vec = embed(query)
     except EmbeddingError as exc:
@@ -385,6 +407,8 @@ def memory_recall_turns(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, A
         session_id=session_id,
         limit=top_k,
         min_similarity=min_similarity,
+        decay_half_life_days=decay_half_life_days,
+        recall_boost_weight=recall_boost_weight,
     )
     return {
         "query": query,
@@ -530,6 +554,16 @@ def memory_hybrid_search(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, 
     min_confidence = float(args.get("min_confidence", 0.0))
     min_confidence = max(0.0, min(min_confidence, 1.0))
 
+    decay_val = args.get("decay_half_life_days")
+    if decay_val is None:
+        decay_val = os.environ.get("HEXUS_DECAY_HALF_LIFE_DAYS", 0.0)
+    decay_half_life_days = max(0.0, float(decay_val))
+
+    boost_val = args.get("recall_boost_weight")
+    if boost_val is None:
+        boost_val = os.environ.get("HEXUS_RECALL_BOOST_WEIGHT", 0.0)
+    recall_boost_weight = max(0.0, float(boost_val))
+
     try:
         vec = embed(query)
     except EmbeddingError as exc:
@@ -545,6 +579,8 @@ def memory_hybrid_search(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, 
         text_weight=text_weight,
         min_similarity=min_similarity,
         min_confidence=min_confidence,
+        decay_half_life_days=decay_half_life_days,
+        recall_boost_weight=recall_boost_weight,
     )
     return {
         "query": query,
@@ -589,6 +625,16 @@ def memory_hybrid_recall_turns(store: MemoryStore, args: Dict[str, Any]) -> Dict
     min_similarity = float(args.get("min_similarity", 0.0))
     min_similarity = max(0.0, min(min_similarity, 1.0))
 
+    decay_val = args.get("decay_half_life_days")
+    if decay_val is None:
+        decay_val = os.environ.get("HEXUS_DECAY_HALF_LIFE_DAYS", 0.0)
+    decay_half_life_days = max(0.0, float(decay_val))
+
+    boost_val = args.get("recall_boost_weight")
+    if boost_val is None:
+        boost_val = os.environ.get("HEXUS_RECALL_BOOST_WEIGHT", 0.0)
+    recall_boost_weight = max(0.0, float(boost_val))
+
     try:
         vec = embed(query)
     except EmbeddingError as exc:
@@ -603,6 +649,8 @@ def memory_hybrid_recall_turns(store: MemoryStore, args: Dict[str, Any]) -> Dict
         vector_weight=vector_weight,
         text_weight=text_weight,
         min_similarity=min_similarity,
+        decay_half_life_days=decay_half_life_days,
+        recall_boost_weight=recall_boost_weight,
     )
     return {
         "query": query,
@@ -876,6 +924,24 @@ def memory_stats(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
             queue_stats = obj.stats()
             break
 
+    cleanup_stats = getattr(store, "_cleanup_metrics", None) or {
+        "total_runs": 0,
+        "last_run_timestamp": 0.0,
+        "deleted_conversations": 0,
+        "deleted_memories": 0,
+        "deleted_delegations": 0,
+    }
+
+    consolidation_stats = getattr(store, "_consolidation_metrics", None) or {
+        "total_runs": 0,
+        "last_run_timestamp": 0.0,
+        "low_confidence_processed": 0,
+        "low_confidence_deletions": 0,
+        "low_confidence_replacements": 0,
+        "cooccurring_processed_topics": 0,
+        "cooccurring_replacements": 0,
+    }
+
     return {
         "status": "ok",
         "database": db_stats,
@@ -886,7 +952,9 @@ def memory_stats(store: MemoryStore, args: Dict[str, Any]) -> Dict[str, Any]:
             "thread_alive": False,
             "p50_latency_sec": float("nan"),
             "p95_latency_sec": float("nan"),
-        }
+        },
+        "background_cleanup": cleanup_stats,
+        "background_consolidation": consolidation_stats,
     }
 
 

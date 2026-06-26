@@ -641,7 +641,7 @@ def test_sha256_deduplication(store):
     s, agent = store
     
     # Insert first memory
-    row_id_1 = s.add(
+    s.add(
         agent_identity=agent,
         target="memory",
         content="Same exact content to test SHA-256 deduplication",
@@ -731,7 +731,7 @@ def test_reranking(store):
         embedding=vec,
     )
     # Entry B: Contains search words but is less relevant
-    row_id_b = s.add(
+    s.add(
         agent_identity=agent,
         target="memory",
         content="Models that perform vector embeddings search are fast but lack cross-encoder attention.",

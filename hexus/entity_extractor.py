@@ -1,5 +1,5 @@
 import re
-from typing import List, Dict, Any
+from typing import List, Dict
 
 DEFAULT_PATTERNS = {
     "url": r'https?://[^\s<>"]+',

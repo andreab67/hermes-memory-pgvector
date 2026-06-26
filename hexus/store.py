@@ -119,6 +119,17 @@ class MemoryStore:
         )
         self._ccr_cache = CCRCache()
 
+        # Resolve vector precision configuration
+        precision = os.environ.get("HEXUS_VECTOR_PRECISION", "float32").lower()
+        if precision in ("float16", "fp16", "half"):
+            self._vector_precision = "float16"
+        elif precision == "binary":
+            self._vector_precision = "binary"
+        else:
+            self._vector_precision = "float32"
+            
+        self._actual_column_type = "vector(384)"  # Default fallback
+
 
 
 
@@ -174,6 +185,123 @@ class MemoryStore:
                         "delegations table missing. Apply the migration as DB admin: "
                         "psql -d <dbname> -f plugins/memory/hexus/migrations/002_observability.sql"
                     )
+        # Adapt schema types and indexes dynamically to match the configured precision
+        self.adapt_vector_precision()
+
+    def adapt_vector_precision(self) -> None:
+        """Verify and adapt the database column types and indexes to match the configured precision."""
+        precision = self._vector_precision
+        
+        # Determine target type
+        target_type = "halfvec(384)" if precision == "float16" else "vector(384)"
+        
+        with self._get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                # Check current type of memory_entries.embedding
+                cur.execute("""
+                    SELECT pg_catalog.format_type(atttypid, atttypmod)
+                    FROM pg_catalog.pg_attribute
+                    WHERE attrelid = 'memory_entries'::regclass
+                      AND attname = 'embedding';
+                """)
+                row = cur.fetchone()
+                if not row:
+                    return  # Table doesn't exist yet, migrations will handle it.
+                
+                current_type = row[0]
+                self._actual_column_type = current_type
+                if current_type != target_type:
+                    logger.info("Adapting database column types from %s to %s to match HEXUS_VECTOR_PRECISION=%s", current_type, target_type, precision)
+                    try:
+                        # 1. Drop existing indexes that depend on embedding column
+                        cur.execute("DROP INDEX IF EXISTS ix_memory_entries_embedding_hnsw;")
+                        cur.execute("DROP INDEX IF EXISTS ix_conversations_embedding_hnsw;")
+                        cur.execute("DROP INDEX IF EXISTS ix_delegations_embedding_hnsw;")
+                        
+                        # 2. Alter column types
+                        cur.execute(f"ALTER TABLE memory_entries ALTER COLUMN embedding TYPE {target_type};")
+                        cur.execute(f"ALTER TABLE conversations ALTER COLUMN embedding TYPE {target_type};")
+                        cur.execute(f"ALTER TABLE delegations ALTER COLUMN embedding TYPE {target_type};")
+                        
+                        conn.commit()
+                        self._actual_column_type = target_type
+                        logger.info("Successfully altered database columns to %s", target_type)
+                    except Exception as exc:
+                        conn.rollback()
+                        logger.warning("Failed to alter database column types (insufficient permissions?): %s", exc)
+                        
+                # Ensure the correct indexes are in place based on precision
+                try:
+                    if precision == "float16":
+                        # Drop binary indexes if they exist
+                        cur.execute("DROP INDEX IF EXISTS ix_memory_entries_embedding_binary_hnsw;")
+                        cur.execute("DROP INDEX IF EXISTS ix_conversations_embedding_binary_hnsw;")
+                        cur.execute("DROP INDEX IF EXISTS ix_delegations_embedding_binary_hnsw;")
+
+                        # Create HNSW index on halfvec_cosine_ops
+                        cur.execute("""
+                            CREATE INDEX IF NOT EXISTS ix_memory_entries_embedding_hnsw
+                              ON memory_entries USING hnsw (embedding halfvec_cosine_ops)
+                              WITH (m = 16, ef_construction = 64);
+                        """)
+                        cur.execute("""
+                            CREATE INDEX IF NOT EXISTS ix_conversations_embedding_hnsw
+                              ON conversations USING hnsw (embedding halfvec_cosine_ops)
+                              WITH (m = 16, ef_construction = 64);
+                        """)
+                        cur.execute("""
+                            CREATE INDEX IF NOT EXISTS ix_delegations_embedding_hnsw
+                              ON delegations USING hnsw (embedding halfvec_cosine_ops)
+                              WITH (m = 16, ef_construction = 64);
+                        """)
+                    elif precision == "binary":
+                        # Drop standard HNSW index to save RAM (if they exist)
+                        cur.execute("DROP INDEX IF EXISTS ix_memory_entries_embedding_hnsw;")
+                        cur.execute("DROP INDEX IF EXISTS ix_conversations_embedding_hnsw;")
+                        cur.execute("DROP INDEX IF EXISTS ix_delegations_embedding_hnsw;")
+                        
+                        # Create the binary HNSW expression indexes
+                        cur.execute("""
+                            CREATE INDEX IF NOT EXISTS ix_memory_entries_embedding_binary_hnsw
+                              ON memory_entries USING hnsw ((binary_quantize(embedding)::bit(384)) bit_hamming_ops)
+                              WITH (m = 16, ef_construction = 64);
+                        """)
+                        cur.execute("""
+                            CREATE INDEX IF NOT EXISTS ix_conversations_embedding_binary_hnsw
+                              ON conversations USING hnsw ((binary_quantize(embedding)::bit(384)) bit_hamming_ops)
+                              WITH (m = 16, ef_construction = 64);
+                        """)
+                        cur.execute("""
+                            CREATE INDEX IF NOT EXISTS ix_delegations_embedding_binary_hnsw
+                              ON delegations USING hnsw ((binary_quantize(embedding)::bit(384)) bit_hamming_ops)
+                              WITH (m = 16, ef_construction = 64);
+                        """)
+                    else:  # float32
+                        # Drop binary indexes if they exist
+                        cur.execute("DROP INDEX IF EXISTS ix_memory_entries_embedding_binary_hnsw;")
+                        cur.execute("DROP INDEX IF EXISTS ix_conversations_embedding_binary_hnsw;")
+                        cur.execute("DROP INDEX IF EXISTS ix_delegations_embedding_binary_hnsw;")
+
+                        # Create HNSW index on vector_cosine_ops
+                        cur.execute("""
+                            CREATE INDEX IF NOT EXISTS ix_memory_entries_embedding_hnsw
+                              ON memory_entries USING hnsw (embedding vector_cosine_ops)
+                              WITH (m = 16, ef_construction = 64);
+                        """)
+                        cur.execute("""
+                            CREATE INDEX IF NOT EXISTS ix_conversations_embedding_hnsw
+                              ON conversations USING hnsw (embedding vector_cosine_ops)
+                              WITH (m = 16, ef_construction = 64);
+                        """)
+                        cur.execute("""
+                            CREATE INDEX IF NOT EXISTS ix_delegations_embedding_hnsw
+                              ON delegations USING hnsw (embedding vector_cosine_ops)
+                              WITH (m = 16, ef_construction = 64);
+                        """)
+                    conn.commit()
+                except Exception as exc:
+                    conn.rollback()
+                    logger.warning("Failed to create/ensure quantization indexes: %s", exc)
 
     def apply_migration_as_admin(self, *, admin_dsn: str) -> None:
         """One-shot admin path: run the full migrations with privileged creds."""
@@ -460,23 +588,44 @@ class MemoryStore:
             params.append(platform)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
-        db_limit = max(limit, 50) if rerank else limit
+        cast_type = "halfvec" if "halfvec" in getattr(self, "_actual_column_type", "vector(384)") else "vector"
 
-        with self._get_pool().connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    f"""
-                    SELECT id, agent_identity, target, content, compressed, created_at,
-                           updated_at, metadata,
-                           1 - (embedding <=> %s::vector) AS score
-                    FROM memory_entries
-                    {where}
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    [vec_literal] + params + [vec_literal, db_limit],
-                )
-                rows = list(cur.fetchall())
+        if self._vector_precision == "binary":
+            db_limit = max(limit * 10, 50)
+            if rerank:
+                db_limit = max(db_limit, 100)
+            with self._get_pool().connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, agent_identity, target, content, compressed, created_at,
+                               updated_at, metadata,
+                               1 - (embedding <=> %s::{cast_type}) AS score
+                        FROM memory_entries
+                        {where}
+                        ORDER BY (binary_quantize(embedding)::bit(384)) <~> (binary_quantize(%s::{cast_type})::bit(384))
+                        LIMIT %s
+                        """,
+                        [vec_literal] + params + [vec_literal, db_limit],
+                    )
+                    rows = list(cur.fetchall())
+        else:
+            db_limit = max(limit, 50) if rerank else limit
+            with self._get_pool().connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, agent_identity, target, content, compressed, created_at,
+                               updated_at, metadata,
+                               1 - (embedding <=> %s::{cast_type}) AS score
+                        FROM memory_entries
+                        {where}
+                        ORDER BY embedding <=> %s::{cast_type}
+                        LIMIT %s
+                        """,
+                        [vec_literal] + params + [vec_literal, db_limit],
+                    )
+                    rows = list(cur.fetchall())
                 print(f"DEBUG_SEARCH_RAW: rows_len={len(rows)} data={[ {'id': r['id'], 'content': r['content'], 'score': r['score']} for r in rows ]}")
 
         # Apply boost & decay
@@ -492,7 +641,7 @@ class MemoryStore:
                 r["rerank_score"] = float(rerank_score)
                 r["score"] = r["rerank_score"]
 
-        if decay_half_life_days > 0.0 or recall_boost_weight > 0.0 or rerank:
+        if self._vector_precision == "binary" or decay_half_life_days > 0.0 or recall_boost_weight > 0.0 or rerank:
             rows = sorted(rows, key=lambda r: r.get("score", 0.0), reverse=True)
 
         rows = rows[:limit]
@@ -831,26 +980,45 @@ class MemoryStore:
             params.append(platform)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
-        with self._get_pool().connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    f"""
-                    SELECT id, session_id, agent_identity, role, content, ts, metadata,
-                           1 - (embedding <=> %s::vector) AS score
-                    FROM conversations
-                    {where}
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    [vec_literal] + params + [vec_literal, limit],
-                )
-                rows = list(cur.fetchall())
+        cast_type = "halfvec" if "halfvec" in getattr(self, "_actual_column_type", "vector(384)") else "vector"
+
+        if self._vector_precision == "binary":
+            db_limit = max(limit * 10, 50)
+            with self._get_pool().connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, session_id, agent_identity, role, content, ts, metadata,
+                               1 - (embedding <=> %s::{cast_type}) AS score
+                        FROM conversations
+                        {where}
+                        ORDER BY (binary_quantize(embedding)::bit(384)) <~> (binary_quantize(%s::{cast_type})::bit(384))
+                        LIMIT %s
+                        """,
+                        [vec_literal] + params + [vec_literal, db_limit],
+                    )
+                    rows = list(cur.fetchall())
+        else:
+            with self._get_pool().connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, session_id, agent_identity, role, content, ts, metadata,
+                               1 - (embedding <=> %s::{cast_type}) AS score
+                        FROM conversations
+                        {where}
+                        ORDER BY embedding <=> %s::{cast_type}
+                        LIMIT %s
+                        """,
+                        [vec_literal] + params + [vec_literal, limit],
+                    )
+                    rows = list(cur.fetchall())
 
         # Apply boost & decay
         rows = self._apply_recall_boost(rows, recall_boost_weight)
         rows = self._apply_temporal_decay(rows, decay_half_life_days)
 
-        if decay_half_life_days > 0.0 or recall_boost_weight > 0.0:
+        if self._vector_precision == "binary" or decay_half_life_days > 0.0 or recall_boost_weight > 0.0:
             rows = sorted(rows, key=lambda r: r.get("score", 0.0), reverse=True)
 
         if min_similarity > 0:
@@ -1027,26 +1195,45 @@ class MemoryStore:
             params.append(platform)
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
-        with self._get_pool().connection() as conn:
-            with conn.cursor(row_factory=dict_row) as cur:
-                cur.execute(
-                    f"""
-                    SELECT id, parent_session_id, child_session_id, agent_identity, task, result, ts, metadata,
-                           1 - (embedding <=> %s::vector) AS score
-                    FROM delegations
-                    {where}
-                    ORDER BY embedding <=> %s::vector
-                    LIMIT %s
-                    """,
-                    [vec_literal] + params + [vec_literal, limit],
-                )
-                rows = list(cur.fetchall())
+        cast_type = "halfvec" if "halfvec" in getattr(self, "_actual_column_type", "vector(384)") else "vector"
+
+        if self._vector_precision == "binary":
+            db_limit = max(limit * 10, 50)
+            with self._get_pool().connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, parent_session_id, child_session_id, agent_identity, task, result, ts, metadata,
+                               1 - (embedding <=> %s::{cast_type}) AS score
+                        FROM delegations
+                        {where}
+                        ORDER BY (binary_quantize(embedding)::bit(384)) <~> (binary_quantize(%s::{cast_type})::bit(384))
+                        LIMIT %s
+                        """,
+                        [vec_literal] + params + [vec_literal, db_limit],
+                    )
+                    rows = list(cur.fetchall())
+        else:
+            with self._get_pool().connection() as conn:
+                with conn.cursor(row_factory=dict_row) as cur:
+                    cur.execute(
+                        f"""
+                        SELECT id, parent_session_id, child_session_id, agent_identity, task, result, ts, metadata,
+                               1 - (embedding <=> %s::{cast_type}) AS score
+                        FROM delegations
+                        {where}
+                        ORDER BY embedding <=> %s::{cast_type}
+                        LIMIT %s
+                        """,
+                        [vec_literal] + params + [vec_literal, limit],
+                    )
+                    rows = list(cur.fetchall())
 
         # Apply boost & decay
         rows = self._apply_recall_boost(rows, recall_boost_weight)
         rows = self._apply_temporal_decay(rows, decay_half_life_days)
 
-        if decay_half_life_days > 0.0 or recall_boost_weight > 0.0:
+        if self._vector_precision == "binary" or decay_half_life_days > 0.0 or recall_boost_weight > 0.0:
             rows = sorted(rows, key=lambda r: r.get("score", 0.0), reverse=True)
 
         if min_similarity > 0:
@@ -1139,6 +1326,114 @@ class MemoryStore:
                     return {"ok": True, "error": "", "row_count": int(cur.fetchone()[0])}
         except Exception as exc:  # noqa: BLE001
             return {"ok": False, "error": str(exc)[:200], "row_count": 0}
+
+    def get_metrics_data(self) -> Dict[str, Any]:
+        """Fetch detailed metrics from the database for Prometheus output."""
+        data = {
+            "memory_entries": [],
+            "memory_entries_compressed": [],
+            "conversations": [],
+            "delegations": [],
+            "feedback": [],
+            "conversation_recalls": [],
+            "delegation_recalls": [],
+            "memory_entities": [],
+            "conversation_entities": [],
+        }
+
+        # Helper to execute query and return list of rows
+        def query_safe(sql: str, params: Optional[list] = None) -> list:
+            try:
+                with self._get_pool().connection() as conn:
+                    with conn.cursor(row_factory=dict_row) as cur:
+                        cur.execute(sql, params or [])
+                        return list(cur.fetchall())
+            except Exception as exc:
+                logger.warning("Metrics query failed (%s): %s", sql[:50], exc)
+                return []
+
+        # 1. Memory entries by agent and target
+        data["memory_entries"] = query_safe(
+            "SELECT agent_identity, target, COUNT(*) as count FROM memory_entries GROUP BY agent_identity, target"
+        )
+
+        # 2. Compressed memory entries
+        data["memory_entries_compressed"] = query_safe(
+            "SELECT agent_identity, COUNT(*) as count FROM memory_entries WHERE compressed IS NOT NULL GROUP BY agent_identity"
+        )
+
+        # 3. Conversations by agent and role
+        data["conversations"] = query_safe(
+            "SELECT agent_identity, role, COUNT(*) as count FROM conversations GROUP BY agent_identity, role"
+        )
+
+        # 4. Delegations by agent
+        data["delegations"] = query_safe(
+            "SELECT agent_identity, COUNT(*) as count FROM delegations GROUP BY agent_identity"
+        )
+
+        # 5. Feedback and recall counts on memory entries
+        data["feedback"] = query_safe(
+            """
+            SELECT 
+                agent_identity,
+                SUM(COALESCE((metadata->>'recall_count')::int, 0)) AS total_recalls,
+                SUM(COALESCE((metadata->>'confirm_count')::int, 0)) AS total_confirms,
+                SUM(COALESCE((metadata->>'reject_count')::int, 0)) AS total_rejects
+            FROM memory_entries
+            GROUP BY agent_identity
+            """
+        )
+
+        # 6. Conversation recalls
+        data["conversation_recalls"] = query_safe(
+            """
+            SELECT 
+                agent_identity,
+                SUM(COALESCE((metadata->>'recall_count')::int, 0)) AS total_recalls
+            FROM conversations
+            GROUP BY agent_identity
+            """
+        )
+
+        # 7. Delegation recalls
+        data["delegation_recalls"] = query_safe(
+            """
+            SELECT 
+                agent_identity,
+                SUM(COALESCE((metadata->>'recall_count')::int, 0)) AS total_recalls
+            FROM delegations
+            GROUP BY agent_identity
+            """
+        )
+
+        # 8. Memory entry entities
+        data["memory_entities"] = query_safe(
+            """
+            SELECT
+                agent_identity,
+                COUNT(DISTINCT ((e->>'type') || ':' || (e->>'value'))) AS unique_entities,
+                COUNT(*) AS total_entity_occurrences
+            FROM memory_entries,
+                 jsonb_array_elements(COALESCE(metadata->'entities', '[]'::jsonb)) AS e
+            GROUP BY agent_identity
+            """
+        )
+
+        # 9. Conversation entities
+        data["conversation_entities"] = query_safe(
+            """
+            SELECT
+                agent_identity,
+                COUNT(DISTINCT ((e->>'type') || ':' || (e->>'value'))) AS unique_entities,
+                COUNT(*) AS total_entity_occurrences
+            FROM conversations,
+                 jsonb_array_elements(COALESCE(metadata->'entities', '[]'::jsonb)) AS e
+            GROUP BY agent_identity
+            """
+        )
+
+        return data
 
     def _apply_recall_boost(self, rows: List[Dict[str, Any]], boost_weight: float) -> List[Dict[str, Any]]:
         if boost_weight <= 0.0:
@@ -1443,5 +1738,273 @@ class MemoryStore:
                     "turn_count": total_turns,
                     "summary_turns": rows,
                 }
+
+
+# TODO: Implement a background LLM reflection/consolidation loop (Lightweight LLM Re-Ranking / Reflection Loop)
+# that runs when the agent is idle to group/summarize low-confidence or heavily co-occurring memory entries.
+
+    def consolidate_low_confidence_memories(self, agent_identity: Optional[str] = None) -> Dict[str, Any]:
+        """Query low-confidence (frequently rejected) memories and send them to the LLM for pruning/merging."""
+        import json
+        import urllib.request
+        import urllib.error
+        import os
+        from hexus.store import dict_row
+
+        api_base = os.environ.get("LLM_API_BASE") or "http://headroom:8787/v1"
+        api_key = os.environ.get("HEADROOM_INTERNAL_TOKEN") or os.environ.get("LITELLM_MASTER_KEY")
+        summary_model = os.environ.get("HEXUS_SUMMARY_MODEL")
+        
+        if not summary_model:
+            logger.warning("HEXUS_SUMMARY_MODEL is not set. Skipping low-confidence memory consolidation.")
+            return {"status": "skipped", "reason": "HEXUS_SUMMARY_MODEL not set"}
+
+        # 1. Fetch candidates
+        query = """
+            SELECT id, agent_identity, target, content, metadata
+            FROM memory_entries
+            WHERE (metadata->>'reject_count')::int > 0
+              AND (
+                metadata->>'confirm_count' IS NULL 
+                OR (metadata->>'confirm_count')::int = 0
+                OR (metadata->>'confirm_count')::float / ((metadata->>'confirm_count')::float + (metadata->>'reject_count')::float) < 0.3
+              )
+        """
+        params = []
+        if agent_identity:
+            query += " AND agent_identity = %s"
+            params.append(agent_identity)
+        query += " LIMIT 20"
+
+        with self._get_pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) if hasattr(conn, "cursor") else conn.cursor() as cur:
+                cur.execute(query, params)
+                rows = list(cur.fetchall())
+
+        if not rows:
+            return {"status": "ok", "processed": 0, "deletions": 0, "replacements": 0}
+
+        # 2. Call LLM
+        memories_str = "\n".join([f"- [ID: {r['id']}] (Target: {r['target']}) \"{r['content']}\"" for r in rows])
+        prompt = (
+            "You are an AI memory manager. Analyze the following low-confidence/frequently rejected memory entries "
+            "and decide what to do with them. Redundant, contradiction, obsolete, or incorrect facts should be deleted. "
+            "Related facts should be merged. Valid facts should be kept.\n\n"
+            f"Memories:\n{memories_str}\n\n"
+            "Respond ONLY with a JSON object matching this schema. Do not include markdown code block formatting or explanations:\n"
+            "{\n"
+            "  \"deletions\": [id, id, ...],\n"
+            "  \"replacements\": [\n"
+            "    {\"ids\": [id, id, ...], \"content\": \"consolidated text\", \"target\": \"memory\"}\n"
+            "  ]\n"
+            "}"
+        )
+
+        payload = {
+            "model": summary_model,
+            "messages": [
+                {"role": "system", "content": "You are a database cleanup manager. Output ONLY raw valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            "temperature": 0.2,
+            "max_tokens": 800
+        }
+
+        url = f"{api_base.rstrip('/')}/chat/completions"
+        try:
+            req = urllib.request.Request(
+                url,
+                data=json.dumps(payload).encode("utf-8"),
+                headers={"Content-Type": "application/json"}
+            )
+            if api_key:
+                req.add_header("Authorization", f"Bearer {api_key}")
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                resp_data = json.loads(resp.read().decode("utf-8"))
+                llm_response = resp_data["choices"][0]["message"]["content"].strip()
+        except Exception as exc:
+            logger.error("Failed to query LLM for low-confidence memory consolidation: %s", exc)
+            return {"status": "error", "reason": f"LLM query failed: {exc}"}
+
+        # Parse JSON
+        try:
+            if llm_response.startswith("```"):
+                lines = llm_response.splitlines()
+                if lines[0].startswith("```"):
+                    lines = lines[1:]
+                if lines[-1].startswith("```"):
+                    lines = lines[:-1]
+                llm_response = "\n".join(lines).strip()
+            data = json.loads(llm_response)
+        except Exception as exc:
+            logger.error("Failed to parse LLM consolidation response JSON: %s. Response: %r", exc, llm_response)
+            return {"status": "error", "reason": f"JSON parse failed: {exc}"}
+
+        deletions = data.get("deletions", [])
+        replacements = data.get("replacements", [])
+
+        deleted_count = 0
+        replaced_count = 0
+
+        # Process deletions
+        if deletions:
+            valid_del_ids = [r["id"] for r in rows if r["id"] in deletions]
+            if valid_del_ids:
+                with self._get_pool().connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM memory_entries WHERE id = ANY(%s)", (valid_del_ids,))
+                        deleted_count += cur.rowcount
+                        conn.commit()
+
+        # Process replacements
+        for rep in replacements:
+            rep_ids = rep.get("ids", [])
+            rep_content = rep.get("content", "").strip()
+            rep_target = rep.get("target", "memory")
+            
+            valid_rep_ids = [r["id"] for r in rows if r["id"] in rep_ids]
+            if valid_rep_ids and rep_content:
+                with self._get_pool().connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM memory_entries WHERE id = ANY(%s)", (valid_rep_ids,))
+                        conn.commit()
+                agent_id = next((r["agent_identity"] for r in rows if r["id"] in valid_rep_ids), agent_identity or "default")
+                self.add(agent_identity=agent_id, target=rep_target, content=rep_content)
+                replaced_count += len(valid_rep_ids)
+
+        return {
+            "status": "ok",
+            "processed": len(rows),
+            "deletions": deleted_count,
+            "replacements": replaced_count,
+        }
+
+    def consolidate_cooccurring_memories(self, agent_identity: Optional[str] = None) -> Dict[str, Any]:
+        """Query clusters of co-occurring entities and consolidate their memories using the LLM."""
+        import json
+        import urllib.request
+        import urllib.error
+        import os
+        from hexus.store import dict_row
+
+        api_base = os.environ.get("LLM_API_BASE") or "http://headroom:8787/v1"
+        api_key = os.environ.get("HEADROOM_INTERNAL_TOKEN") or os.environ.get("LITELLM_MASTER_KEY")
+        summary_model = os.environ.get("HEXUS_SUMMARY_MODEL")
+        
+        if not summary_model:
+            logger.warning("HEXUS_SUMMARY_MODEL is not set. Skipping co-occurring memory consolidation.")
+            return {"status": "skipped", "reason": "HEXUS_SUMMARY_MODEL not set"}
+
+        topics = self.common_topics(agent_identity=agent_identity, min_strength=3, limit=5)
+        if not topics:
+            return {"status": "ok", "processed_topics": 0, "replacements": 0}
+
+        processed_topics = 0
+        replaced_count = 0
+        processed_ids = set()
+
+        for topic in topics:
+            type_a, val_a = topic["type_a"], topic["value_a"]
+            type_b, val_b = topic["type_b"], topic["value_b"]
+
+            query = """
+                SELECT id, agent_identity, target, content, metadata
+                FROM memory_entries
+                WHERE (%s::text IS NULL OR agent_identity = %s)
+                  AND metadata @> %s::jsonb
+                  AND metadata @> %s::jsonb
+                LIMIT 10
+            """
+            meta_a = json.dumps({"entities": [{"type": type_a, "value": val_a}]})
+            meta_b = json.dumps({"entities": [{"type": type_b, "value": val_b}]})
+            params = [agent_identity, agent_identity, meta_a, meta_b]
+
+            with self._get_pool().connection() as conn:
+                with conn.cursor(row_factory=dict_row) if hasattr(conn, "cursor") else conn.cursor() as cur:
+                    cur.execute(query, params)
+                    rows = list(cur.fetchall())
+
+            rows = [r for r in rows if r["id"] not in processed_ids]
+
+            if len(rows) < 3:
+                continue
+
+            processed_topics += 1
+
+            memories_str = "\n".join([f"- [ID: {r['id']}] (Target: {r['target']}) \"{r['content']}\"" for r in rows])
+            prompt = (
+                "You are an AI memory manager. The following memory entries relate to the same concepts "
+                f"({val_a} and {val_b}) and contain redundant or overlapping information.\n\n"
+                f"Memories:\n{memories_str}\n\n"
+                "Consolidate and summarize these entries into a single, high-signal, comprehensive memory entry "
+                "to clean up the database. Respond ONLY with a JSON object matching this schema. Do not include markdown code block formatting or explanations:\n"
+                "{\n"
+                "  \"ids_to_replace\": [id, id, ...],\n"
+                "  \"consolidated_content\": \"consolidated text\",\n"
+                "  \"target\": \"memory\"\n"
+                "}"
+            )
+
+            payload = {
+                "model": summary_model,
+                "messages": [
+                    {"role": "system", "content": "You are a database consolidation manager. Output ONLY raw valid JSON."},
+                    {"role": "user", "content": prompt}
+                ],
+                "temperature": 0.2,
+                "max_tokens": 800
+            }
+
+            url = f"{api_base.rstrip('/')}/chat/completions"
+            try:
+                req = urllib.request.Request(
+                    url,
+                    data=json.dumps(payload).encode("utf-8"),
+                    headers={"Content-Type": "application/json"}
+                )
+                if api_key:
+                    req.add_header("Authorization", f"Bearer {api_key}")
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    resp_data = json.loads(resp.read().decode("utf-8"))
+                    llm_response = resp_data["choices"][0]["message"]["content"].strip()
+            except Exception as exc:
+                logger.error("Failed to query LLM for topic consolidation: %s", exc)
+                continue
+
+            try:
+                if llm_response.startswith("```"):
+                    lines = llm_response.splitlines()
+                    if lines[0].startswith("```"):
+                        lines = lines[1:]
+                    if lines[-1].startswith("```"):
+                        lines = lines[:-1]
+                    llm_response = "\n".join(lines).strip()
+                data = json.loads(llm_response)
+            except Exception as exc:
+                logger.error("Failed to parse LLM topic consolidation JSON: %s. Response: %r", exc, llm_response)
+                continue
+
+            ids_to_replace = data.get("ids_to_replace", [])
+            consolidated_content = data.get("consolidated_content", "").strip()
+            rep_target = data.get("target", "memory")
+
+            valid_ids = [r["id"] for r in rows if r["id"] in ids_to_replace]
+            if len(valid_ids) >= 2 and consolidated_content:
+                with self._get_pool().connection() as conn:
+                    with conn.cursor() as cur:
+                        cur.execute("DELETE FROM memory_entries WHERE id = ANY(%s)", (valid_ids,))
+                        conn.commit()
+                agent_id = next((r["agent_identity"] for r in rows if r["id"] in valid_ids), agent_identity or "default")
+                self.add(agent_identity=agent_id, target=rep_target, content=consolidated_content)
+                replaced_count += len(valid_ids)
+                processed_ids.update(valid_ids)
+
+        return {
+            "status": "ok",
+            "processed_topics": processed_topics,
+            "replacements": replaced_count,
+        }
+
+
 
 

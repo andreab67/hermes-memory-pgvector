@@ -1,14 +1,13 @@
 import hashlib
 import hmac
 import json
-import time
 import threading
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from typing import List, Dict, Any
 from unittest.mock import patch, MagicMock
 
 import pytest
-from hexus.webhook.dispatcher import sign_payload, dispatch_webhook, dispatch_webhook_sync
+from hexus.webhook.dispatcher import sign_payload, dispatch_webhook_sync
 
 class MockWebhookHandler(BaseHTTPRequestHandler):
     requests_received: List[Dict[str, Any]] = []

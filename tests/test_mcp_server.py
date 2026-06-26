@@ -19,8 +19,6 @@ Dockerfile's pip install).
 
 from __future__ import annotations
 
-import asyncio
-import inspect
 import os
 import uuid
 
@@ -713,6 +711,7 @@ class TestMcpWiring:
             "memory_summarize_session",
             "memory_retrieve",
             "headroom_retrieve",
+            "memory_consolidate",
         }.issubset(names), f"missing tools: {names}"
 
 
@@ -749,6 +748,14 @@ class TestMcpWiring:
         assert "query" in props
         assert "top_k" in props
         assert "agent_identity" in props
+
+    def test_memory_recall_schema_includes_decay_parameters(self, store):
+        mcp = self._server(store)
+        for tool_name in ["memory_recall", "memory_hybrid_search", "memory_recall_turns", "memory_hybrid_recall_turns"]:
+            tool = self._get_tool_cache(mcp)[tool_name]
+            props = tool.parameters["properties"]
+            assert "decay_half_life_days" in props
+            assert "recall_boost_weight" in props
 
 
 def test_mcp_graph_tools_round_trip(store):
@@ -814,7 +821,7 @@ def test_mcp_confirm_reject_summarize_round_trip(store):
     agent = agent_of(store) # noqa: SLF001
 
     # Retain entry
-    retain_res = tools.memory_retain(
+    tools.memory_retain(
         store,
         {
             "contents": ["Some test memory details"],
@@ -924,7 +931,337 @@ def test_mcp_memory_stats_round_trip(store):
     assert res["status"] == "ok"
     assert "database" in res
     assert "async_writer" in res
+    assert "background_cleanup" in res
     assert "memory_entries_count" in res["database"]
     assert "conversations_count" in res["database"]
+
+
+def test_mcp_server_cleanup_thread_startup(monkeypatch):
+    """Verify that build_server spawns the background cleanup thread if configured."""
+    import threading
+    import os
+    from mcp_server.server import build_server
+
+    # Set environment variables to enable cleanup
+    monkeypatch.setenv("HEXUS_CLEANUP_INTERVAL_HOURS", "1")
+    monkeypatch.setenv("HEXUS_CLEANUP_MEMORIES_TTL_DAYS", "7")
+
+    dsn = os.environ.get("PG_TEST_DSN")
+    if not dsn:
+        return  # Skip if no DSN available
+
+    # Build server (this should spawn the daemon thread)
+    build_server(dsn, name="hexus-cleanup-test")
+
+    # Count threads after
+    after_threads = [t.name for t in threading.enumerate()]
+
+    assert "hexus-cleanup-thread" in after_threads
+
+
+def test_mcp_recall_dynamic_decay(store):
+    """Verify that memory_recall tool respects decay_half_life_days dynamic parameter."""
+    from mcp_server import tools
+    from hexus.store import dict_row
+
+    agent = agent_of(store)
+
+    # Retain two identical memories
+    tools.memory_retain(store, {
+        "contents": ["Dynamic Decay Test Entry 1"],
+        "agent_identity": agent,
+        "target": "memory",
+    })
+    tools.memory_retain(store, {
+        "contents": ["Dynamic Decay Test Entry 2"],
+        "agent_identity": agent,
+        "target": "memory",
+    })
+
+    # Retrieve their IDs from database to modify updated_at
+    with store._get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) if hasattr(conn, "cursor") else conn.cursor() as cur:
+            cur.execute("SELECT id, content FROM memory_entries WHERE agent_identity = %s", (agent,))
+            rows = list(cur.fetchall())
+            
+            # Make sure we got two entries
+            assert len(rows) == 2
+            
+            # Set one to be 10 days ago
+            cur.execute(
+                "UPDATE memory_entries SET updated_at = now() - interval '10 days' WHERE id = %s",
+                (rows[0]["id"],)
+            )
+            conn.commit()
+
+    # Query with decay disabled (decay_half_life_days=0.0)
+    res_no_decay = tools.memory_recall(store, {
+        "query": "Dynamic Decay Test Entry",
+        "agent_identity": agent,
+        "decay_half_life_days": 0.0,
+        "top_k": 2,
+    })
+    
+    # Query with decay enabled (decay_half_life_days=2.0)
+    res_decay = tools.memory_recall(store, {
+        "query": "Dynamic Decay Test Entry",
+        "agent_identity": agent,
+        "decay_half_life_days": 2.0,
+        "top_k": 2,
+    })
+
+    # Under decay, the older entry (rows[0]) should have a lower score than the new entry (rows[1])
+    no_decay_scores = {r["id"]: r["score"] for r in res_no_decay["results"]}
+    decay_scores = {r["id"]: r["score"] for r in res_decay["results"]}
+
+    old_id = rows[0]["id"]
+    new_id = rows[1]["id"]
+
+    assert old_id in no_decay_scores and new_id in no_decay_scores
+    assert old_id in decay_scores and new_id in decay_scores
+
+    # With decay, old_id score should be strictly less than new_id score, and less than its own no-decay score
+    assert decay_scores[old_id] < decay_scores[new_id]
+    assert decay_scores[old_id] < no_decay_scores[old_id]
+
+
+def test_mcp_server_consolidation_thread_startup(monkeypatch):
+    """Verify that build_server spawns the background consolidation thread if configured."""
+    import threading
+    import os
+    from mcp_server.server import build_server
+
+    monkeypatch.setenv("HEXUS_CONSOLIDATION_INTERVAL_HOURS", "1")
+
+    dsn = os.environ.get("PG_TEST_DSN")
+    if not dsn:
+        return  # Skip if no DSN available
+
+    build_server(dsn, name="hexus-consolidation-test")
+
+    after_threads = [t.name for t in threading.enumerate()]
+    assert "hexus-consolidation-thread" in after_threads
+
+
+def test_mcp_consolidation_round_trip(store, monkeypatch):
+    """Verify that consolidation works and updates DB and metrics correctly."""
+    import urllib.request
+    import json
+    from hexus.store import dict_row
+
+    # 1. Setup mock environment
+    monkeypatch.setenv("HEXUS_SUMMARY_MODEL", "mock-summary-model")
+    
+    if not hasattr(store, "_consolidation_metrics"):
+        store._consolidation_metrics = {
+            "total_runs": 0,
+            "last_run_timestamp": 0.0,
+            "low_confidence_processed": 0,
+            "low_confidence_deletions": 0,
+            "low_confidence_replacements": 0,
+            "cooccurring_processed_topics": 0,
+            "cooccurring_replacements": 0,
+        }
+    
+    # 2. Insert some low confidence memories (rejected count > 0, confirm count = 0)
+    agent = "test-agent-consolidation"
+    
+    with store._get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM memory_entries WHERE agent_identity = %s", (agent,))
+            conn.commit()
+
+    # Insert entry to delete
+    store.add(agent_identity=agent, target="memory", content="Obsolete content to be deleted")
+    # Insert entries to replace/merge
+    store.add(agent_identity=agent, target="memory", content="First partial fact about python")
+    store.add(agent_identity=agent, target="memory", content="Second partial fact about python")
+    
+    # Get IDs of inserted entries
+    with store._get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) if hasattr(conn, "cursor") else conn.cursor() as cur:
+            cur.execute("SELECT id, content FROM memory_entries WHERE agent_identity = %s", (agent,))
+            rows = list(cur.fetchall())
+            
+    assert len(rows) == 3
+    
+    id_delete = next(r["id"] for r in rows if "Obsolete" in r["content"])
+    id_rep1 = next(r["id"] for r in rows if "First" in r["content"])
+    id_rep2 = next(r["id"] for r in rows if "Second" in r["content"])
+    
+    # Update metadata to make them low confidence (reject_count = 1, confirm_count = 0)
+    with store._get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                "UPDATE memory_entries SET metadata = %s WHERE id = ANY(%s)",
+                (json.dumps({"reject_count": 1, "confirm_count": 0}), [id_delete, id_rep1, id_rep2])
+            )
+            conn.commit()
+
+    # Define the mock LLM response data
+    llm_resp_data = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps({
+                        "deletions": [id_delete],
+                        "replacements": [
+                            {"ids": [id_rep1, id_rep2], "content": "Python is a dynamic programming language.", "target": "memory"}
+                        ]
+                    })
+                }
+            }
+        ]
+    }
+    
+    class MockResponse:
+        def read(self):
+            return json.dumps(llm_resp_data).encode("utf-8")
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    # Mock urllib.request.urlopen
+    def mock_urlopen(req, *args, **kwargs):
+        return MockResponse()
+        
+    monkeypatch.setattr(urllib.request, "urlopen", mock_urlopen)
+
+    # Run low-confidence consolidation
+    res = store.consolidate_low_confidence_memories(agent_identity=agent)
+    
+    assert res["status"] == "ok"
+    assert res["deletions"] == 1
+    assert res["replacements"] == 2
+    
+    # Assert database is updated: id_delete, id_rep1, id_rep2 should be gone
+    with store._get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) if hasattr(conn, "cursor") else conn.cursor() as cur:
+            cur.execute("SELECT id, content FROM memory_entries WHERE agent_identity = %s", (agent,))
+            new_rows = list(cur.fetchall())
+            
+    # Should have exactly 1 entry: the consolidated python text
+    assert len(new_rows) == 1
+    assert new_rows[0]["content"] == "Python is a dynamic programming language."
+
+    # 3. Test co-occurring memories consolidation
+    # Mock store.common_topics
+    def mock_common_topics(agent_identity=None, min_strength=3, limit=5):
+        return [
+            {
+                "type_a": "tech",
+                "value_a": "docker",
+                "type_b": "tech",
+                "value_b": "postgres",
+                "strength": 3
+            }
+        ]
+    monkeypatch.setattr(store, "common_topics", mock_common_topics)
+
+    # Insert 3 entries with matching metadata
+    meta = {"entities": [{"type": "tech", "value": "docker"}, {"type": "tech", "value": "postgres"}]}
+    id1 = store.add(agent_identity=agent, target="memory", content="Docker fact 1", metadata=meta)
+    id2 = store.add(agent_identity=agent, target="memory", content="Docker fact 2", metadata=meta)
+    id3 = store.add(agent_identity=agent, target="memory", content="Docker fact 3", metadata=meta)
+
+    # Define mock response for co-occurring
+    cooccurring_resp_data = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps({
+                        "ids_to_replace": [id1, id2, id3],
+                        "consolidated_content": "Docker and Postgres are set up.",
+                        "target": "memory"
+                    })
+                }
+            }
+        ]
+    }
+
+    class MockCoResponse:
+        def read(self):
+            return json.dumps(cooccurring_resp_data).encode("utf-8")
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: MockCoResponse())
+
+    res_co = store.consolidate_cooccurring_memories(agent_identity=agent)
+    assert res_co["status"] == "ok"
+    assert res_co["processed_topics"] == 1
+    assert res_co["replacements"] == 3
+
+    # Assert database is updated: the 3 Docker facts are gone and the consolidated one is added
+    with store._get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) if hasattr(conn, "cursor") else conn.cursor() as cur:
+            cur.execute("SELECT id, content FROM memory_entries WHERE agent_identity = %s AND content LIKE 'Docker fact%%'", (agent,))
+            docker_rows = list(cur.fetchall())
+    assert len(docker_rows) == 0
+
+    with store._get_pool().connection() as conn:
+        with conn.cursor(row_factory=dict_row) if hasattr(conn, "cursor") else conn.cursor() as cur:
+            cur.execute("SELECT id, content FROM memory_entries WHERE agent_identity = %s AND content = 'Docker and Postgres are set up.'", (agent,))
+            consolidated_docker_rows = list(cur.fetchall())
+    assert len(consolidated_docker_rows) == 1
+
+
+def test_memory_consolidate_tool(store, monkeypatch):
+    """Verify that the memory_consolidate tool can be called and executes consolidation."""
+    import urllib.request
+    import json
+    from mcp_server.server import _build_server
+
+    monkeypatch.setenv("HEXUS_SUMMARY_MODEL", "mock-summary-model")
+
+    # Build server to register tools
+    mcp = _build_server(store, name="hexus-test")
+
+    # Mock urllib.request.urlopen to return empty response/dummy choices
+    dummy_resp = {
+        "choices": [
+            {
+                "message": {
+                    "role": "assistant",
+                    "content": json.dumps({"deletions": [], "replacements": []})
+                }
+            }
+        ]
+    }
+    class MockResponse:
+        def read(self):
+            return json.dumps(dummy_resp).encode("utf-8")
+        def __enter__(self):
+            return self
+        def __exit__(self, exc_type, exc_val, exc_tb):
+            pass
+    monkeypatch.setattr(urllib.request, "urlopen", lambda *args, **kwargs: MockResponse())
+
+    # Get tool from tool cache
+    if hasattr(mcp, "_tool_manager") and hasattr(mcp._tool_manager, "_tools"):
+        tools_dict = mcp._tool_manager._tools
+    elif hasattr(mcp, "_server") and hasattr(mcp._server, "_tool_cache"):
+        tools_dict = mcp._server._tool_cache
+    elif hasattr(mcp, "get_tools"):
+        tools = mcp.get_tools()
+        tools_dict = tools if isinstance(tools, dict) else {t.name: t for t in tools}
+    else:
+        raise AttributeError("Cannot find tool cache in FastMCP instance")
+
+    assert "memory_consolidate" in tools_dict
+    
+    # We can retrieve the underlying function and call it
+    tool_func = tools_dict["memory_consolidate"].fn
+    res = tool_func(agent_identity="test-agent")
+    assert res["status"] == "ok"
+    assert "low_confidence" in res
+    assert "cooccurring" in res
+
+
 
 

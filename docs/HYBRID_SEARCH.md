@@ -8,11 +8,11 @@ Hexus supports advanced hybrid search over both core memory entries (`memory_ent
 
 The hybrid search architecture blends semantic vector distance and full-text keyword matching (using a double-CTE query):
 
-$$\text{Combined Score} = (w_{vector} \times S_{vector}) + (w_{text} \times S_{text})$$
+`Combined Score = (w_vector × S_vector) + (w_text × S_text)`
 
-* **Vector Similarity ($S_{vector}$):** Calculated as $1 - \text{cosine\_distance}(\text{embedding}, \text{query})$.
-* **Text Similarity ($S_{text}$):** Uses Postgres `ts_rank` with English full-text indexing (`to_tsvector` and `websearch_to_tsquery`).
-* **Weights:** You can balance the contribution of both using `vector_weight` ($w_{vector}$) and `text_weight` ($w_{text}$). The default weights are `0.7` and `0.3` respectively.
+* **Vector Similarity (`S_vector`)**: Calculated as `1 - cosine_distance(embedding, query)`.
+* **Text Similarity (`S_text`)**: Uses Postgres `ts_rank` with English full-text indexing (`to_tsvector` and `websearch_to_tsquery`).
+* **Weights**: You can balance the contribution of both using `vector_weight` (`w_vector`) and `text_weight` (`w_text`). The default weights are `0.7` and `0.3` respectively.
 
 ---
 
@@ -23,7 +23,7 @@ Hexus applies post-retrieval mathematical scoring adjustments to reflect memory 
 ### Temporal Decay
 Memory relevance degrades over time (newer items are prioritized). Decay is modeled exponentially based on age:
 
-$$\text{Score}_{decayed} = \text{Score} \times 2^{-\frac{\text{Age}}{\text{HalfLife}}}$$
+`Score_decayed = Score × 2^(-Age / HalfLife)`
 
 * **Half-Life (`decay_half_life_days`):** Specifies the time period (in days) after which a memory's score is halved.
 * Setting `decay_half_life_days = 0.0` (default) disables temporal decay.
@@ -31,7 +31,7 @@ $$\text{Score}_{decayed} = \text{Score} \times 2^{-\frac{\text{Age}}{\text{HalfL
 ### Recall Boosting
 Frequently recalled memories or conversation turns receive a logarithmic score boost to prioritize topics that are frequently requested:
 
-$$\text{Score}_{boosted} = \text{Score} \times (1.0 + w_{boost} \times \ln(1 + \text{recall\_count}))$$
+`Score_boosted = Score × (1.0 + w_boost × ln(1 + recall_count))`
 
 * **Recall Count:** The database increments `recall_count` in the item's JSONB `metadata` every time it is included in search results.
 * **Boost Weight (`recall_boost_weight`):** Controls the scale of the boost.

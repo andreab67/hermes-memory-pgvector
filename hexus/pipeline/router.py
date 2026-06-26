@@ -1,7 +1,6 @@
 # Forked from andreab67/hermes-hexus (BSD-3-Clause)
 import re
 import json
-from typing import Dict, Any, List
 
 class ContentRouter:
     """Pre-processing pipeline to route and compress large memory payloads (> 200 tokens)."""

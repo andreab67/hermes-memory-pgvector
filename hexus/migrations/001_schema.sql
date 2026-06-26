@@ -44,6 +44,8 @@ CREATE TABLE IF NOT EXISTS memory_entries (
   target          TEXT NOT NULL CHECK (target IN ('memory', 'user')),
 
   content         TEXT NOT NULL,
+  -- TODO: For large-scale deployments (>10M rows), support vector quantization (int8/binary)
+  -- to reduce Postgres/HNSW index memory footprint and speed up calculations.
   embedding       vector(384),
 
   created_at      TIMESTAMPTZ NOT NULL DEFAULT now(),

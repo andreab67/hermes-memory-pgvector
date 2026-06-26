@@ -69,7 +69,7 @@ class AsyncWriter:
         self._dropped = 0
         self._dropped_warned = False
         self._lock = threading.Lock()
-        self._latencies: List[float] = []
+        self._latencies: list[float] = []
 
     # -- Public API ----------------------------------------------------------
 
