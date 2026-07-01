@@ -73,6 +73,15 @@ Four capabilities, all storage-layer (still no LLM in the hot path):
 
 Maintenance CLI (`python -m pgvector`, installed as `hermes-pgvector`): `migrate · stats · backfill · prune · cleanup · remap` — destructive commands default to dry-run. v0.4.0 is a clean upgrade from v0.3.x: apply migration `002` to light up attribution/delegation; without it the new hooks no-op and everything else runs unchanged.
 
+## New in v0.4.1 — hybrid recall (vector + full-text)
+
+`recall_memory` and `recall_conversation` now fuse the HNSW **vector** ranking with a Postgres **full-text** ranking using **Reciprocal Rank Fusion** (RRF, `k=60`). A row surfaces if *either* ranker likes it, which fixes the two blind spots of pure cosine similarity:
+
+- **Exact-lexical hits** the embedding smooths away — a specific error code, hostname, flag name, or rare identifier the agent quotes verbatim.
+- **Text-only rows with a `NULL` embedding** (written while the embed endpoint was down) — invisible to the vector index, but the full-text leg finds them. So hybrid recall doubles as best-effort recovery until the next `backfill`.
+
+Still a storage-layer feature: **no LLM, no entity graph, no new tables or columns** — just a GIN index over the existing `content` column (migration `003`) and a fused query. It stays inside invariant #1 (a second index over the same text is not a parallel ontology). Fail-soft as ever: a hybrid hiccup degrades to the proven pure-vector path, and a query that *itself* fails to embed degrades to full-text-only instead of erroring. Toggle with `plugins.pgvector.hybrid_search` (default `true`); the ambient `prefetch()` path stays pure-vector. Works without migration `003` — the GIN index only makes the full-text leg faster.
+
 ## Multi-agent / per-minion themes
 
 Each systemd-run minion sets one header on its OpenAI client; everything else flows automatically:
@@ -134,6 +143,12 @@ sudo -u postgres psql -d <your-memory-db> \
 # runtime role needs — it self-grants, so no extra OWNER step for these).
 sudo -u postgres psql -d <your-memory-db> \
      -f ~/.hermes/plugins/pgvector/migrations/002_agent_attribution.sql
+
+# v0.4.1: apply the hybrid-search full-text indexes (GIN over content on both
+# tables). Optional — hybrid recall works without it, just seq-scans the FTS
+# leg. No new tables/columns/GRANTs; needs no OWNER step.
+sudo -u postgres psql -d <your-memory-db> \
+     -f ~/.hermes/plugins/pgvector/migrations/003_hybrid_search_fts.sql
 # (or apply every migration in order:  hermes-pgvector migrate --admin-dsn "user=postgres host=/var/run/postgresql dbname=<your-memory-db>")
 
 # Hand ownership of the v0.1 tables to the hermes runtime role

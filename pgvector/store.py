@@ -41,6 +41,12 @@ class MemoryStore:
     # table — a hard guardrail against corrupting the synthesis layer (v0.4.0).
     CLEANUP_WHITELIST = ("memory_entries", "conversations")
 
+    # Reciprocal Rank Fusion constant. The standard k=60 from the original RRF
+    # paper (Cormack et al., 2009) — it dampens low-ranked items so a row only
+    # floats to the top when BOTH rankers (vector + full-text) agree, while a
+    # strong hit in either ranker alone still surfaces. Not tuning-sensitive.
+    RRF_K = 60
+
     def __init__(
         self,
         dsn: str,
@@ -365,6 +371,140 @@ class MemoryStore:
             rows = [r for r in rows if (r.get("score") or 0) >= min_similarity]
         return rows
 
+    def hybrid_search(
+        self,
+        *,
+        query_text: str,
+        query_embedding: Optional[List[float]] = None,
+        agent_identity: Optional[str] = None,
+        target: Optional[str] = None,
+        limit: int = 5,
+        pool: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Hybrid recall over memory_entries: vector + full-text, fused by RRF.
+
+        Fuses the HNSW cosine ranking with a Postgres full-text ranking
+        (websearch_to_tsquery / ts_rank_cd) via Reciprocal Rank Fusion, so a
+        row surfaces if EITHER ranker likes it. This recovers exact-lexical
+        hits — rare tokens, identifiers, flags, error codes — that pure cosine
+        similarity smooths away, and, because the full-text leg has no
+        embedding requirement, also recovers text-only rows whose embedding is
+        still NULL (embed endpoint was down at write time) that the pure-vector
+        search() cannot see.
+
+        query_embedding=None → full-text only (used when the query itself failed
+        to embed; recall degrades to lexical instead of erroring). query_text is
+        always required — an empty query returns [].
+
+        `pool` is the per-ranker candidate depth fused before the final cut
+        (default max(limit*4, 40)). Returns rows shaped like search() plus an
+        `rrf_score`; `score` is the cosine similarity, or None for a full-text-
+        only row that has no embedding. There is no min_similarity: RRF ranks,
+        it does not threshold — filter on `score` downstream if a floor matters.
+        """
+        if not query_text or not query_text.strip():
+            return []
+        if pool is None:
+            pool = max(int(limit) * 4, 40)
+
+        params: Dict[str, Any] = {
+            "qtext": query_text, "k": self.RRF_K, "pool": pool, "limit": limit,
+        }
+        filters: List[str] = []
+        if agent_identity:
+            filters.append("agent_identity = %(agent)s")
+            params["agent"] = agent_identity
+        if target:
+            filters.append("target = %(target)s")
+            params["target"] = target
+        extra = (" AND " + " AND ".join(filters)) if filters else ""
+
+        sql = self._build_hybrid_sql(
+            table="memory_entries",
+            extra_filter=extra,
+            has_vector=query_embedding is not None,
+            columns="m.id, m.agent_identity, m.target, m.content, "
+                    "m.created_at, m.updated_at, m.metadata",
+        )
+        if query_embedding is not None:
+            params["qvec"] = to_pgvector_literal(query_embedding)
+
+        with self._get_pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, params)
+                return list(cur.fetchall())
+
+    @staticmethod
+    def _build_hybrid_sql(
+        *, table: str, extra_filter: str, has_vector: bool, columns: str
+    ) -> str:
+        """Assemble the RRF hybrid query for `table`.
+
+        `table` is a trusted literal (never user input — only 'memory_entries'
+        / 'conversations' from our own call sites). The vec CTE runs the ANN
+        `ORDER BY embedding <=> q LIMIT pool` in a subquery and assigns ranks
+        with ROW_NUMBER() OVER () *outside* that limit, so the HNSW index still
+        serves the top-`pool` scan — a window ORDER BY on the distance would
+        force an exact full sort and defeat the index. When has_vector is False
+        the vec CTE is omitted and fusion runs on the full-text leg alone.
+        """
+        vec_cte = ""
+        score_expr = "NULL::float8 AS score"
+        if has_vector:
+            # Rank AFTER the ANN limit: the inner `ORDER BY embedding <=> q
+            # LIMIT pool` is a plain top-`pool` KNN the HNSW index serves, and
+            # ROW_NUMBER() OVER () numbers those already-ordered rows without a
+            # full sort. A window ORDER BY on the distance here would instead
+            # force an exact sort over every candidate row and defeat the index.
+            vec_cte = f"""
+                vec AS (
+                    SELECT id, ROW_NUMBER() OVER () AS rnk
+                    FROM (
+                        SELECT id
+                        FROM {table}
+                        WHERE embedding IS NOT NULL{extra_filter}
+                        ORDER BY embedding <=> %(qvec)s::vector
+                        LIMIT %(pool)s
+                    ) v
+                ),"""
+            score_expr = (
+                "CASE WHEN m.embedding IS NULL THEN NULL "
+                "ELSE 1 - (m.embedding <=> %(qvec)s::vector) END AS score"
+            )
+        fts_cte = f"""
+                fts AS (
+                    SELECT id, ROW_NUMBER() OVER (
+                               ORDER BY ts_rank_cd(
+                                   to_tsvector('english', content), q) DESC) AS rnk
+                    FROM {table}, websearch_to_tsquery('english', %(qtext)s) q
+                    WHERE to_tsvector('english', content) @@ q{extra_filter}
+                    ORDER BY ts_rank_cd(to_tsvector('english', content), q) DESC
+                    LIMIT %(pool)s
+                )"""
+        if has_vector:
+            fused = """
+                fused AS (
+                    SELECT COALESCE(vec.id, fts.id) AS id,
+                           COALESCE(1.0 / (%(k)s + vec.rnk), 0)
+                         + COALESCE(1.0 / (%(k)s + fts.rnk), 0) AS rrf
+                    FROM vec FULL OUTER JOIN fts ON vec.id = fts.id
+                )"""
+        else:
+            fused = """
+                fused AS (
+                    SELECT fts.id AS id, 1.0 / (%(k)s + fts.rnk) AS rrf
+                    FROM fts
+                )"""
+        return f"""
+            WITH{vec_cte}{fts_cte},
+                {fused}
+            SELECT {columns}, {score_expr}, f.rrf AS rrf_score
+            FROM fused f
+            JOIN {table} m ON m.id = f.id
+            ORDER BY f.rrf DESC
+            LIMIT %(limit)s
+        """
+
     # -- Bulk import from MEMORY.md / USER.md (v0.1.1) ----------------------
 
     # Matches tools/memory_tool.py:ENTRY_DELIMITER. Keep in sync if upstream
@@ -529,6 +669,50 @@ class MemoryStore:
         if min_similarity > 0:
             rows = [r for r in rows if (r.get("score") or 0) >= min_similarity]
         return rows
+
+    def hybrid_search_turns(
+        self,
+        *,
+        query_text: str,
+        query_embedding: Optional[List[float]] = None,
+        agent_identity: Optional[str] = None,
+        session_id: Optional[str] = None,
+        limit: int = 5,
+        pool: Optional[int] = None,
+    ) -> List[Dict[str, Any]]:
+        """Hybrid recall over conversation turns. RRF fusion, same shape as
+        hybrid_search() but returns turn columns (session_id, role, ts)."""
+        if not query_text or not query_text.strip():
+            return []
+        if pool is None:
+            pool = max(int(limit) * 4, 40)
+
+        params: Dict[str, Any] = {
+            "qtext": query_text, "k": self.RRF_K, "pool": pool, "limit": limit,
+        }
+        filters: List[str] = []
+        if agent_identity:
+            filters.append("agent_identity = %(agent)s")
+            params["agent"] = agent_identity
+        if session_id:
+            filters.append("session_id = %(session)s")
+            params["session"] = session_id
+        extra = (" AND " + " AND ".join(filters)) if filters else ""
+
+        sql = self._build_hybrid_sql(
+            table="conversations",
+            extra_filter=extra,
+            has_vector=query_embedding is not None,
+            columns="m.id, m.session_id, m.agent_identity, m.role, "
+                    "m.content, m.ts, m.metadata",
+        )
+        if query_embedding is not None:
+            params["qvec"] = to_pgvector_literal(query_embedding)
+
+        with self._get_pool().connection() as conn:
+            with conn.cursor(row_factory=dict_row) as cur:
+                cur.execute(sql, params)
+                return list(cur.fetchall())
 
     # -- Maintenance ---------------------------------------------------------
 

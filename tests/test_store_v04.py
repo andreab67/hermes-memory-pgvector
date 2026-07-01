@@ -14,9 +14,9 @@ from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pgvector"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from store import MemoryStore  # noqa: E402
+from pgvector.store import MemoryStore  # noqa: E402
 
 
 @pytest.fixture

@@ -23,6 +23,7 @@ Config in $HERMES_HOME/config.yaml under plugins.pgvector:
         min_similarity: 0.30
         embed_on_write: true
         scope_default: "current"   # 'current' | 'all'
+        hybrid_search: true        # fuse vector + full-text (RRF) in recall tools
 
 Tools exposed: `recall_memory` (one explicit search tool). All built-in
 memory writes (add/replace/remove) are mirrored automatically via the
@@ -182,6 +183,13 @@ DEFAULTS = {
     "min_similarity": 0.30,
     "embed_on_write": True,
     "scope_default": "current",
+    # v0.4.1 — hybrid recall: fuse the HNSW vector ranking with a Postgres
+    # full-text ranking via RRF in the recall_memory / recall_conversation
+    # tools. Recovers exact-lexical hits cosine smooths away + text-only rows
+    # with NULL embeddings. Degrades to pure vector on any error, and to
+    # full-text-only when the query fails to embed. Needs migration 003 for the
+    # GIN index (works without it, just slower — seq-scan FTS on a small table).
+    "hybrid_search": True,
     "write_queue_maxsize": 256,
     # v0.1.1 — bulk sync MEMORY.md / USER.md on init
     "bulk_sync_on_init": True,
@@ -838,6 +846,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         if target_filter not in (None, "memory", "user"):
             return tool_error(f"Invalid target: {target_arg!r}")
 
+        hybrid = bool(self._config.get("hybrid_search", True))
         try:
             vec = embed(
                 query,
@@ -845,17 +854,44 @@ class PgvectorMemoryProvider(MemoryProvider):
                 model=self._config["embed_model"],
             )
         except EmbeddingError as exc:
-            return json.dumps({"results": [], "count": 0, "error": f"embed: {exc}"})
+            if not hybrid:
+                return json.dumps({"results": [], "count": 0, "error": f"embed: {exc}"})
+            # Hybrid on: the query text still drives a full-text search without a
+            # vector, so degrade to lexical recall instead of erroring.
+            logger.debug("recall_memory embed failed; full-text-only: %s", exc)
+            vec = None
 
         try:
-            rows = self._store.search(
-                query_embedding=vec,
-                agent_identity=agent_filter,
-                target=target_filter,
-                limit=limit,
-            )
+            if hybrid:
+                rows = self._store.hybrid_search(
+                    query_text=query,
+                    query_embedding=vec,
+                    agent_identity=agent_filter,
+                    target=target_filter,
+                    limit=limit,
+                )
+            else:
+                rows = self._store.search(
+                    query_embedding=vec,
+                    agent_identity=agent_filter,
+                    target=target_filter,
+                    limit=limit,
+                )
         except Exception as exc:  # noqa: BLE001
-            return json.dumps({"results": [], "count": 0, "error": f"db: {exc}"})
+            # Fail-soft: a hybrid hiccup with a usable vector falls back to the
+            # proven pure-vector path rather than returning nothing.
+            if hybrid and vec is not None:
+                try:
+                    rows = self._store.search(
+                        query_embedding=vec,
+                        agent_identity=agent_filter,
+                        target=target_filter,
+                        limit=limit,
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    return json.dumps({"results": [], "count": 0, "error": f"db: {exc2}"})
+            else:
+                return json.dumps({"results": [], "count": 0, "error": f"db: {exc}"})
 
         results = []
         for r in rows:
@@ -897,6 +933,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         else:
             agent_filter = scope  # treat as a specific theme name
 
+        hybrid = bool(self._config.get("hybrid_search", True))
         try:
             vec = embed(
                 query,
@@ -904,17 +941,40 @@ class PgvectorMemoryProvider(MemoryProvider):
                 model=self._config["embed_model"],
             )
         except EmbeddingError as exc:
-            return json.dumps({"results": [], "count": 0, "error": f"embed: {exc}"})
+            if not hybrid:
+                return json.dumps({"results": [], "count": 0, "error": f"embed: {exc}"})
+            logger.debug("recall_conversation embed failed; full-text-only: %s", exc)
+            vec = None
 
         try:
-            rows = self._store.search_turns(
-                query_embedding=vec,
-                agent_identity=agent_filter,
-                session_id=session_filter,
-                limit=limit,
-            )
+            if hybrid:
+                rows = self._store.hybrid_search_turns(
+                    query_text=query,
+                    query_embedding=vec,
+                    agent_identity=agent_filter,
+                    session_id=session_filter,
+                    limit=limit,
+                )
+            else:
+                rows = self._store.search_turns(
+                    query_embedding=vec,
+                    agent_identity=agent_filter,
+                    session_id=session_filter,
+                    limit=limit,
+                )
         except Exception as exc:  # noqa: BLE001
-            return json.dumps({"results": [], "count": 0, "error": f"db: {exc}"})
+            if hybrid and vec is not None:
+                try:
+                    rows = self._store.search_turns(
+                        query_embedding=vec,
+                        agent_identity=agent_filter,
+                        session_id=session_filter,
+                        limit=limit,
+                    )
+                except Exception as exc2:  # noqa: BLE001
+                    return json.dumps({"results": [], "count": 0, "error": f"db: {exc2}"})
+            else:
+                return json.dumps({"results": [], "count": 0, "error": f"db: {exc}"})
 
         results = []
         for r in rows:
@@ -974,6 +1034,12 @@ class PgvectorMemoryProvider(MemoryProvider):
                 "description": "Default scope for recall_memory when caller omits it",
                 "default": DEFAULTS["scope_default"],
                 "choices": ["current", "all"],
+            },
+            {
+                "key": "hybrid_search",
+                "description": "v0.4.1: fuse the HNSW vector ranking with a Postgres full-text ranking (Reciprocal Rank Fusion) in recall_memory / recall_conversation. Recovers exact-lexical hits cosine smooths away and text-only rows with NULL embeddings; degrades to pure vector on error and to full-text-only when the query fails to embed. Apply migration 003 for the GIN index (works without it, just slower).",
+                "default": "true",
+                "choices": ["true", "false"],
             },
             {
                 "key": "write_queue_maxsize",

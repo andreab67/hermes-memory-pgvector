@@ -90,6 +90,19 @@ Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolati
 
 ---
 
+### M4.1 — Hybrid recall: vector + full-text (v0.4.1) ✅ DONE
+
+`recall_memory` / `recall_conversation` fuse the HNSW cosine ranking with a Postgres full-text ranking via **Reciprocal Rank Fusion** (`k=60`). Recovers exact-lexical hits that pure cosine smooths away (error codes, hostnames, flags, rare identifiers) and text-only rows with a `NULL` embedding that the vector index can't see. Migration `003` adds a GIN index over the existing `content` column — **no new tables, columns, or LLM** (stays inside invariant #1: a second index over the same text, not a parallel ontology). Fail-soft: degrades to pure vector on a hybrid error, and to full-text-only when the query itself fails to embed. Toggle via `plugins.pgvector.hybrid_search` (default on); ambient `prefetch()` stays pure-vector.
+
+| Capability | Version |
+|---|---|
+| GIN `to_tsvector('english', content)` indexes on `memory_entries` + `conversations` (migration `003`) | v0.4.1 |
+| `MemoryStore.hybrid_search()` / `hybrid_search_turns()` — RRF fusion of vector + full-text rankers | v0.4.1 |
+| Full-text-only degradation when the query fails to embed (recall instead of error) | v0.4.1 |
+| `hybrid_search` config toggle | v0.4.1 |
+
+---
+
 ### M5 — Production hardening at scale (v0.5 → v0.6) ⏳ PROPOSED
 
 **Goal:** survive a fleet of dozens of minions, hundreds of writes per minute, multi-million-row tables.
