@@ -281,4 +281,4 @@ Bug reports + PRs welcome. Open an issue describing the failure mode + your envi
 
 ## License
 
-[BSD 3-Clause](LICENSE) © 2026 Andrea Borghi.
+[BSD 3-Clause](LICENSE) © 2026 Green Yoga Inc
