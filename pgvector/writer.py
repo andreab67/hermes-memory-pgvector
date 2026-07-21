@@ -63,7 +63,8 @@ class AsyncWriter:
         self._worker_fn = worker_fn
         self._queue: "queue.Queue[Optional[_PendingWrite]]" = queue.Queue(maxsize=maxsize)
         self._thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()
+        self._stop = threading.Event()      # hard stop: exit ASAP, abandon queue
+        self._draining = threading.Event()  # graceful stop: exit once queue is empty
         self._dropped = 0
         self._dropped_warned = False
         self._lock = threading.Lock()
@@ -109,17 +110,31 @@ class AsyncWriter:
             return False
 
     def shutdown(self, timeout: float = 5.0) -> None:
-        """Signal stop + wait for the queue to drain (up to `timeout` seconds)."""
+        """Drain the queue (up to `timeout` seconds), then stop the thread.
+
+        The drain flag is set FIRST, so the thread exits only once the queue
+        is empty — a full queue at shutdown time is drained rather than
+        silently abandoned, and items racing in behind the wake-up sentinel
+        are still processed (v0.4.2; previously a full queue downgraded to a
+        hard stop that dropped up to maxsize-1 accepted writes with no log).
+        """
         if not self._thread or not self._thread.is_alive():
             return
-        # Sentinel wakes the thread even if the queue is empty.
+        self._draining.set()
         try:
+            # Sentinel wakes the thread instantly if it's idle on an empty
+            # queue; if the queue is full the 0.5s get-timeout wakes it anyway.
             self._queue.put_nowait(None)
         except queue.Full:
-            self._stop.set()
+            pass
         self._thread.join(timeout=timeout)
         if self._thread.is_alive():
             logger.warning("pgvector writer thread did not drain within %.1fs", timeout)
+        leftover = self._queue.qsize()
+        if leftover:
+            logger.warning(
+                "pgvector writer shutdown abandoned %d queued write(s)", leftover
+            )
 
     def stats(self) -> Dict[str, Any]:
         return {
@@ -136,6 +151,7 @@ class AsyncWriter:
             if self._thread and self._thread.is_alive():
                 return
             self._stop.clear()
+            self._draining.clear()
             self._thread = threading.Thread(
                 target=self._run,
                 name="pgvector-writer",
@@ -148,9 +164,15 @@ class AsyncWriter:
             try:
                 item = self._queue.get(timeout=0.5)
             except queue.Empty:
+                if self._draining.is_set():
+                    break  # queue fully drained — graceful shutdown complete
                 continue
-            if item is None:  # shutdown sentinel
+            if item is None:  # shutdown wake-up sentinel
                 self._queue.task_done()
+                if self._draining.is_set():
+                    # Keep draining — real items can be queued BEHIND the
+                    # sentinel (enqueue racing shutdown); exit on Empty above.
+                    continue
                 break
             try:
                 self._worker_fn(item)

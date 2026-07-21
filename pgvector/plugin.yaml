@@ -1,5 +1,5 @@
 name: pgvector
-version: 0.4.1
+version: 0.4.2
 description: "Postgres + pgvector storage layer for hermes-agent. Mirrors built-in MEMORY.md / USER.md + captures every substantive (user, assistant) chat turn into a conversations table. Per-agent themes via X-Hermes-Session-Key with v0.4 identity governance (PII/DM-key bucketing, bench isolation, allow-list). Agent attribution + parent->child delegation provenance (memory_agents / memory_agent_edges). 768-dim semantic recall with hybrid vector+full-text (RRF) ranking, embedding backfill, conversation TTL. Async writer + connection pool. No LLM mediation."
 pip_dependencies:
   - "psycopg[binary]>=3.3.4"

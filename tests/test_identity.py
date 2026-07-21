@@ -1,7 +1,9 @@
 """Unit tests for pgvector/identity.py — pure normalization, no DB or embed.
 
 These run everywhere (no PG_TEST_DSN needed); identity.py has no I/O.
-Import style matches test_smoke.py (sibling import via sys.path insert).
+Import style matches test_smoke.py (repo root on sys.path, package imports —
+v0.4.2: the old pgvector/-dir insert leaked bare module names onto sys.path
+for the whole pytest process, masking broken imports in sibling test files).
 """
 
 from __future__ import annotations
@@ -9,9 +11,9 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "pgvector"))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from identity import (  # noqa: E402
+from pgvector.identity import (  # noqa: E402
     BENCH_BUCKET,
     DEFAULT_IDENTITY,
     DM_BUCKET,
@@ -66,6 +68,21 @@ def test_dm_bucket_is_idempotent():
     canon, normalized, _ = normalize_identity(DM_BUCKET)
     assert canon == DM_BUCKET
     assert normalized is False  # already canonical, nothing changed
+
+
+def test_platform_token_alone_is_not_a_dm_key():
+    # v0.4.2: a bare ':signal:'/':whatsapp:' segment no longer sweeps ordinary
+    # colon-namespaced themes into the DM bucket on nothing but the word.
+    canon, _, reason = normalize_identity("desk:signal:main")
+    assert canon == "desk:signal:main"
+    assert reason == "unchanged"
+
+
+def test_platform_followed_by_id_is_a_dm_key():
+    for raw in ("whatsapp:17195550000", "agent:x:signal:12345", "telegram:+15551234"):
+        canon, _, reason = normalize_identity(raw)
+        assert canon == DM_BUCKET
+        assert reason == "dm-bucket"
 
 
 # --- bench isolation ------------------------------------------------------

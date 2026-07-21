@@ -35,8 +35,17 @@ from typing import Iterable, Mapping, Optional, Tuple
 # segment. Collapse the whole family to ONE bucket so we neither get a theme
 # per contact (cardinality) nor store the phone number as an agent_identity
 # (PII). Matches e.g. 'agent:main:whatsapp:dm:17192714834',
-# 'agent:x:telegram:dm:55512345', 'signal:dm:+1...'.
-_DM_RE = re.compile(r"(?:^|:)dm:|:whatsapp:|:telegram:|:signal:", re.IGNORECASE)
+# 'agent:x:telegram:dm:55512345', 'signal:dm:+1...', 'whatsapp:17195550000'.
+#
+# v0.4.2: a platform token alone no longer triggers — it must be followed by
+# a 'dm:' segment or a phone/chat id. The old pattern's bare ':signal:'
+# alternative swept ordinary colon-namespaced themes (e.g. a trading key like
+# 'desk:signal:main') into the DM bucket, breaking theme isolation on nothing
+# but the word "signal".
+_DM_RE = re.compile(
+    r"(?:^|:)dm:|(?:^|:)(?:whatsapp|telegram|signal):(?=dm:|\+?\d)",
+    re.IGNORECASE,
+)
 
 # Benchmark / test-harness identities that must not pollute durable prod memory.
 # 'skill-bench', 'skill-bench-ws', '<x>-bench', '<x>-bench-ws', 'bench'.

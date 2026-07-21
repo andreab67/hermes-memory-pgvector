@@ -84,6 +84,17 @@ _NOISE_RE = re.compile(
 logger = logging.getLogger(__name__)
 
 
+# Credential-looking fragments that must never round-trip into a tool response
+# (psycopg/libpq errors can echo conninfo verbatim; tool errors flow back to
+# the model and can be persisted durably by conversation capture).
+_CRED_RE = re.compile(r"(password|passfile|sslkey|sslpassword)=\S+", re.IGNORECASE)
+
+
+def _safe_err(exc: BaseException) -> str:
+    """Exception text safe to return to the model: truncated + creds redacted."""
+    return _CRED_RE.sub(r"\1=[redacted]", str(exc)[:300])
+
+
 # ---------------------------------------------------------------------------
 # Tool schema — one explicit search over memory_entries
 # ---------------------------------------------------------------------------
@@ -195,7 +206,7 @@ DEFAULTS = {
     "bulk_sync_on_init": True,
     # v0.2 — conversation turn capture
     "sync_turns": True,
-    "turn_min_chars": 40,  # turns shorter than this are noise unless > 200 chars or contain tool refs
+    "turn_min_chars": 40,  # turns shorter than this (after strip) are boilerplate noise
     # v0.4 — identity governance
     "allowed_themes": None,        # None/empty = governance off; set a list to enforce an allow-list
     "identity_aliases": {},        # {raw: canonical} remaps applied before normalization
@@ -257,6 +268,11 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     def initialize(self, session_id: str, **kwargs) -> None:
         self._session_id = session_id
+        # Per-session log-signal reset (v0.4.2): the provider instance is
+        # reused across sessions, so without this a single embed failure in
+        # any past session silences the one-time warning for the process
+        # lifetime — a later session with a broken endpoint gets zero signal.
+        self._embed_warned = False
         # Per-agent theme scoping — priority order:
         #   1. gateway_session_key — from the `X-Hermes-Session-Key` header on
         #      API requests. This is the EXPLICIT minion-scope signal sent by
@@ -837,6 +853,14 @@ class PgvectorMemoryProvider(MemoryProvider):
             agent_filter: Optional[str] = self._agent_identity
         elif scope == "all":
             agent_filter = None
+        elif scope == "session":
+            # Only recall_conversation supports 'session'. Falling through
+            # would silently filter on a literal 'session' theme and return
+            # zero rows — indistinguishable from "nothing found" (v0.4.2).
+            return tool_error(
+                "scope='session' is only valid for recall_conversation; "
+                "use 'current', 'all', or a theme name here."
+            )
         else:
             agent_filter = scope
 
@@ -855,7 +879,7 @@ class PgvectorMemoryProvider(MemoryProvider):
             )
         except EmbeddingError as exc:
             if not hybrid:
-                return json.dumps({"results": [], "count": 0, "error": f"embed: {exc}"})
+                return json.dumps({"results": [], "count": 0, "error": f"embed: {_safe_err(exc)}"})
             # Hybrid on: the query text still drives a full-text search without a
             # vector, so degrade to lexical recall instead of erroring.
             logger.debug("recall_memory embed failed; full-text-only: %s", exc)
@@ -889,23 +913,28 @@ class PgvectorMemoryProvider(MemoryProvider):
                         limit=limit,
                     )
                 except Exception as exc2:  # noqa: BLE001
-                    return json.dumps({"results": [], "count": 0, "error": f"db: {exc2}"})
+                    return json.dumps({"results": [], "count": 0, "error": f"db: {_safe_err(exc2)}"})
             else:
-                return json.dumps({"results": [], "count": 0, "error": f"db: {exc}"})
+                return json.dumps({"results": [], "count": 0, "error": f"db: {_safe_err(exc)}"})
 
         results = []
         for r in rows:
             ts = r.get("updated_at") or r.get("created_at")
-            results.append(
-                {
-                    "id": r.get("id"),
-                    "agent_identity": r.get("agent_identity"),
-                    "target": r.get("target"),
-                    "ts": ts.isoformat() if ts else None,
-                    "score": round(float(r.get("score") or 0.0), 4),
-                    "content": (r.get("content") or "")[:2000],
-                }
-            )
+            score = r.get("score")
+            entry = {
+                "id": r.get("id"),
+                "agent_identity": r.get("agent_identity"),
+                "target": r.get("target"),
+                "ts": ts.isoformat() if ts else None,
+                # None stays None (v0.4.2): a full-text-only hybrid hit has no
+                # cosine score; flattening it to 0.0 made a strong lexical
+                # match look identical to an orthogonal vector match.
+                "score": round(float(score), 4) if score is not None else None,
+                "content": (r.get("content") or "")[:2000],
+            }
+            if r.get("rrf_score") is not None:
+                entry["rrf_score"] = round(float(r["rrf_score"]), 6)
+            results.append(entry)
         return json.dumps({"results": results, "count": len(results)})
 
     def _handle_recall_conversation(self, args: Dict[str, Any]) -> str:
@@ -942,7 +971,7 @@ class PgvectorMemoryProvider(MemoryProvider):
             )
         except EmbeddingError as exc:
             if not hybrid:
-                return json.dumps({"results": [], "count": 0, "error": f"embed: {exc}"})
+                return json.dumps({"results": [], "count": 0, "error": f"embed: {_safe_err(exc)}"})
             logger.debug("recall_conversation embed failed; full-text-only: %s", exc)
             vec = None
 
@@ -972,24 +1001,26 @@ class PgvectorMemoryProvider(MemoryProvider):
                         limit=limit,
                     )
                 except Exception as exc2:  # noqa: BLE001
-                    return json.dumps({"results": [], "count": 0, "error": f"db: {exc2}"})
+                    return json.dumps({"results": [], "count": 0, "error": f"db: {_safe_err(exc2)}"})
             else:
-                return json.dumps({"results": [], "count": 0, "error": f"db: {exc}"})
+                return json.dumps({"results": [], "count": 0, "error": f"db: {_safe_err(exc)}"})
 
         results = []
         for r in rows:
             ts = r.get("ts")
-            results.append(
-                {
-                    "id": r.get("id"),
-                    "agent_identity": r.get("agent_identity"),
-                    "session_id": r.get("session_id"),
-                    "role": r.get("role"),
-                    "ts": ts.isoformat() if ts else None,
-                    "score": round(float(r.get("score") or 0.0), 4),
-                    "content": (r.get("content") or "")[:2000],
-                }
-            )
+            score = r.get("score")
+            entry = {
+                "id": r.get("id"),
+                "agent_identity": r.get("agent_identity"),
+                "session_id": r.get("session_id"),
+                "role": r.get("role"),
+                "ts": ts.isoformat() if ts else None,
+                "score": round(float(score), 4) if score is not None else None,
+                "content": (r.get("content") or "")[:2000],
+            }
+            if r.get("rrf_score") is not None:
+                entry["rrf_score"] = round(float(r["rrf_score"]), 6)
+            results.append(entry)
         return json.dumps({"results": results, "count": len(results)})
 
     # -- Setup hooks ---------------------------------------------------------

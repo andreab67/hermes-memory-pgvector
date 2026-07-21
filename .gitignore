@@ -46,3 +46,6 @@ CLAUDE.md
 AGENTS.md
 .planning/
 .claude/
+
+# VarAlign local store (machine-local variable-tracking data)
+.varmem/

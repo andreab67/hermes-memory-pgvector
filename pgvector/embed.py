@@ -22,6 +22,16 @@ class EmbeddingError(Exception):
     """Raised when the embedding endpoint fails to return a usable vector."""
 
 
+class EmbeddingDimensionError(EmbeddingError):
+    """Endpoint reachable but returned wrong-dimension vectors.
+
+    Distinct from generic EmbeddingError so the protocol-fallback path can
+    tell "endpoint down, try the other protocol" apart from "endpoint fine,
+    the MODEL is misconfigured" — the latter must surface as-is (invariant
+    #7), not be masked by a 404 from retrying the other protocol (v0.4.2).
+    """
+
+
 def embed(
     text: str,
     *,
@@ -74,6 +84,11 @@ def _embed_once(text: str, *, base_url: str, model: str, timeout: float) -> List
             timeout=timeout,
             extract=lambda d: d["data"][0]["embedding"],
         )
+    except EmbeddingDimensionError:
+        # The endpoint answered — the model is just wrong-dimensional.
+        # Falling through to the native protocol would 404 on a pure
+        # OpenAI-compatible server and bury the actionable message.
+        raise
     except EmbeddingError as exc:
         logger.debug("OpenAI-compat embed failed (%s); trying native", exc)
 
@@ -112,7 +127,7 @@ def _post(url: str, body: dict, *, timeout: float, extract) -> List[float]:
     if not isinstance(vec, list) or not vec:
         raise EmbeddingError("response had no embedding array")
     if len(vec) != 768:
-        raise EmbeddingError(f"expected 768 dims, got {len(vec)}")
+        raise EmbeddingDimensionError(f"expected 768 dims, got {len(vec)}")
     return vec
 
 

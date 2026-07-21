@@ -54,24 +54,24 @@ cat <<EOF
 
 ==> Plugin files installed.
 
+NOTE: for production installs prefer the pip-native path (v0.4.2+):
+    pip install hermes-memory-pgvector && hermes-pgvector install
+This script remains the from-clone alternative.
+
 Next steps (admin once):
-  1. Apply the schema migration as a DB superuser:
-       sudo -u postgres psql -d <your-memory-db> \\
-            -f "$PLUGIN_DIR/migrations/001_schema.sql"
+  1. Apply ALL migrations (schema + attribution + FTS indexes + runtime
+     grants) in one shot — from the repo root:
+       python -m pgvector migrate --admin-dsn \\
+           "dbname=<your-memory-db> user=postgres host=/var/run/postgresql"
+     (or apply migrations/00*.sql in lexical order with psql -f; migration
+      004 grants the runtime 'hermes' role DML on the 001 tables — no manual
+      OWNER transfer needed anymore)
 
-  2. Transfer ownership of the new tables to the hermes runtime role:
-       sudo -u postgres psql -d <your-memory-db> -c "
-       ALTER TABLE memory_entries OWNER TO hermes;
-       ALTER SEQUENCE memory_entries_id_seq OWNER TO hermes;
-       ALTER TABLE conversations OWNER TO hermes;
-       ALTER SEQUENCE conversations_id_seq OWNER TO hermes;
-       "
-
-  3. Activate the provider:
+  2. Activate the provider:
        hermes config set memory.provider pgvector
        sudo systemctl restart hermes.service   # or however you run hermes
 
-  4. Verify:
+  3. Verify:
        hermes memory status
        # expect: Provider: pgvector; Status: available
 

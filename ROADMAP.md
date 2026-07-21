@@ -103,6 +103,18 @@ Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolati
 
 ---
 
+### M4.2 — Pip-native install + review hardening (v0.4.2) ✅ DONE
+
+`pip install hermes-memory-pgvector` + `hermes-pgvector install` is now a complete deployment on any hermes-agent host: the new `install` subcommand generates a `$HERMES_HOME/plugins/pgvector/` discovery shim (hermes-agent scans plugin directories only — never site-packages — so pip alone was invisible to it), and migration `004` grants the runtime role DML on the core tables so `migrate` alone yields a working install. Plus a full-codebase review's fixes: LIKE-literal `replace`/`remove` matching, drain-on-shutdown writer, unmasked dimension-mismatch errors, tightened DM-key regex, bulk-import circuit breaker, remap guard under lock, credential-redacted tool errors, preserved `score: null` + `rrf_score` for hybrid hits.
+
+| Capability | Version |
+|---|---|
+| `hermes-pgvector install [--remove] [--force]` discovery-shim generator | v0.4.2 |
+| Migration `004` — runtime-role grants (no manual OWNER step) | v0.4.2 |
+| Review hardening (writer drain, LIKE escaping, dim-error surfacing, DM regex, circuit breaker) | v0.4.2 |
+
+---
+
 ### M5 — Production hardening at scale (v0.5 → v0.6) ⏳ PROPOSED
 
 **Goal:** survive a fleet of dozens of minions, hundreds of writes per minute, multi-million-row tables.

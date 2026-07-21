@@ -82,6 +82,12 @@ Maintenance CLI (`python -m pgvector`, installed as `hermes-pgvector`): `migrate
 
 Still a storage-layer feature: **no LLM, no entity graph, no new tables or columns** — just a GIN index over the existing `content` column (migration `003`) and a fused query. It stays inside invariant #1 (a second index over the same text is not a parallel ontology). Fail-soft as ever: a hybrid hiccup degrades to the proven pure-vector path, and a query that *itself* fails to embed degrades to full-text-only instead of erroring. Toggle with `plugins.pgvector.hybrid_search` (default `true`); the ambient `prefetch()` path stays pure-vector. Works without migration `003` — the GIN index only makes the full-text leg faster.
 
+## New in v0.4.2 — pip-native install + hardening
+
+- **`hermes-pgvector install`** — makes a plain `pip install hermes-memory-pgvector` deployable on ANY hermes-agent install: generates the `$HERMES_HOME/plugins/pgvector/` discovery shim (see *Install · Option 1*). No more vendored copies or editable checkouts.
+- **Migration `004`** — `hermes-pgvector migrate` now grants the runtime role DML on `memory_entries`/`conversations` itself; the manual OWNER-transfer step is gone (fresh installs previously hit `permission denied` if it was skipped).
+- **Correctness fixes** from a full-codebase review: `replace`/`remove` now match `old_text` as a *literal* substring (LIKE `%`/`_`/`\` metacharacters no longer over- or under-match — parity with the built-in tool's `in` semantics); the async writer drains its queue on shutdown instead of silently abandoning up to 255 accepted writes when full; a wrong-dimension embed model now surfaces as `expected 768 dims, got N` instead of a masking 404; DM-key bucketing no longer sweeps ordinary `:signal:`-containing theme names into `whatsapp-dm`; bulk MEMORY.md import circuit-breaks after 3 consecutive embed failures (a hanging endpoint can no longer block session start for minutes); `remap` re-checks its duplicate-drop guard under the advisory lock; tool errors redact credential-looking fragments and preserve `score: null` for full-text-only hybrid hits (with `rrf_score` now included); `recall_memory(scope='session')` returns a helpful error instead of silently matching nothing.
+
 ## Multi-agent / per-minion themes
 
 Each systemd-run minion sets one header on its OpenAI client; everything else flows automatically:
@@ -106,7 +112,28 @@ Set `plugins.pgvector.allowed_themes` to that product/worker list to enforce it 
 
 ## Install
 
-### Option 1: clone + run the installer script (recommended)
+### Option 1: pip + discovery shim (recommended, v0.4.2+)
+
+```bash
+# 1. Install the package into the SAME environment hermes-agent runs in
+pip install hermes-memory-pgvector
+
+# 2. Create the discovery shim
+hermes-pgvector install          # writes $HERMES_HOME/plugins/pgvector/
+
+# 3. Apply ALL migrations (schema + attribution + FTS + runtime grants)
+hermes-pgvector migrate --admin-dsn \
+    "dbname=<your-memory-db> user=postgres host=/var/run/postgresql"
+
+# 4. Activate + verify
+hermes config set memory.provider pgvector
+sudo systemctl restart hermes.service
+hermes memory status             # expect: Provider: pgvector; Status: available
+```
+
+**Why the shim?** hermes-agent discovers memory providers by scanning plugin *directories* — `plugins/memory/<name>/` (bundled) and `$HERMES_HOME/plugins/<name>/` (user) — and never looks at installed packages. `pip install` alone is therefore invisible to it. `hermes-pgvector install` writes a two-line shim whose absolute import resolves to the pip-installed package, so upgrades are just `pip install -U hermes-memory-pgvector` + restart, and rollback is `pip install hermes-memory-pgvector==<prev>` + restart — the shim never changes. `--remove` deletes it; if the package is uninstalled the shim import fails cleanly and hermes falls back to built-in memory.
+
+### Option 2: clone + run the installer script (from source)
 
 ```bash
 git clone https://github.com/andreab67/hermes-memory-pgvector.git
@@ -120,7 +147,7 @@ That:
 2. Copies `pgvector/` into `$HERMES_HOME/plugins/pgvector/` (defaults to `~/.hermes/plugins/pgvector/`).
 3. Prints the admin migration + activation commands you run next.
 
-### Option 2: manual
+### Option 3: manual
 
 ```bash
 # Python deps
@@ -149,15 +176,13 @@ sudo -u postgres psql -d <your-memory-db> \
 # leg. No new tables/columns/GRANTs; needs no OWNER step.
 sudo -u postgres psql -d <your-memory-db> \
      -f ~/.hermes/plugins/pgvector/migrations/003_hybrid_search_fts.sql
-# (or apply every migration in order:  hermes-pgvector migrate --admin-dsn "user=postgres host=/var/run/postgresql dbname=<your-memory-db>")
 
-# Hand ownership of the v0.1 tables to the hermes runtime role
-sudo -u postgres psql -d <your-memory-db> -c "
-ALTER TABLE memory_entries OWNER TO hermes;
-ALTER SEQUENCE memory_entries_id_seq OWNER TO hermes;
-ALTER TABLE conversations OWNER TO hermes;
-ALTER SEQUENCE conversations_id_seq OWNER TO hermes;
-"
+# v0.4.2: grant the runtime role DML on the core tables (replaces the old
+# manual "ALTER TABLE ... OWNER TO hermes" step; skips with a NOTICE if your
+# runtime role isn't named 'hermes' — grant manually in that case).
+sudo -u postgres psql -d <your-memory-db> \
+     -f ~/.hermes/plugins/pgvector/migrations/004_runtime_grants.sql
+# (or apply every migration in order:  hermes-pgvector migrate --admin-dsn "user=postgres host=/var/run/postgresql dbname=<your-memory-db>")
 
 # Activate
 hermes config set memory.provider pgvector

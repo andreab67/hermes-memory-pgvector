@@ -6,7 +6,7 @@ tools.registry, …) and is only exercised when the plugin runs inside
 hermes-agent.
 
 Run with:
-    pytest plugins/memory/pgvector/tests/
+    pytest tests/
 
 DB tests skip when PG_TEST_DSN is unset; embed live tests skip when
 PG_TEST_EMBED_URL is unset.
@@ -20,8 +20,9 @@ from pathlib import Path
 
 import pytest
 
-# Import sibling modules without going through hermes-agent's package
-# system (which isn't on the sys.path during workstation testing).
+# Repo root on sys.path so `pgvector.*` imports resolve without installing.
+# (v0.4.2: bare `from embed import ...` only worked when another test file
+# happened to leak pgvector/ onto sys.path first — order-dependent.)
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 
@@ -30,7 +31,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # ---------------------------------------------------------------------------
 
 def test_pgvector_literal_roundtrip():
-    from embed import to_pgvector_literal
+    from pgvector.embed import to_pgvector_literal
 
     lit = to_pgvector_literal([0.1, -0.25, 0.333333])
     assert lit.startswith("[") and lit.endswith("]")
@@ -38,7 +39,7 @@ def test_pgvector_literal_roundtrip():
 
 
 def test_embed_empty_input_raises():
-    from embed import embed, EmbeddingError
+    from pgvector.embed import embed, EmbeddingError
 
     with pytest.raises(EmbeddingError):
         embed("", base_url="http://localhost:11434")
@@ -46,12 +47,21 @@ def test_embed_empty_input_raises():
         embed("   ", base_url="http://localhost:11434")
 
 
+def test_escape_like_literalizes_metacharacters():
+    from pgvector.store import _escape_like
+
+    assert _escape_like("15% YoY") == "15\\% YoY"
+    assert _escape_like("a_b") == "a\\_b"
+    assert _escape_like("C:\\U") == "C:\\\\U"
+    assert _escape_like("plain text") == "plain text"
+
+
 @pytest.mark.skipif(
     not os.environ.get("PG_TEST_EMBED_URL"),
     reason="PG_TEST_EMBED_URL not set",
 )
 def test_embed_live_returns_768_dims():
-    from embed import embed
+    from pgvector.embed import embed
 
     base_url = os.environ["PG_TEST_EMBED_URL"]
     vec = embed("hello world", base_url=base_url, model="nomic-embed-text")
@@ -74,7 +84,7 @@ def store():
     if not dsn:
         pytest.skip("PG_TEST_DSN not set")
 
-    from store import MemoryStore
+    from pgvector.store import MemoryStore
 
     s = MemoryStore(dsn)
     s.ensure_schema()

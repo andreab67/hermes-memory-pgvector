@@ -31,6 +31,20 @@ from .embed import to_pgvector_literal
 logger = logging.getLogger(__name__)
 
 
+def _escape_like(text: str) -> str:
+    """Escape LIKE metacharacters so `text` matches as a literal substring.
+
+    The built-in memory tool matches old_text with plain Python `in` — no
+    wildcards. Postgres LIKE treats %/_ as wildcards and backslash as the
+    default escape character, so an unescaped pattern both over-matches
+    ('15% YoY' matches '15<anything>YoY' and can hit unrelated rows) and
+    under-matches (backslashes in stored Windows paths are consumed as
+    escapes, so the row that literally contains them never matches).
+    Escaping all three restores exact-substring semantics (v0.4.2).
+    """
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 class MemoryStore:
     """Postgres-backed mirror of hermes-agent's built-in memory entries."""
 
@@ -136,8 +150,10 @@ class MemoryStore:
                 cur.execute("SELECT to_regclass('memory_entries')")
                 if cur.fetchone()[0] is None:
                     raise self.SchemaNotApplied(
-                        "memory_entries table missing. Apply the migration as DB admin: "
-                        "psql -d <dbname> -f plugins/memory/pgvector/migrations/001_schema.sql"
+                        "memory_entries table missing. Apply migrations as DB admin: "
+                        "hermes-pgvector migrate --admin-dsn 'dbname=<db> user=postgres "
+                        "host=/var/run/postgresql' (or psql -f the files in the "
+                        "installed package's pgvector/migrations/ directory, in order)"
                     )
 
     def apply_migration_as_admin(self, *, admin_dsn: str, migration: str = "001_schema.sql") -> None:
@@ -261,7 +277,8 @@ class MemoryStore:
                        AND target = %s
                        AND content LIKE %s
                     """,
-                    (new_content, vec_literal, agent_identity, target, f"%{old_text}%"),
+                    (new_content, vec_literal, agent_identity, target,
+                     f"%{_escape_like(old_text)}%"),
                 )
                 updated = cur.rowcount
                 conn.commit()
@@ -287,7 +304,7 @@ class MemoryStore:
                        AND target = %s
                        AND content LIKE %s
                     """,
-                    (agent_identity, target, f"%{old_text}%"),
+                    (agent_identity, target, f"%{_escape_like(old_text)}%"),
                 )
                 deleted = cur.rowcount
                 conn.commit()
@@ -555,15 +572,31 @@ class MemoryStore:
 
         inserted = 0
         skipped = 0
+        # Circuit breaker (v0.4.2): this loop runs SYNCHRONOUSLY inside
+        # initialize(), and a hanging (not refused) embed endpoint costs up to
+        # ~20s per entry (two protocol attempts × 10s timeout). Without a
+        # breaker, 50 new entries would block session start for ~17 minutes.
+        # After 3 consecutive failures, stop embedding and insert the rest
+        # text-only — the nightly backfill re-embeds them later.
+        consecutive_embed_failures = 0
         for entry in entries:
             if entry in existing:
                 skipped += 1
                 continue
             vec = None
-            try:
-                vec = embed_fn(entry) if embed_fn else None
-            except Exception:  # noqa: BLE001 — fail-soft on bulk embed
-                vec = None
+            if embed_fn and consecutive_embed_failures < 3:
+                try:
+                    vec = embed_fn(entry)
+                    consecutive_embed_failures = 0
+                except Exception:  # noqa: BLE001 — fail-soft on bulk embed
+                    vec = None
+                    consecutive_embed_failures += 1
+                    if consecutive_embed_failures == 3:
+                        logger.warning(
+                            "bulk_upsert_md: 3 consecutive embed failures — "
+                            "inserting remaining entries text-only "
+                            "(the backfill sweep will re-embed them)"
+                        )
             row_id = self.add(
                 agent_identity=agent_identity,
                 target=target,
@@ -908,19 +941,24 @@ class MemoryStore:
                 batch_progress = 0
                 for r in rows:
                     processed += 1
+                    # The whole embed → literal → UPDATE pipeline is fail-soft
+                    # per row (v0.4.2): a vector that embeds "successfully" but
+                    # is unstorable (NaN/Inf tokens rejected by vector_in, a
+                    # transient DB error) must mark THIS row failed and move
+                    # on, not abort the run for every remaining table.
                     try:
                         vec = embed_fn(r["content"])
+                        vec_literal = to_pgvector_literal(vec)
+                        with self._get_pool().connection() as conn:
+                            with conn.cursor() as cur:
+                                cur.execute(
+                                    f"UPDATE {t} SET embedding = %s::vector WHERE id = %s",
+                                    (vec_literal, r["id"]),
+                                )
+                                conn.commit()
                     except Exception:  # noqa: BLE001 — fail-soft, leave NULL
                         failed += 1
                         continue
-                    vec_literal = to_pgvector_literal(vec)
-                    with self._get_pool().connection() as conn:
-                        with conn.cursor() as cur:
-                            cur.execute(
-                                f"UPDATE {t} SET embedding = %s::vector WHERE id = %s",
-                                (vec_literal, r["id"]),
-                            )
-                            conn.commit()
                     succeeded += 1
                     batch_progress += 1
                 # If an entire batch failed to embed (endpoint flapping), stop —
@@ -1053,14 +1091,33 @@ class MemoryStore:
                     "memory_entries": {"moved": me_old - dupes, "dropped_duplicates": dupes},
                     "conversations": {"moved": conv_old},
                 }
-            if dupes > 10 and not force:
-                raise RuntimeError(
-                    f"remap {old_identity!r} -> {new_identity!r} would drop {dupes} "
-                    "duplicate memory_entries rows; re-run with force=True to proceed"
-                )
 
             with conn.cursor() as cur:
                 cur.execute("SELECT pg_advisory_xact_lock(9999)")
+                # Re-count duplicates INSIDE the advisory lock (v0.4.2): the
+                # pre-count above ran unlocked (it also feeds the dry-run
+                # report), so a concurrent writer inserting colliding rows
+                # between count and mutate could push real duplicates past the
+                # unlocked estimate — the >10 force-guard must be enforced
+                # against the locked truth, mirroring delete_by_identity's
+                # count-under-lock ordering.
+                cur.execute(
+                    """
+                    SELECT count(*) FROM memory_entries o
+                     WHERE o.agent_identity = %s
+                       AND EXISTS (SELECT 1 FROM memory_entries n
+                                    WHERE n.agent_identity = %s
+                                      AND n.target = o.target
+                                      AND n.content = o.content)
+                    """,
+                    (old_identity, new_identity),
+                )
+                dupes = int(cur.fetchone()[0])
+                if dupes > 10 and not force:
+                    raise RuntimeError(
+                        f"remap {old_identity!r} -> {new_identity!r} would drop {dupes} "
+                        "duplicate memory_entries rows; re-run with force=True to proceed"
+                    )
                 cur.execute(
                     """
                     INSERT INTO memory_entries

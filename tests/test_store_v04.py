@@ -118,6 +118,31 @@ def test_remap_identity_merges_and_dedupes(store):
     assert s.count(agent_identity=new) == 2  # shared (once) + unique-to-old
 
 
+# --- LIKE-literal substring semantics (v0.4.2) -----------------------------
+
+def test_replace_treats_percent_as_literal(store):
+    s, agent = store
+    s.add(agent_identity=agent, target="memory", content="Q3 revenue grew 15 million YoY")
+    s.add(agent_identity=agent, target="memory", content="Q3 revenue grew 15% YoY")
+    n = s.replace(
+        agent_identity=agent, target="memory",
+        old_text="15% YoY", new_content="Q3 revenue grew 15pct YoY",
+    )
+    assert n == 1  # only the literal-'%' row — never the 'million' row via wildcard
+    contents = {r["content"] for r in s.list_entries(agent_identity=agent, target="memory", limit=10)}
+    assert "Q3 revenue grew 15 million YoY" in contents
+
+
+def test_remove_underscore_and_backslash_literal(store):
+    s, agent = store
+    s.add(agent_identity=agent, target="memory", content="snake_case_name noted")
+    s.add(agent_identity=agent, target="memory", content="snakeXcaseXname noted")  # unescaped '_' would match this too
+    s.add(agent_identity=agent, target="memory", content=r"path C:\Users\andreab noted")
+    assert s.remove(agent_identity=agent, target="memory", old_text="snake_case_name") == 1
+    assert s.remove(agent_identity=agent, target="memory", old_text=r"C:\Users\andreab") == 1
+    assert s.count(agent_identity=agent, target="memory") == 1  # only the X-row remains
+
+
 # --- prune ----------------------------------------------------------------
 
 def test_prune_conversations_deletes_old(store):
