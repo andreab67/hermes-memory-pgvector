@@ -1,0 +1,7 @@
+# varmem registry. Only the human-curated files un-ignored below are
+# committed; everything else is machine-generated (rebuilt by `varmem
+# scan`) and left out of git to keep diffs clean.
+*
+!.gitignore
+!reviews.json
+!config.json
