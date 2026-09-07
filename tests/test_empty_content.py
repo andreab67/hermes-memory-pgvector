@@ -68,8 +68,15 @@ def test_empty_add_or_replace_is_not_mirrored(action, content):
 
 
 def test_remove_with_empty_content_is_still_mirrored():
-    """`remove` legitimately arrives with empty content: it targets the row via
-    old_text, so the empty-content guard must not swallow it."""
+    """`remove` legitimately arrives with empty content -- the removal target
+    travels in metadata as old_text, not in content -- so the empty-content
+    guard must not swallow it.
+
+    NOTE: an earlier version of this docstring said the row is targeted "via
+    old_text" and left it there, which quietly asserted a path that was in fact
+    broken downstream: _worker read item.content, not extra["old_text"], so the
+    forwarded remove deleted EVERYTHING. See the _worker tests below -- this
+    test only pins that the enqueue happens, never that it is well-formed."""
     p = _provider()
     p.on_memory_write(
         action="remove", target="memory", content="",
@@ -160,3 +167,105 @@ def test_backfill_remaining_can_reach_zero_despite_an_empty_row(store):
     assert report["memory_entries"]["failed"] == 0, (
         "an un-embeddable row must be skipped, not counted as a failure"
     )
+
+
+# ---------------------------------------------------------------------------
+# CRITICAL: the remove path must never be able to wipe a whole scope.
+#
+# store.remove() matches with `content LIKE %<old_text>%`. With an empty
+# old_text that is LIKE '%%', which matches EVERY row -- so a remove that lost
+# its target deletes the entire mirror for that (agent_identity, target)
+# instead of one entry. Verified against Postgres: DELETE ... WHERE c LIKE '%%'
+# removed all rows.
+#
+# _worker used to pass old_text=item.content. The built-in tool's remove op
+# takes old_text and leaves content empty (tools/memory_tool.py:87), and the
+# host forwards old_text through METADATA (memory_manager.notify_memory_tool_write),
+# so item.content was ALWAYS '' for a remove -- making every mirrored
+# `memory remove` a full wipe of that theme.
+# ---------------------------------------------------------------------------
+
+class _FakeStore:
+    def __init__(self):
+        self.removes = []
+
+    def remove(self, *, agent_identity, target, old_text):
+        self.removes.append(old_text)
+        return 1
+
+
+def _worker_provider():
+    p = PgvectorMemoryProvider()
+    p._healthy = True
+    p._store = _FakeStore()
+    return p
+
+
+class _Item:
+    def __init__(self, content="", extra=None):
+        self.action = "remove"
+        self.agent_identity = "marketing"
+        self.target = "memory"
+        self.content = content
+        self.extra = extra or {}
+        self.metadata = {}
+
+
+def test_worker_remove_uses_old_text_not_content():
+    """The regression: content is empty for every real remove, so reading it
+    produced LIKE '%%' and deleted the whole scope."""
+    p = _worker_provider()
+    p._worker(_Item(content="", extra={"old_text": "the entry to delete"}))
+    assert p._store.removes == ["the entry to delete"]
+
+
+def test_worker_remove_refuses_when_no_target_is_available():
+    """Belt and braces: with neither content nor old_text there is nothing to
+    match, and the store must not be called at all."""
+    for item in (_Item(content="", extra={}), _Item(content="   ", extra={"old_text": "  "})):
+        p = _worker_provider()
+        p._worker(item)
+        assert p._store.removes == [], "a target-less remove must never reach the store"
+
+
+def test_worker_remove_falls_back_to_content_when_old_text_absent():
+    """Older/other callers that put the target in content still work."""
+    p = _worker_provider()
+    p._worker(_Item(content="target in content", extra={}))
+    assert p._store.removes == ["target in content"]
+
+
+def test_store_remove_rejects_empty_old_text():
+    """Store-level guard, independent of any caller: an empty pattern is
+    LIKE '%%' and must be impossible to reach by omission."""
+    s = MemoryStore.__new__(MemoryStore)   # no connection needed; guard is first
+    for bad in ("", "   ", chr(10), chr(9) + " "):
+        with pytest.raises(ValueError, match="non-empty old_text"):
+            s.remove(agent_identity="a", target="memory", old_text=bad)
+
+
+def test_store_remove_guard_runs_before_any_db_work(store):
+    """Live: the guard must fire before touching the pool, and delete nothing."""
+    s, agent = store
+    _insert_raw(s, agent, "row one that must survive")
+    _insert_raw(s, agent, "row two that must survive")
+
+    with pytest.raises(ValueError):
+        s.remove(agent_identity=agent, target="memory", old_text="")
+
+    with s._get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT count(*) FROM memory_entries WHERE agent_identity = %s", (agent,))
+            assert cur.fetchone()[0] == 2, "an empty remove must delete nothing"
+
+
+def test_store_remove_still_deletes_a_real_match(store):
+    s, agent = store
+    _insert_raw(s, agent, "delete me please")
+    _insert_raw(s, agent, "keep me around")
+    n = s.remove(agent_identity=agent, target="memory", old_text="delete me")
+    assert n == 1
+    with s._get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT content FROM memory_entries WHERE agent_identity = %s", (agent,))
+            assert [r[0] for r in cur.fetchall()] == ["keep me around"]

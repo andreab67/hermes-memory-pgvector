@@ -92,9 +92,11 @@ Still a storage-layer feature: **no LLM, no entity graph, no new tables or colum
 
 - **Dependency floor raised**: `psycopg[binary]>=3.3.5` (upstream bugfix release, 2026-08-31: prepared-statement invalidation on `ALTER`/`DISCARD`, DataError fixes for malformed COPY/jsonb data, client-encoding aliases). No code changes.
 
-## New in v0.5.1 — empty-content rows no longer poison the backfill signal
+## New in v0.5.1 — `memory remove` no longer wipes a whole theme
 
-Patch release. No schema changes, no migrations, no API changes.
+Patch release, but **upgrade promptly**: it fixes a data-loss bug. No schema changes, no migrations, no API changes.
+
+- **`remove` deleted every mirrored entry for a theme, not one.** `_worker` passed `old_text=item.content` — but the built-in tool's remove op carries its target in `old_text` and leaves `content` empty, and the host forwards `old_text` via *metadata*. So `item.content` was always `""`, `store.remove` built `content LIKE '%%'`, and that matches every row: a single `memory remove` deleted the entire mirror for that `(agent_identity, target)`. Verified against Postgres — `DELETE … WHERE c LIKE '%%'` removes all rows. `_worker` now reads `extra["old_text"]`, and `store.remove()` **refuses an empty pattern outright**, so no caller can reach that delete by omission. (The built-in store was never affected — only the pgvector mirror.)
 
 Found in production: one `memory_entries` row sat with a NULL embedding and **zero-length content**, arrived through the built-in tool's `replace` path. Two defects met there.
 

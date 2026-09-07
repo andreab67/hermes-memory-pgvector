@@ -299,7 +299,18 @@ class MemoryStore:
         """Delete entries in (agent_identity, target) matching old_text substring.
 
         Returns the number of rows deleted.
+
+        REFUSES an empty or whitespace-only old_text. `%{""}%` is `LIKE '%%'`,
+        which matches every row -- so a caller that lost the removal target
+        would silently delete the entire mirror for that (agent_identity,
+        target) instead of one entry. A delete this destructive must never be
+        reachable by omission; the caller has to say what it means to remove.
         """
+        if not (old_text or "").strip():
+            raise ValueError(
+                "remove() requires a non-empty old_text: an empty pattern is "
+                "LIKE '%%', which would delete every entry in this scope"
+            )
         with self._get_pool().connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
@@ -941,7 +952,8 @@ class MemoryStore:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("backfill aborted — embed endpoint unavailable: %s", str(exc)[:200])
                 return {t: {"processed": 0, "succeeded": 0, "failed": 0,
-                            "remaining": None, "note": "embed-unavailable"} for t in tables}
+                            "remaining": None, "unembeddable": None,
+                            "note": "embed-unavailable"} for t in tables}
             if not isinstance(probe, list) or len(probe) != 768:
                 got = len(probe) if isinstance(probe, list) else type(probe).__name__
                 raise ValueError(
@@ -953,8 +965,15 @@ class MemoryStore:
             with self._get_pool().connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        f"SELECT count(*) FILTER (WHERE trim(coalesce(content,'')) <> ''), "
-                        f"       count(*) FILTER (WHERE trim(coalesce(content,'')) = '') "
+                        # content ~ '\S' means "has at least one non-whitespace
+                        # character", which matches Python's str.strip()
+                        # exactly. Postgres trim() defaults to SPACES ONLY, so a
+                        # row holding just a newline or a tab would still be
+                        # selected here, still raise EmbeddingError("empty
+                        # input"), and still fail on every run -- the very bug
+                        # this filter exists to stop.
+                        f"SELECT count(*) FILTER (WHERE content ~ '\S'), "
+                        f"       count(*) FILTER (WHERE content !~ '\S' OR content IS NULL) "
                         f"FROM {t} WHERE embedding IS NULL"
                     )
                     row = cur.fetchone()
@@ -979,7 +998,7 @@ class MemoryStore:
                         cur.execute(
                             f"SELECT id, content FROM {t} "
                             f"WHERE embedding IS NULL "
-                            f"  AND trim(coalesce(content,'')) <> '' "
+                            f"  AND content ~ '\S' "
                             f"ORDER BY id LIMIT %s",
                             (batch_size,),
                         )
@@ -1018,7 +1037,7 @@ class MemoryStore:
                 with conn.cursor() as cur:
                     cur.execute(
                         f"SELECT count(*) FROM {t} "
-                        f"WHERE embedding IS NULL AND trim(coalesce(content,'')) <> ''"
+                        f"WHERE embedding IS NULL AND content ~ '\S'"
                     )
                     remaining = int(cur.fetchone()[0])
             result[t] = {"processed": processed, "succeeded": succeeded,

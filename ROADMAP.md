@@ -115,6 +115,23 @@ Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolati
 
 ---
 
+### M4.4 — Remove-path data-loss fix + backfill signal repair (v0.5.1) ✅ DONE
+
+Two defects found by reviewing the v0.5.1 candidate, one of them data-loss.
+
+`_worker` passed `old_text=item.content` for a remove, but the built-in tool's remove op carries its target in `old_text` and leaves `content` empty — so the pattern was always `LIKE '%%'`, which matches every row. A single `memory remove` deleted the entire mirror for that `(agent_identity, target)`. Fixed at two layers: the worker reads `extra["old_text"]`, and `store.remove()` refuses an empty pattern so the destructive delete is unreachable by omission. No production loss occurred — every theme's history is continuous.
+
+Separately, an empty-content row (created because nothing rejected empty `add`/`replace`) was retried by every nightly backfill forever, pinning `failed` above zero and making `remaining == 0` unreachable — destroying the signal operators watch. Un-embeddable rows are now skipped *and* reported as `unembeddable`.
+
+| Capability | Version |
+|---|---|
+| `remove` targets `extra["old_text"]`; `store.remove()` rejects an empty pattern | v0.5.1 |
+| Empty `add`/`replace` no longer mirrored; `remove` exempt (target is in metadata) | v0.5.1 |
+| Backfill skips + reports un-embeddable rows so `remaining` can reach zero | v0.5.1 |
+| Whitespace predicate matches Python `str.strip()` (`content ~ '\S'`, not `trim()`) | v0.5.1 |
+
+---
+
 ### M4.3 — Import rename + read-side identity gate (v0.5.0) ✅ DONE
 
 Two findings from the 2026-09-07 full-codebase review that could not be fixed without a breaking change or a public-behaviour change, so they were split out of the v0.4.x line.
