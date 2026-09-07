@@ -63,7 +63,7 @@ except ImportError:  # pragma: no cover
         return cur
 
 from .embed import embed, EmbeddingError
-from .identity import classify_kind, normalize_identity
+from .identity import BENCH_BUCKET, DM_BUCKET, classify_kind, normalize_identity
 from .store import MemoryStore
 from .writer import AsyncWriter, _PendingWrite
 
@@ -975,6 +975,23 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     # -- Tool surface --------------------------------------------------------
 
+    def _restricted_identities(self) -> List[str]:
+        """Sink themes this agent must not read out of.
+
+        identity.py buckets direct-message traffic into `whatsapp-dm` and
+        benchmark traffic into `_bench`. That bucketing is WRITE-side only: it
+        strips PII from the *identity*, but the message bodies still land in
+        `content`. Without a read-side gate, any theme could pull DM content
+        (and discarded bench fixtures) into its context via scope='all' or by
+        naming the bucket directly -- and, with turn capture on, the reply
+        quoting it would be written back under the *reading* theme,
+        permanently re-attributing DM data into a production theme.
+
+        An agent that IS the bucket keeps full access to its own rows, so
+        DM-scoped recall still works for the DM agent itself.
+        """
+        return [b for b in (DM_BUCKET, BENCH_BUCKET) if b != self._agent_identity]
+
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [RECALL_MEMORY_SCHEMA, RECALL_CONVERSATION_SCHEMA]
 
@@ -998,10 +1015,15 @@ class PgvectorMemoryProvider(MemoryProvider):
         # Scope resolution: 'current' → my agent_identity; 'all' → no filter;
         # anything else → treat as explicit theme name.
         scope = str(args.get("scope") or self._config.get("scope_default") or "current").strip()
+        restricted = self._restricted_identities()
+        exclude: Optional[List[str]] = None
         if scope == "current":
             agent_filter: Optional[str] = self._agent_identity
         elif scope == "all":
             agent_filter = None
+            # Cross-theme recall stays opt-in and broad, but never reaches the
+            # PII/bench sinks -- see _restricted_identities().
+            exclude = restricted or None
         elif scope == "session":
             # Only recall_conversation supports 'session'. Falling through
             # would silently filter on a literal 'session' theme and return
@@ -1009,6 +1031,11 @@ class PgvectorMemoryProvider(MemoryProvider):
             return tool_error(
                 "scope='session' is only valid for recall_conversation; "
                 "use 'current', 'all', or a theme name here."
+            )
+        elif scope in restricted:
+            return tool_error(
+                f"scope={scope!r} is a restricted sink (direct-message / bench "
+                "traffic) and is not readable from this theme."
             )
         else:
             agent_filter = scope
@@ -1042,6 +1069,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     agent_identity=agent_filter,
                     target=target_filter,
                     limit=limit,
+                    exclude_identities=exclude,
                 )
             else:
                 rows = self._store.search(
@@ -1049,6 +1077,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     agent_identity=agent_filter,
                     target=target_filter,
                     limit=limit,
+                    exclude_identities=exclude,
                 )
         except Exception as exc:  # noqa: BLE001
             # Fail-soft: a hybrid hiccup with a usable vector falls back to the
@@ -1060,6 +1089,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                         agent_identity=agent_filter,
                         target=target_filter,
                         limit=limit,
+                        exclude_identities=exclude,
                     )
                 except Exception as exc2:  # noqa: BLE001
                     return json.dumps({"results": [], "count": 0, "error": f"db: {_safe_err(exc2)}"})
@@ -1102,12 +1132,20 @@ class PgvectorMemoryProvider(MemoryProvider):
         scope = str(args.get("scope") or "current").strip()
         agent_filter: Optional[str] = None
         session_filter: Optional[str] = None
+        restricted = self._restricted_identities()
+        exclude: Optional[List[str]] = None
         if scope == "current":
             agent_filter = self._agent_identity
         elif scope == "session":
             session_filter = self._session_id or None
         elif scope == "all":
-            pass  # no filters
+            # No agent filter, but never the PII/bench sinks.
+            exclude = restricted or None
+        elif scope in restricted:
+            return tool_error(
+                f"scope={scope!r} is a restricted sink (direct-message / bench "
+                "traffic) and is not readable from this theme."
+            )
         else:
             agent_filter = scope  # treat as a specific theme name
 
@@ -1132,6 +1170,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     agent_identity=agent_filter,
                     session_id=session_filter,
                     limit=limit,
+                    exclude_identities=exclude,
                 )
             else:
                 rows = self._store.search_turns(
@@ -1139,6 +1178,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     agent_identity=agent_filter,
                     session_id=session_filter,
                     limit=limit,
+                    exclude_identities=exclude,
                 )
         except Exception as exc:  # noqa: BLE001
             if hybrid and vec is not None:
@@ -1148,6 +1188,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                         agent_identity=agent_filter,
                         session_id=session_filter,
                         limit=limit,
+                        exclude_identities=exclude,
                     )
                 except Exception as exc2:  # noqa: BLE001
                     return json.dumps({"results": [], "count": 0, "error": f"db: {_safe_err(exc2)}"})

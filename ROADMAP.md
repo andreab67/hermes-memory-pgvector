@@ -115,18 +115,37 @@ Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolati
 
 ---
 
-### M5 — Production hardening at scale (v0.5 → v0.6) ⏳ PROPOSED
+### M4.3 — Import rename + read-side identity gate (v0.5.0) ✅ DONE
+
+Two findings from the 2026-09-07 full-codebase review that could not be fixed without a breaking change or a public-behaviour change, so they were split out of the v0.4.x line.
+
+The import package moved `pgvector` → `hermes_pgvector`. The old top-level name is owned by [pgvector-python](https://pypi.org/project/pgvector/); sharing a venv meant whichever installed last won, and the discovery shim's import could resolve to the wrong module — the loader then falls back to built-in memory on a single log line, taking the fleet's shared memory offline silently. The distribution name, the `hermes-pgvector` CLI and the `pgvector` provider name are unchanged; only the import moved. Upgrading requires re-running `hermes-pgvector install --force` once.
+
+The PII/bench buckets also gained the read-side half they never had. `whatsapp-dm` and `_bench` isolation was write-side only, so `scope='all'` (or naming a bucket directly) surfaced DM bodies in any theme — and turn capture then rewrote them under the reading theme. Cross-theme recall stays opt-in and broad; it just no longer reaches the sinks.
+
+| Capability | Version |
+|---|---|
+| Import package `pgvector` → `hermes_pgvector`; shim import verified at install time | v0.5.0 |
+| Read-side exclusion of `whatsapp-dm` / `_bench` from `scope='all'` + explicit-scope rejection | v0.5.0 |
+| Config type-contract fixes (`allowed_themes` string/list, boolean toggles declared as strings) | v0.5.0 |
+| Turn double-write guard; `replace()` single-row UPDATE; fail-soft hardening | v0.5.0 |
+
+---
+
+### M5 — Production hardening at scale (v0.6 → v0.7) ⏳ PROPOSED
+
+> Version targets shifted from v0.5/v0.6: v0.5.0 was taken by the M4.3 breaking rename above.
 
 **Goal:** survive a fleet of dozens of minions, hundreds of writes per minute, multi-million-row tables.
 
 | Capability | Version |
 |---|---|
-| TTL / decay policy on `memory_entries.updated_at` and `conversations.ts` so stale entries surface less | v0.5.0 |
-| Optional partial HNSW indexes per high-volume `agent_identity` when cross-theme search becomes the slow query | v0.5.0 |
-| Periodic re-sync of `MEMORY.md` / `USER.md` (not just on init) for callers that edit the markdown directly | v0.5.0 |
-| Bulk-import CLI for migrating from Holographic / Honcho / Mem0 / Hindsight installations | v0.5.0 |
-| Metrics: queue depth, drop count, embed latency p50/p95, recall hit rate (Prometheus-friendly) | v0.6.0 |
-| Per-platform metadata facets (CLI vs cron vs telegram vs API) for richer recall filtering | v0.6.0 |
+| TTL / decay policy on `memory_entries.updated_at` and `conversations.ts` so stale entries surface less | v0.6.0 |
+| Optional partial HNSW indexes per high-volume `agent_identity` when cross-theme search becomes the slow query | v0.6.0 |
+| Periodic re-sync of `MEMORY.md` / `USER.md` (not just on init) for callers that edit the markdown directly | v0.6.0 |
+| Bulk-import CLI for migrating from Holographic / Honcho / Mem0 / Hindsight installations | v0.6.0 |
+| Metrics: queue depth, drop count, embed latency p50/p95, recall hit rate (Prometheus-friendly) | v0.7.0 |
+| Per-platform metadata facets (CLI vs cron vs telegram vs API) for richer recall filtering | v0.7.0 |
 
 **Why this matters for multi-agent deployments:** a memory store that's fast for one user often falls over under fleet load. M5 is the slow + boring work that turns "works on my hermes" into "works for ten agents writing concurrently."
 

@@ -111,7 +111,7 @@ in the SAME environment hermes-agent runs in. Uninstall the package and the
 import fails cleanly — the loader logs it and falls back to built-in memory.
 """
 
-from pgvector import PgvectorMemoryProvider, register  # noqa: F401
+from hermes_pgvector import PgvectorMemoryProvider, register  # noqa: F401
 '''
 
 
@@ -199,7 +199,32 @@ def cmd_install(args) -> int:
         print(f"warning: could not copy plugin.yaml: {exc}", file=sys.stderr)
 
     print(f"installed discovery shim: {shim_dir}")
-    print("  -> resolves to the pip-installed `pgvector` package at import time")
+    print("  -> resolves to the pip-installed `hermes_pgvector` package at import time")
+
+    # Verify the shim's import actually resolves HERE. If it does not, the
+    # hermes-agent loader would log one line and fall back to built-in memory
+    # -- the whole fleet's shared memory goes dark on a single log entry. Fail
+    # loudly at install time instead of silently at runtime.
+    try:
+        import hermes_pgvector as _pkg
+        resolved = Path(_pkg.__file__).resolve().parent
+        expected = Path(__file__).resolve().parent
+        if resolved != expected:
+            print(
+                f"WARNING: `import hermes_pgvector` resolves to {resolved}, not "
+                f"{expected}. Another package is shadowing this one in the same "
+                "environment; the shim will import the wrong module.",
+                file=sys.stderr,
+            )
+        elif not hasattr(_pkg, "PgvectorMemoryProvider"):
+            print(
+                "WARNING: `hermes_pgvector` imported but exposes no "
+                "PgvectorMemoryProvider; the shim will fail at load time.",
+                file=sys.stderr,
+            )
+    except Exception as exc:  # noqa: BLE001
+        print(f"WARNING: shim import check failed: {exc}", file=sys.stderr)
+
     print("next steps:")
     print("  1. config.yaml:  memory.provider: pgvector   (+ plugins.pgvector settings)")
     print("  2. migrations (admin, once):")
@@ -307,7 +332,7 @@ def cmd_remap(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="pgvector", description="hermes-memory-pgvector maintenance CLI")
+    p = argparse.ArgumentParser(prog="hermes-pgvector", description="hermes-memory-pgvector maintenance CLI")
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp):

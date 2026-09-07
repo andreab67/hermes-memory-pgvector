@@ -22,8 +22,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pgvector import PgvectorMemoryProvider  # noqa: E402
-import pgvector as pgvector_pkg  # noqa: E402
+from hermes_pgvector import PgvectorMemoryProvider  # noqa: E402
+import hermes_pgvector as pgvector_pkg  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

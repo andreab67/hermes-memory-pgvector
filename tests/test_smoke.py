@@ -35,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # ---------------------------------------------------------------------------
 
 def test_pgvector_literal_roundtrip():
-    from pgvector.embed import to_pgvector_literal
+    from hermes_pgvector.embed import to_pgvector_literal
 
     lit = to_pgvector_literal([0.1, -0.25, 0.333333])
     assert lit.startswith("[") and lit.endswith("]")
@@ -43,7 +43,7 @@ def test_pgvector_literal_roundtrip():
 
 
 def test_embed_empty_input_raises():
-    from pgvector.embed import embed, EmbeddingError
+    from hermes_pgvector.embed import embed, EmbeddingError
 
     with pytest.raises(EmbeddingError):
         embed("", base_url="http://localhost:11434")
@@ -52,7 +52,7 @@ def test_embed_empty_input_raises():
 
 
 def test_escape_like_literalizes_metacharacters():
-    from pgvector.store import _escape_like
+    from hermes_pgvector.store import _escape_like
 
     assert _escape_like("15% YoY") == "15\\% YoY"
     assert _escape_like("a_b") == "a\\_b"
@@ -65,7 +65,7 @@ def test_escape_like_literalizes_metacharacters():
     reason="PG_TEST_EMBED_URL not set",
 )
 def test_embed_live_returns_768_dims():
-    from pgvector.embed import embed
+    from hermes_pgvector.embed import embed
 
     base_url = os.environ["PG_TEST_EMBED_URL"]
     vec = embed("hello world", base_url=base_url, model="nomic-embed-text")
@@ -88,7 +88,7 @@ def store():
     if not dsn:
         pytest.skip("PG_TEST_DSN not set")
 
-    from pgvector.store import MemoryStore
+    from hermes_pgvector.store import MemoryStore
 
     s = MemoryStore(dsn)
     s.ensure_schema()

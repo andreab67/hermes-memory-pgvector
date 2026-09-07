@@ -20,8 +20,8 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pgvector import _as_bool, _as_theme_list  # noqa: E402
-from pgvector.identity import normalize_identity  # noqa: E402
+from hermes_pgvector import _as_bool, _as_theme_list  # noqa: E402
+from hermes_pgvector.identity import normalize_identity  # noqa: E402
 
 
 # ---------------------------------------------------------------------------

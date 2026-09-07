@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pgvector.__main__ import SHIM_MARKER, main  # noqa: E402
+from hermes_pgvector.__main__ import SHIM_MARKER, main  # noqa: E402
 
 
 def test_install_creates_shim(tmp_path):
@@ -27,7 +27,7 @@ def test_install_creates_shim(tmp_path):
     assert "MemoryProvider" in text
     assert "register_memory_provider" in text
     # The actual bridge: absolute import of the installed package.
-    assert "from pgvector import PgvectorMemoryProvider, register" in text
+    assert "from hermes_pgvector import PgvectorMemoryProvider, register" in text
     # plugin.yaml copied beside the shim for the discovery description.
     assert (tmp_path / "plugins" / "pgvector" / "plugin.yaml").exists()
 

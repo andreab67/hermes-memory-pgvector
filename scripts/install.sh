@@ -46,8 +46,8 @@ if [[ -d "$PLUGIN_DIR" ]]; then
     mv "$PLUGIN_DIR" "$BACKUP"
 fi
 
-cp -r "$REPO_ROOT/pgvector" "$PLUGIN_DIR"
-echo "    copied $REPO_ROOT/pgvector → $PLUGIN_DIR"
+cp -r "$REPO_ROOT/hermes_pgvector" "$PLUGIN_DIR"
+echo "    copied $REPO_ROOT/hermes_pgvector -> $PLUGIN_DIR"
 
 # 3. Next steps
 cat <<EOF
@@ -61,7 +61,7 @@ This script remains the from-clone alternative.
 Next steps (admin once):
   1. Apply ALL migrations (schema + attribution + FTS indexes + runtime
      grants) in one shot — from the repo root:
-       python -m pgvector migrate --admin-dsn \\
+       hermes-pgvector migrate --admin-dsn \\
            "dbname=<your-memory-db> user=postgres host=/var/run/postgresql"
      (or apply migrations/00*.sql in lexical order with psql -f; migration
       004 grants the runtime 'hermes' role DML on the 001 tables — no manual

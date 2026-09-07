@@ -20,7 +20,7 @@ import json
 import logging
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import psycopg
 from psycopg.rows import dict_row
@@ -355,11 +355,14 @@ class MemoryStore:
         target: Optional[str] = None,
         limit: int = 5,
         min_similarity: float = 0.0,
+        exclude_identities: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic recall via cosine distance.
 
         agent_identity=None → search across ALL agents (cross-theme recall).
         target=None → search both 'memory' and 'user'.
+        exclude_identities → themes omitted even from a cross-theme sweep, so
+        the PII/bench sinks stay out of ordinary recall (read-side gate).
         Returns rows with `score` = 1 - cosine_distance ∈ [0, 1].
         """
         vec_literal = to_pgvector_literal(query_embedding)
@@ -371,6 +374,9 @@ class MemoryStore:
         if target:
             clauses.append("target = %s")
             params.append(target)
+        if exclude_identities:
+            clauses.append("agent_identity <> ALL(%s)")
+            params.append(list(exclude_identities))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
         with self._get_pool().connection() as conn:
@@ -402,6 +408,7 @@ class MemoryStore:
         target: Optional[str] = None,
         limit: int = 5,
         pool: Optional[int] = None,
+        exclude_identities: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Hybrid recall over memory_entries: vector + full-text, fused by RRF.
 
@@ -439,6 +446,9 @@ class MemoryStore:
         if target:
             filters.append("target = %(target)s")
             params["target"] = target
+        if exclude_identities:
+            filters.append("agent_identity <> ALL(%(excl)s)")
+            params["excl"] = list(exclude_identities)
         extra = (" AND " + " AND ".join(filters)) if filters else ""
 
         sql = self._build_hybrid_sql(
@@ -676,6 +686,7 @@ class MemoryStore:
         session_id: Optional[str] = None,
         limit: int = 5,
         min_similarity: float = 0.0,
+        exclude_identities: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic recall over conversation turns. Same shape as `search()`."""
         vec_literal = to_pgvector_literal(query_embedding)
@@ -687,6 +698,9 @@ class MemoryStore:
         if session_id:
             clauses.append("session_id = %s")
             params.append(session_id)
+        if exclude_identities:
+            clauses.append("agent_identity <> ALL(%s)")
+            params.append(list(exclude_identities))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
         with self._get_pool().connection() as conn:
@@ -717,6 +731,7 @@ class MemoryStore:
         session_id: Optional[str] = None,
         limit: int = 5,
         pool: Optional[int] = None,
+        exclude_identities: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Hybrid recall over conversation turns. RRF fusion, same shape as
         hybrid_search() but returns turn columns (session_id, role, ts)."""
@@ -735,6 +750,9 @@ class MemoryStore:
         if session_id:
             filters.append("session_id = %(session)s")
             params["session"] = session_id
+        if exclude_identities:
+            filters.append("agent_identity <> ALL(%(excl)s)")
+            params["excl"] = list(exclude_identities)
         extra = (" AND " + " AND ".join(filters)) if filters else ""
 
         sql = self._build_hybrid_sql(

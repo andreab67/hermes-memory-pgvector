@@ -19,7 +19,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pgvector.writer import AsyncWriter  # noqa: E402
+from hermes_pgvector.writer import AsyncWriter  # noqa: E402
 
 
 def test_shutdown_drains_all_enqueued_items():

@@ -13,7 +13,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pgvector.identity import (  # noqa: E402
+from hermes_pgvector.identity import (  # noqa: E402
     BENCH_BUCKET,
     DEFAULT_IDENTITY,
     DM_BUCKET,

@@ -16,7 +16,7 @@ import pytest
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pgvector.store import MemoryStore  # noqa: E402
+from hermes_pgvector.store import MemoryStore  # noqa: E402
 
 
 @pytest.fixture

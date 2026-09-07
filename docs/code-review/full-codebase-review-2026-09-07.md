@@ -10,9 +10,19 @@
 A complete review-and-repair pass over all 24 tracked files (~4,600 lines) of
 `hermes-memory-pgvector` at v0.4.3. Five review partitions (four per-file, one
 cross-cutting) produced 24 candidate findings. After controller verification and
-deduplication, **22 were confirmed actionable and 20 were fixed**; 2 were
-deliberately deferred as product decisions rather than defects, and 8 further
+deduplication, **22 were confirmed actionable**; a second adversarial pass added
+6 more. **All 28 are fixed** — including the two originally deferred as product
+decisions, which the owner subsequently asked to be fixed — and 8 further
 candidates were rejected with recorded reasons.
+
+**Two regressions were introduced during repair and both were caught before
+merge** — one by the controller self-checking its own change, one by the
+independent challenge. Both are documented in section 6, not glossed over.
+
+The release is **v0.5.0**, not a patch bump: it carries a breaking import rename
+(`pgvector` → `hermes_pgvector`) alongside the behavior fixes. v0.4.3 is already
+published to PyPI describing itself as "No code changes", so none of this could
+ship under it.
 
 The highest-value findings came from the cross-cutting pass, not the per-file
 passes: three self-inconsistent config contracts entirely inside this repo, each
@@ -25,9 +35,10 @@ was iterated character-by-character and routed *every* theme in the fleet to
 `default` — governance appearing configured while doing the exact opposite of
 its purpose.
 
-Note that this repository has **no CI pipeline configured**, so the exact-SHA
-pipeline gate cannot pass; it resolves to `NO PIPELINE CONFIGURED`, reported
-honestly rather than as a pass. Evidence in section 10.
+This repository defines **no CI workflow**, and the only check that runs on PR
+commits is a third-party app that is currently disabled — so **no passing
+pipeline evidence exists for the final SHA, and none is claimed**. Evidence, and
+a correction to an earlier over-broad claim, are in section 10.
 
 ---
 
@@ -119,28 +130,50 @@ By severity (confirmed): critical 0 · high 6 · medium 12 · low 4.
 | STORE-2 | low | `store.py` `_get_pool` | `self._pool` read twice outside the lock; a concurrent `close()` between the reads returns None, then AttributeError at the call site. |
 | AUX-4 | low | `README.md` | "New in" sections out of version order (0.4.3 spliced above 0.4.2). |
 
-### 5.2 Deferred — product decisions, not defects
+### 5.2 Originally deferred, then fixed on request
 
-Both are real and evidenced. Neither was silently changed, because the repair
-alters documented public behavior and that is the owner's call.
+Both were held back from the first pass because the repair alters documented
+public behavior, which is the owner's call rather than a reviewer's. The owner
+then asked for both; both are implemented in this branch.
 
-**XCUT-6 (medium) — read-side PII/bench exposure.** `scope='all'` applies no
-identity filter, so `whatsapp-dm` and `_bench` rows surface in any theme's
-recall; `scope` is also free-text, so a bucket can be named directly. The
-PII/bench bucketing in `identity.py` is write-side only — there is no read-side
-gate anywhere. *Why deferred:* INV-3 documents cross-theme recall as
-intentionally opt-in; adding a read-side exclusion changes the semantics of a
-public tool. **Recommend deciding this explicitly.**
+**XCUT-6 (medium) — read-side PII/bench exposure. FIXED.** `scope='all'` applied
+no identity filter, so `whatsapp-dm` and `_bench` rows surfaced in any theme's
+recall; `scope` is also free-text, so a bucket could be named directly. The
+bucketing in `identity.py` was write-side only — it strips PII from the
+*identity*, but message bodies still live in `content`, and with turn capture on,
+a reply quoting leaked DM text was written back under the *reading* theme,
+permanently re-attributing it.
 
-**XCUT-7 (medium) — top-level import-name collision.** The distribution claims
-the import name `pgvector`, which is owned by the widely-used pgvector-python
-package. In a shared venv whichever installs last wins, the generated shim's
-`from pgvector import PgvectorMemoryProvider` breaks, and the loader falls back
-to built-in memory — fleet memory goes dark on a single log line. Confirmed
-live: `/opt/hermes/hermes-agent/.venv/lib/python3.12/site-packages/pgvector/` is
-this package. *Why deferred:* the durable fix is a rename to `hermes_pgvector`,
-which is breaking and must be scheduled deliberately rather than slipped into a
-review branch.
+*Fix:* `scope='all'` now passes an explicit `exclude_identities` down all six
+recall paths — including the hybrid-failure fallback, which would otherwise have
+let any transient error bypass the gate — and naming a sink explicitly is
+rejected before the store is queried. The gate deliberately does not over-reach:
+an agent whose own identity IS a bucket keeps full access to its own rows, and
+ordinary cross-theme recall (`scope='sales'`, etc.) is unchanged. 11 tests;
+disabling the gate fails 8 of them.
+
+**XCUT-7 (medium) — top-level import-name collision. FIXED.** The distribution
+claimed the import name `pgvector`, owned by the widely-used pgvector-python
+package. In a shared venv whichever installed last won, the generated shim's
+`from pgvector import PgvectorMemoryProvider` broke, and the loader fell back to
+built-in memory — fleet memory dark on a single log line. Confirmed live:
+`/opt/hermes/hermes-agent/.venv/lib/python3.12/site-packages/pgvector/` is this
+package.
+
+*Fix:* the import package is renamed `pgvector` → `hermes_pgvector`, which is why
+this release is v0.5.0. Three namespaces were deliberately left alone because
+they are not the colliding one: the distribution `hermes-memory-pgvector`, the
+`hermes-pgvector` CLI, and the hermes provider name `pgvector`
+(`memory.provider: pgvector`, discovery dir `$HERMES_HOME/plugins/pgvector/`) —
+renaming that last one would break every existing operator config for no benefit.
+
+The upgrade is **not** transparent, and the README says so prominently: a
+pre-0.5.0 shim still reads `from pgvector import ...`, and the hermes-agent
+loader treats the resulting ImportError as "plugin absent", falling back to
+built-in memory. `hermes-pgvector install --force` must be re-run once after
+upgrading. To make that failure mode louder in future, `install` now verifies
+after writing the shim that `import hermes_pgvector` actually resolves to this
+package, and warns if anything shadows it.
 
 ### 5.3 Rejected candidates (recorded)
 
@@ -236,8 +269,13 @@ docstring correction in `tests/test_smoke.py` — its claim that the provider "i
 only exercised when the plugin runs inside hermes-agent" was stale; the provider
 constructs standalone via the `MemoryProvider = object` ImportError fallback.
 
-**24 passed → 53 passed** (+29). Skip count unchanged at 34. No test was
-weakened, skipped, or deleted.
+**24 passed → 72 passed** (+48); skips 34 → 35 (one added live-mode test for
+`replace()`). No test was weakened, skipped, or deleted.
+
+Each new non-live test was empirically verified to FAIL against the reintroduced
+bug. For the read-side gate, disabling `_restricted_identities()` fails 8 of its
+11 tests — and the 3 that still pass are precisely the "must not over-reach"
+assertions, which should hold either way.
 
 **Honest caveat, surfaced by the test author rather than hidden:** 4 of the
 tool-arg tests exercise the outer fail-soft contract but pass against unfixed
@@ -255,7 +293,7 @@ then restoring.
 | Command | Result |
 |---|---|
 | `python -m pytest tests/ -q` (baseline) | 24 passed, 34 skipped |
-| `python -m pytest tests/ -q` (final) | **61 passed, 35 skipped** |
+| `python -m pytest tests/ -q` (final) | **72 passed, 35 skipped** |
 | `python -c "import pgvector, pgvector.store, pgvector.embed, pgvector.__main__"` | imports OK |
 | `bash -n scripts/install.sh` | syntax OK |
 | `yaml.safe_load(open('pgvector/plugin.yaml'))` | valid; reflects all three changes |
@@ -338,7 +376,11 @@ final-SHA status belongs in the merge proposal and the final response.
    psycopg pin appeared in two files and survived a release; a three-line
    consistency check comparing `pyproject.toml` against `plugin.yaml`,
    `README.md`, and `scripts/install.sh` would have caught it.
-3. **XCUT-6 and XCUT-7 remain open by design** (section 5.2).
+3. **The v0.5.0 upgrade needs a manual step.** `hermes-pgvector install --force`
+   must be re-run after `pip install -U`, or the stale shim silently disables the
+   plugin. The hermes-vps deploy runbook (`docs/memory/PGVECTOR-PLUGIN-DEPLOY.md`)
+   currently describes deploy as `pip install -U` + migrations + restart, and
+   **must be updated before this ships**.
 4. **`plugin.yaml`'s `hooks:` semantics are unconfirmed.** The list was expanded
    to all 7 implemented hooks, which is strictly more accurate, but whether
    hermes-agent treats the field as authoritative or informational was not
@@ -373,7 +415,8 @@ exists.
 live-DB tests — the `replace()` rewrite is the highest-impact change and is
 currently unexecuted.
 
-**After merge:** decide XCUT-6, schedule XCUT-7, and add a minimal CI workflow.
+**After merge:** update the hermes-vps deploy runbook for the `install --force`
+step, and add a minimal CI workflow.
 
 **Correct `CLAUDE.md`:** it states the hermes-agent checkout is gone from this
 workstation. It exists at `~/hermes-agent`, and having it available materially
