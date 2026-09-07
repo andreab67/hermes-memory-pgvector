@@ -922,7 +922,15 @@ class MemoryStore:
         fail fast, never write a wrong-dim vector). If the embed endpoint is
         unreachable, the run aborts cleanly (nothing to backfill right now).
 
-        Returns {table: {processed, succeeded, failed, remaining}}.
+        Rows whose content is empty or whitespace are EXCLUDED, not failed.
+        embed() raises EmbeddingError("empty input") on such text, so selecting
+        them means retrying a guaranteed failure on every nightly run forever,
+        permanently pinning `failed` above zero and making "remaining == 0"
+        unreachable -- which destroys the one signal an operator watches. They
+        are reported separately as `unembeddable` so they are skipped, not
+        hidden.
+
+        Returns {table: {processed, succeeded, failed, remaining, unembeddable}}.
         """
         tables = self._assert_whitelisted(tables)
         result: Dict[str, Dict[str, Any]] = {}
@@ -944,10 +952,24 @@ class MemoryStore:
         for t in tables:
             with self._get_pool().connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(f"SELECT count(*) FROM {t} WHERE embedding IS NULL")
-                    remaining = int(cur.fetchone()[0])
+                    cur.execute(
+                        f"SELECT count(*) FILTER (WHERE trim(coalesce(content,'')) <> ''), "
+                        f"       count(*) FILTER (WHERE trim(coalesce(content,'')) = '') "
+                        f"FROM {t} WHERE embedding IS NULL"
+                    )
+                    row = cur.fetchone()
+                    remaining, unembeddable = int(row[0]), int(row[1])
+            if unembeddable:
+                # Surfaced, not swallowed: these are permanently un-embeddable
+                # and would otherwise be invisible now that they are skipped.
+                logger.info(
+                    "backfill %s: skipping %d row(s) with empty content "
+                    "(cannot be embedded; delete them or leave them text-only)",
+                    t, unembeddable,
+                )
             if dry_run:
-                result[t] = {"processed": 0, "succeeded": 0, "failed": 0, "remaining": remaining}
+                result[t] = {"processed": 0, "succeeded": 0, "failed": 0,
+                             "remaining": remaining, "unembeddable": unembeddable}
                 continue
 
             processed = succeeded = failed = 0
@@ -955,7 +977,10 @@ class MemoryStore:
                 with self._get_pool().connection() as conn:
                     with conn.cursor(row_factory=dict_row) as cur:
                         cur.execute(
-                            f"SELECT id, content FROM {t} WHERE embedding IS NULL ORDER BY id LIMIT %s",
+                            f"SELECT id, content FROM {t} "
+                            f"WHERE embedding IS NULL "
+                            f"  AND trim(coalesce(content,'')) <> '' "
+                            f"ORDER BY id LIMIT %s",
                             (batch_size,),
                         )
                         rows = list(cur.fetchall())
@@ -991,10 +1016,14 @@ class MemoryStore:
 
             with self._get_pool().connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(f"SELECT count(*) FROM {t} WHERE embedding IS NULL")
+                    cur.execute(
+                        f"SELECT count(*) FROM {t} "
+                        f"WHERE embedding IS NULL AND trim(coalesce(content,'')) <> ''"
+                    )
                     remaining = int(cur.fetchone()[0])
             result[t] = {"processed": processed, "succeeded": succeeded,
-                         "failed": failed, "remaining": remaining}
+                         "failed": failed, "remaining": remaining,
+                         "unembeddable": unembeddable}
         return result
 
     def prune_conversations(self, *, older_than_days: int, dry_run: bool = False) -> int:

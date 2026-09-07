@@ -92,6 +92,15 @@ Still a storage-layer feature: **no LLM, no entity graph, no new tables or colum
 
 - **Dependency floor raised**: `psycopg[binary]>=3.3.5` (upstream bugfix release, 2026-08-31: prepared-statement invalidation on `ALTER`/`DISCARD`, DataError fixes for malformed COPY/jsonb data, client-encoding aliases). No code changes.
 
+## New in v0.5.1 — empty-content rows no longer poison the backfill signal
+
+Patch release. No schema changes, no migrations, no API changes.
+
+Found in production: one `memory_entries` row sat with a NULL embedding and **zero-length content**, arrived through the built-in tool's `replace` path. Two defects met there.
+
+- **Nothing rejected empty content on write.** `on_memory_write` filtered on `target` and `action` but never on content, so an `add`/`replace` carrying nothing created a row that can never be embedded — `embed()` raises `EmbeddingError("empty input")` unconditionally for empty or whitespace text. Such writes are now ignored (`remove` is exempt: it legitimately arrives with empty content and targets the row via `old_text`).
+- **`backfill_null_embeddings` retried it forever.** The sweep selected `WHERE embedding IS NULL` with no content filter, so every nightly run re-fetched the row, called `embed()`, failed, and moved on — permanently pinning `failed` above zero and making `remaining == 0` unreachable. That is the damaging half: it destroys the one signal an operator watches, because you can no longer distinguish a permanently-stuck row from a new genuine failure. Un-embeddable rows are now **skipped and reported separately** as `unembeddable` (skipping them silently would be equally misleading), so `remaining` can actually reach zero again.
+
 ## New in v0.5.0 — import rename (BREAKING), read-side identity gate, config-contract fixes
 
 > ### Breaking upgrade — read before installing

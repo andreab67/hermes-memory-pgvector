@@ -888,6 +888,20 @@ class PgvectorMemoryProvider(MemoryProvider):
         if action not in ("add", "replace", "remove"):
             logger.debug("pgvector ignoring unknown action: %r", action)
             return
+        # An add/replace with no content produces a row that can NEVER be
+        # embedded: embed() raises EmbeddingError("empty input") on empty or
+        # whitespace text. Such a row is retried by every nightly backfill
+        # forever, always fails, and permanently prevents the NULL-embedding
+        # count from reaching zero -- destroying the one signal an operator
+        # watches. It also carries no information worth mirroring. `remove`
+        # is exempt: it legitimately arrives with empty content and targets
+        # the row via old_text.
+        if action in ("add", "replace") and not (content or "").strip():
+            logger.debug(
+                "pgvector ignoring %r with empty content (nothing to mirror)",
+                action,
+            )
+            return
 
         meta = dict(metadata or {})
         meta.setdefault("session_id", self._session_id)
