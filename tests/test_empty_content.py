@@ -2,6 +2,13 @@
 
 No DB required for the write-path half; the backfill half is live-mode.
 
+IMPORTANT: point PG_TEST_DSN at a THROWAWAY database, never production. The
+backfill cases call backfill_null_embeddings(), which sweeps the WHOLE table --
+so on a shared database it would stamp every pre-existing NULL-embedding row
+with this test's constant [0.1]*768 vector. Those rows are then no longer NULL
+and a real backfill can never repair them. The `failed` assertion is table-wide
+for the same reason.
+
 Found in production. One row in `memory_entries` sat with `embedding IS NULL`
 and `length(content) = 0` -- its metadata (`old_text`, `tool_name`) showing it
 arrived through the built-in tool's `replace` path with empty new content.
@@ -186,9 +193,9 @@ def test_backfill_remaining_can_reach_zero_despite_an_empty_row(store):
     # Asserted directly, not as a delta against a dry-run baseline: dry_run
     # hardcodes "failed": 0 (store.py), so such a baseline is always 0 and the
     # comparison would be theatre. `failed` is table-wide, which is sound here
-    # only because this fixture requires a THROWAWAY database (see the module
-    # docstring) -- on a shared one, a pre-existing failing row would surface
-    # here, and that is worth knowing rather than hiding.
+    # only because this fixture requires a THROWAWAY database (stated in the
+    # module docstring above) -- on a shared one, a pre-existing failing row
+    # would surface here, and that is worth knowing rather than hiding.
     assert report["memory_entries"]["failed"] == 0, (
         "an un-embeddable row must be skipped, not counted as a failure"
     )
