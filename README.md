@@ -92,17 +92,6 @@ Still a storage-layer feature: **no LLM, no entity graph, no new tables or colum
 
 - **Dependency floor raised**: `psycopg[binary]>=3.3.5` (upstream bugfix release, 2026-08-31: prepared-statement invalidation on `ALTER`/`DISCARD`, DataError fixes for malformed COPY/jsonb data, client-encoding aliases). No code changes.
 
-## New in v0.5.1 — `memory remove` no longer wipes a whole theme
-
-Patch release, but **upgrade promptly**: it fixes a data-loss bug. No schema changes, no migrations, no API changes.
-
-- **`remove` deleted every mirrored entry for a theme, not one.** `_worker` passed `old_text=item.content` — but the built-in tool's remove op carries its target in `old_text` and leaves `content` empty, and the host forwards `old_text` via *metadata*. So `item.content` was always `""`, `store.remove` built `content LIKE '%%'`, and that matches every row: a single `memory remove` deleted the entire mirror for that `(agent_identity, target)`. Verified against Postgres — `DELETE … WHERE c LIKE '%%'` removes all rows. `_worker` now reads `extra["old_text"]`, and `store.remove()` **refuses an empty pattern outright**, so no caller can reach that delete by omission. `remove()` also now deletes **at most one row** (lowest id), matching both the built-in tool — which requires a unique match and errors on ambiguity — and this class's own `replace()`. (The built-in store was never affected; only the pgvector mirror. No loss occurred on the reference deployment: every theme's history is continuous.)
-
-Found in production: one `memory_entries` row sat with a NULL embedding and **zero-length content**, arrived through the built-in tool's `replace` path. Two defects met there.
-
-- **Nothing rejected empty content on write.** `on_memory_write` filtered on `target` and `action` but never on content, so an `add`/`replace` carrying nothing created a row that can never be embedded — `embed()` raises `EmbeddingError("empty input")` unconditionally for empty or whitespace text. Such writes are now ignored (`remove` is exempt: it legitimately arrives with empty content and targets the row via `old_text`).
-- **`backfill_null_embeddings` retried it forever.** The sweep selected `WHERE embedding IS NULL` with no content filter, so every nightly run re-fetched the row, called `embed()`, failed, and moved on — permanently pinning `failed` above zero and making `remaining == 0` unreachable. That is the damaging half: it destroys the one signal an operator watches, because you can no longer distinguish a permanently-stuck row from a new genuine failure. Un-embeddable rows are now **skipped and reported separately** as `unembeddable` (skipping them silently would be equally misleading), so `remaining` can actually reach zero again.
-
 ## New in v0.5.0 — import rename (BREAKING), read-side identity gate, config-contract fixes
 
 > ### Breaking upgrade — read before installing
@@ -166,6 +155,17 @@ Correctness release from a full-codebase review. **No schema changes and no new 
 - **A dead database is no longer silent.** Worker write failures logged at `debug` only, so a Postgres restart after a healthy init discarded every durable write for the rest of the session with no operator signal. The first failure now warns. Relatedly, `system_prompt_block` no longer tells the model "Empty store" when the count query merely *failed*.
 - **`save_config` stops deleting your settings.** It replaced the whole `plugins.pgvector` block with schema-declared keys, silently dropping hand-edited ones that are read at runtime (`identity_aliases`, `embed_write_backoff`). It merges now.
 - **Fail-soft hardening** (invariant #4): `sync_turn` is wrapped, config casts are guarded, and the recall tools coerce non-string `query`/`scope`/`target` instead of raising `AttributeError` out of the hook. `hermes-pgvector install --remove` now fails closed and requires `--force` on a directory that isn't a generated shim, instead of deleting it outright.
+
+## New in v0.5.1 — `memory remove` no longer wipes a whole theme
+
+Patch release, but **upgrade promptly**: it fixes a data-loss bug. No schema changes, no migrations, no API changes.
+
+- **`remove` deleted every mirrored entry for a theme, not one.** `_worker` passed `old_text=item.content` — but the built-in tool's remove op carries its target in `old_text` and leaves `content` empty, and the host forwards `old_text` via *metadata*. So `item.content` was always `""`, `store.remove` built `content LIKE '%%'`, and that matches every row: a single `memory remove` deleted the entire mirror for that `(agent_identity, target)`. Verified against Postgres — `DELETE … WHERE c LIKE '%%'` removes all rows. `_worker` now reads `extra["old_text"]`, and `store.remove()` **refuses an empty pattern outright**, so no caller can reach that delete by omission. `remove()` also now deletes **at most one row** (lowest id), matching both the built-in tool — which requires a unique match and errors on ambiguity — and this class's own `replace()`. (The built-in store was never affected; only the pgvector mirror. No loss occurred on the reference deployment: every theme's history is continuous.)
+
+Found in production: one `memory_entries` row sat with a NULL embedding and **zero-length content**, arrived through the built-in tool's `replace` path. Two defects met there.
+
+- **Nothing rejected empty content on write.** `on_memory_write` filtered on `target` and `action` but never on content, so an `add`/`replace` carrying nothing created a row that can never be embedded — `embed()` raises `EmbeddingError("empty input")` unconditionally for empty or whitespace text. Such writes are now ignored (`remove` is exempt: it legitimately arrives with empty content and targets the row via `old_text`).
+- **`backfill_null_embeddings` retried it forever.** The sweep selected `WHERE embedding IS NULL` with no content filter, so every nightly run re-fetched the row, called `embed()`, failed, and moved on — permanently pinning `failed` above zero and making `remaining == 0` unreachable. That is the damaging half: it destroys the one signal an operator watches, because you can no longer distinguish a permanently-stuck row from a new genuine failure. Un-embeddable rows are now **skipped and reported separately** as `unembeddable` (skipping them silently would be equally misleading), so `remaining` can actually reach zero again.
 
 ## Multi-agent / per-minion themes
 
