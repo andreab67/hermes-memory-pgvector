@@ -286,7 +286,7 @@ read-only; the controller assigned every edit and owned all Git state.
 
 ## 10. Pipeline
 
-**`NO PIPELINE CONFIGURED`** — proven three independent ways:
+**No repository-defined CI pipeline** — proven three independent ways:
 
 1. `git ls-files` matches nothing for `.github`, `.gitlab`, `azure-pipelines`,
    `jenkins`, `circleci`, `travis`, `appveyor`, `woodpecker`, or `drone`.
@@ -294,9 +294,33 @@ read-only; the controller assigned every edit and owned all Git state.
 3. `gh api repos/andreab67/hermes-memory-pgvector/actions/workflows` returns
    `total_count: 0` with an empty workflow list.
 
-This is reported as *not configured*, **not** as passing. The exact-SHA pipeline
-gate therefore cannot be satisfied by this repository as it stands, and local
-validation (section 8) is the only available evidence.
+### Correction: a third-party check DOES run on PR commits
+
+An earlier draft of this report stated flatly that no pipeline exists. That was
+incomplete. No CI *workflow* is defined in the repository — the three proofs
+above hold — but a third-party GitHub App check runs on pull-request commits,
+and it was found only after pushing:
+
+| Field | Value |
+|---|---|
+| Check | `Kilo Code Review` (app `kilo-code-bot`) |
+| SHA | `2f9ad373564563c2737867b0f79883828a18c93a` (exact final pushed SHA) |
+| Status | completed |
+| Conclusion | **`action_required`** — not a pass |
+| Reported title | "Code Reviewer disabled: model unavailable" |
+| Reported summary | "Code Reviewer was disabled because the selected model is not available for cloud agent sessions. Choose an available model, then enable Code Reviewer again." |
+
+The base `main` SHA `85eba5e` has **0** check runs, confirming this app fires
+only on pull requests.
+
+**This failure is not caused by anything in this branch.** It is an account-level
+Kilo configuration state (a selected model unavailable for cloud agent sessions)
+and cannot be fixed by a code change here. It was therefore not treated as a
+review-caused CI failure to repair, and it was not retried as an infrastructure
+transient, because it is a deterministic configuration state rather than a flake.
+
+**The exact-SHA gate is consequently NOT satisfied**, and no claim is made that
+it is. Local validation (section 8) is the only passing evidence available.
 
 Per the delivery protocol, a committed report cannot self-record the pipeline
 result for its own final SHA without creating a further SHA; authoritative
