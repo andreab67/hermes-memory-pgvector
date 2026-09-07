@@ -296,9 +296,17 @@ class MemoryStore:
         target: str,
         old_text: str,
     ) -> int:
-        """Delete entries in (agent_identity, target) matching old_text substring.
+        """Delete THE entry in (agent_identity, target) matching old_text.
 
-        Returns the number of rows deleted.
+        Deletes at most ONE row (lowest id), matching both the built-in tool
+        and this class's own replace(). The built-in requires a UNIQUE match
+        and errors on ambiguity (memory_tool_store._edit -> _find_unique_match),
+        so one built-in remove is one entry; a mirror that deleted every
+        substring match would remove strictly more -- and the mirror is the
+        side that accumulates stale rows MEMORY.md no longer has, so "every
+        match" is wider here than it would be there.
+
+        Returns the number of rows deleted (0 or 1).
 
         REFUSES an empty or whitespace-only old_text. `%{""}%` is `LIKE '%%'`,
         which matches every row -- so a caller that lost the removal target
@@ -316,9 +324,13 @@ class MemoryStore:
                 cur.execute(
                     """
                     DELETE FROM memory_entries
-                     WHERE agent_identity = %s
-                       AND target = %s
-                       AND content LIKE %s
+                     WHERE id = (
+                         SELECT id FROM memory_entries
+                          WHERE agent_identity = %s
+                            AND target = %s
+                            AND content LIKE %s
+                          ORDER BY id LIMIT 1
+                     )
                     """,
                     (agent_identity, target, f"%{_escape_like(old_text)}%"),
                 )
@@ -972,8 +984,8 @@ class MemoryStore:
                         # selected here, still raise EmbeddingError("empty
                         # input"), and still fail on every run -- the very bug
                         # this filter exists to stop.
-                        f"SELECT count(*) FILTER (WHERE content ~ '\S'), "
-                        f"       count(*) FILTER (WHERE content !~ '\S' OR content IS NULL) "
+                        rf"SELECT count(*) FILTER (WHERE content ~ '\S'), "
+                        rf"       count(*) FILTER (WHERE content !~ '\S' OR content IS NULL) "
                         f"FROM {t} WHERE embedding IS NULL"
                     )
                     row = cur.fetchone()
@@ -998,7 +1010,7 @@ class MemoryStore:
                         cur.execute(
                             f"SELECT id, content FROM {t} "
                             f"WHERE embedding IS NULL "
-                            f"  AND content ~ '\S' "
+                            rf"  AND content ~ '\S' "
                             f"ORDER BY id LIMIT %s",
                             (batch_size,),
                         )
@@ -1037,7 +1049,7 @@ class MemoryStore:
                 with conn.cursor() as cur:
                     cur.execute(
                         f"SELECT count(*) FROM {t} "
-                        f"WHERE embedding IS NULL AND content ~ '\S'"
+                        rf"WHERE embedding IS NULL AND content ~ '\S'"
                     )
                     remaining = int(cur.fetchone()[0])
             result[t] = {"processed": processed, "succeeded": succeeded,

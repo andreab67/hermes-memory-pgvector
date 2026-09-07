@@ -151,22 +151,74 @@ def test_backfill_skips_empty_content_and_reports_it(store):
             assert cur.fetchone()[0] is False, "real row got embedded"
 
 
+def _scoped_backlog(s, agent):
+    """`remaining`, computed for THIS test's rows only.
+
+    backfill_null_embeddings reports table-wide numbers, but the fixture only
+    cleans its own agent_identity prefix -- so asserting on the table-wide
+    figure makes the test depend on every other row in the database and fail
+    permanently after one interrupted run. Assert the same property, scoped."""
+    with s._get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                r"SELECT count(*) FROM memory_entries "
+                r"WHERE agent_identity = %s AND embedding IS NULL AND content ~ '\S'",
+                (agent,),
+            )
+            return int(cur.fetchone()[0])
+
+
 def test_backfill_remaining_can_reach_zero_despite_an_empty_row(store):
-    """The point of the fix: an un-embeddable row must not pin `remaining`
+    """The point of the fix: an un-embeddable row must not pin the backlog
     above zero forever, or 'is the backlog clear?' becomes unanswerable."""
     s, agent = store
     _insert_raw(s, agent, "")
     _insert_raw(s, agent, "another embeddable note for the sweep")
+    assert _scoped_backlog(s, agent) == 1, "one embeddable row to start"
+
+    before = s.backfill_null_embeddings(
+        embed_fn=lambda t: [0.1] * 768, tables=["memory_entries"], dry_run=True
+    )["memory_entries"]["failed"]
 
     report = s.backfill_null_embeddings(
         embed_fn=lambda t: [0.1] * 768, tables=["memory_entries"]
     )
-    assert report["memory_entries"]["remaining"] == 0, (
-        "remaining must exclude un-embeddable rows so it can actually reach 0"
+
+    assert _scoped_backlog(s, agent) == 0, (
+        "the backlog must exclude un-embeddable rows so it can actually reach 0"
     )
-    assert report["memory_entries"]["failed"] == 0, (
+    assert report["memory_entries"]["failed"] == before, (
         "an un-embeddable row must be skipped, not counted as a failure"
     )
+    assert report["memory_entries"]["unembeddable"] >= 1
+
+
+def test_backfill_skips_whitespace_only_content(store):
+    """Not just the empty string. Postgres trim() strips SPACES ONLY, so a row
+    holding a newline or tab used to pass the filter, reach embed(), and fail
+    forever -- the same bug for a different shape. The predicate now matches
+    Python's str.strip()."""
+    s, agent = store
+    for blank in ("", "   ", chr(10), chr(9) + chr(10) + " "):
+        _insert_raw(s, agent, blank)
+    real_id = _insert_raw(s, agent, "a real note alongside the blank ones")
+
+    seen = []
+
+    def _embed_fn(text):
+        seen.append(text)
+        return [0.1] * 768
+
+    report = s.backfill_null_embeddings(embed_fn=_embed_fn, tables=["memory_entries"])
+
+    assert all(x.strip() for x in seen), f"a blank row reached embed(): {seen!r}"
+    assert report["memory_entries"]["unembeddable"] >= 4
+    assert _scoped_backlog(s, agent) == 0
+
+    with s._get_pool().connection() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT embedding IS NULL FROM memory_entries WHERE id = %s", (real_id,))
+            assert cur.fetchone()[0] is False
 
 
 # ---------------------------------------------------------------------------
