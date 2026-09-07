@@ -82,15 +82,15 @@ Maintenance CLI (`python -m pgvector`, installed as `hermes-pgvector`): `migrate
 
 Still a storage-layer feature: **no LLM, no entity graph, no new tables or columns** — just a GIN index over the existing `content` column (migration `003`) and a fused query. It stays inside invariant #1 (a second index over the same text is not a parallel ontology). Fail-soft as ever: a hybrid hiccup degrades to the proven pure-vector path, and a query that *itself* fails to embed degrades to full-text-only instead of erroring. Toggle with `plugins.pgvector.hybrid_search` (default `true`); the ambient `prefetch()` path stays pure-vector. Works without migration `003` — the GIN index only makes the full-text leg faster.
 
-## New in v0.4.3 — psycopg 3.3.5 floor
-
-- **Dependency floor raised**: `psycopg[binary]>=3.3.5` (upstream bugfix release, 2026-08-31: prepared-statement invalidation on `ALTER`/`DISCARD`, DataError fixes for malformed COPY/jsonb data, client-encoding aliases). No code changes.
-
 ## New in v0.4.2 — pip-native install + hardening
 
 - **`hermes-pgvector install`** — makes a plain `pip install hermes-memory-pgvector` deployable on ANY hermes-agent install: generates the `$HERMES_HOME/plugins/pgvector/` discovery shim (see *Install · Option 1*). No more vendored copies or editable checkouts.
 - **Migration `004`** — `hermes-pgvector migrate` now grants the runtime role DML on `memory_entries`/`conversations` itself; the manual OWNER-transfer step is gone (fresh installs previously hit `permission denied` if it was skipped).
 - **Correctness fixes** from a full-codebase review: `replace`/`remove` now match `old_text` as a *literal* substring (LIKE `%`/`_`/`\` metacharacters no longer over- or under-match — parity with the built-in tool's `in` semantics); the async writer drains its queue on shutdown instead of silently abandoning up to 255 accepted writes when full; a wrong-dimension embed model now surfaces as `expected 768 dims, got N` instead of a masking 404; DM-key bucketing no longer sweeps ordinary `:signal:`-containing theme names into `whatsapp-dm`; bulk MEMORY.md import circuit-breaks after 3 consecutive embed failures (a hanging endpoint can no longer block session start for minutes); `remap` re-checks its duplicate-drop guard under the advisory lock; tool errors redact credential-looking fragments and preserve `score: null` for full-text-only hybrid hits (with `rrf_score` now included); `recall_memory(scope='session')` returns a helpful error instead of silently matching nothing.
+
+## New in v0.4.3 — psycopg 3.3.5 floor
+
+- **Dependency floor raised**: `psycopg[binary]>=3.3.5` (upstream bugfix release, 2026-08-31: prepared-statement invalidation on `ALTER`/`DISCARD`, DataError fixes for malformed COPY/jsonb data, client-encoding aliases). No code changes.
 
 ## Multi-agent / per-minion themes
 
@@ -155,7 +155,7 @@ That:
 
 ```bash
 # Python deps
-pip install 'psycopg[binary]>=3.3.4,<4' 'psycopg-pool>=3.3.1,<4' 'PyYAML>=6.0,<7'
+pip install 'psycopg[binary]>=3.3.5,<4' 'psycopg-pool>=3.3.1,<4' 'PyYAML>=6.0,<7'
 
 # Plugin module
 mkdir -p ~/.hermes/plugins
