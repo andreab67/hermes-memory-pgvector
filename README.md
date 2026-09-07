@@ -94,27 +94,52 @@ Still a storage-layer feature: **no LLM, no entity graph, no new tables or colum
 
 ## New in v0.5.0 — import rename (BREAKING), read-side identity gate, config-contract fixes
 
-> **Breaking, one-time upgrade step.** The Python import package is renamed
-> `pgvector` -> `hermes_pgvector`. The distribution (`hermes-memory-pgvector`),
-> the CLI (`hermes-pgvector`) and the hermes provider name (`pgvector`, i.e.
-> `memory.provider: pgvector`) are all **unchanged** — only the import name moved.
-> An existing discovery shim still says `from pgvector import ...` and will fail
-> after upgrading, and the hermes-agent loader treats that as "plugin absent" and
-> silently falls back to built-in memory. **Regenerate the shim as part of the
-> upgrade:**
+> ### Breaking upgrade — read before installing
+>
+> **1. The import package is renamed** `pgvector` -> `hermes_pgvector`. Unchanged:
+> the distribution (`hermes-memory-pgvector`), the CLI (`hermes-pgvector`), and
+> the hermes provider name (`pgvector`, i.e. `memory.provider: pgvector`).
+>
+> Why: the old top-level name is owned by
+> [pgvector-python](https://pypi.org/project/pgvector/). Both in one venv meant
+> whichever installed last won, and this plugin's shim could import the wrong
+> module — taking the fleet's shared memory offline on a single log line.
+>
+> **2. Any `python -m pgvector ...` command breaks.** It is now
+> `hermes-pgvector ...` (or `python -m hermes_pgvector ...`). This matters most
+> for scheduled jobs, which fail *silently* — the nightly backfill simply stops,
+> and rows written during an embed outage stay permanently unsearchable. Check
+> your units before upgrading:
+>
+> ```bash
+> sudo grep -rl 'python -m pgvector' /etc/systemd/system/ /etc/cron.d/ 2>/dev/null
+> # e.g. hermes-pgvector-backfill.service:
+> #   ExecStart=.../python -m pgvector backfill   ->   -m hermes_pgvector backfill
+> sudo systemctl daemon-reload
+> ```
+>
+> **3. Upgrade steps.** An existing shim still reads `from pgvector import ...`;
+> after upgrading it fails, and the loader treats that as "plugin absent" and
+> falls back to built-in memory.
 >
 > ```bash
 > pip install -U hermes-memory-pgvector==0.5.0
-> hermes-pgvector install --force     # rewrites the shim for the new import name
-> # restart hermes; verify:  hermes memory status
+>
+> # Preferred, if your hermes-agent reads the `hermes_agent.memory_providers`
+> # entry-point group (this package now declares it): drop the shim entirely and
+> # let pip discovery take over -- nothing left to go stale on future upgrades.
+> hermes-pgvector install --remove
+>
+> # Otherwise (older host that only scans plugin directories): regenerate it.
+> hermes-pgvector install --force
+>
+> # restart hermes, then verify -- do not skip this:
+> hermes memory status        # expect: Provider: pgvector; Status: available
 > ```
 >
-> Why: the old top-level name `pgvector` is owned by the widely-used
-> [pgvector-python](https://pypi.org/project/pgvector/) distribution. Installing
-> both into one venv meant whichever landed last won, and this plugin's shim
-> import would resolve to the wrong module — taking the fleet's shared memory
-> offline on a single log line. `hermes-pgvector install` now also verifies the
-> import resolves to this package and warns loudly if something shadows it.
+> `hermes-pgvector install` now verifies in a clean subprocess that the shim it
+> just wrote can actually be imported, and warns if it cannot or if another
+> package shadows this one.
 
 - **Read-side identity gate.** The `whatsapp-dm` and `_bench` sinks were write-side only: `identity.py` stripped PII from the *identity*, but message bodies still live in `content`, and nothing filtered them on read. Any theme could pull DM content into its context via `scope='all'` or by naming the bucket directly — and with turn capture on, the reply quoting it was written back under the *reading* theme, permanently re-attributing DM data. `scope='all'` now excludes those sinks, and naming one explicitly is rejected. An agent that *is* the bucket keeps full access to its own rows, and ordinary cross-theme recall is unaffected.
 
@@ -172,7 +197,7 @@ sudo systemctl restart hermes.service
 hermes memory status             # expect: Provider: pgvector; Status: available
 ```
 
-**Why the shim?** hermes-agent discovers memory providers by scanning plugin *directories* — `plugins/memory/<name>/` (bundled) and `$HERMES_HOME/plugins/<name>/` (user) — and never looks at installed packages. `pip install` alone is therefore invisible to it. `hermes-pgvector install` writes a two-line shim whose absolute import resolves to the pip-installed package, so upgrades are just `pip install -U hermes-memory-pgvector` + restart, and rollback is `pip install hermes-memory-pgvector==<prev>` + restart — the shim never changes. `--remove` deletes it; if the package is uninstalled the shim import fails cleanly and hermes falls back to built-in memory.
+**Why the shim?** hermes-agent resolves a provider from bundled dirs, then `$HERMES_HOME/plugins/<name>/`, then the `hermes_agent.memory_providers` pip entry-point group. Since v0.5.0 this package **declares that entry point**, so on a host new enough to support it `pip install hermes-memory-pgvector` is sufficient on its own and no shim is needed. The shim remains for older hosts that only scan directories. Note a shim *directory* takes precedence over the entry point when one is present, so a stale shim still wins — which is why the v0.5.0 upgrade tells you to remove it. `hermes-pgvector install` writes a two-line shim whose absolute import resolves to the pip-installed package, so upgrades are just `pip install -U hermes-memory-pgvector` + restart, and rollback is `pip install hermes-memory-pgvector==<prev>` + restart — the shim never changes. `--remove` deletes it; if the package is uninstalled the shim import fails cleanly and hermes falls back to built-in memory.
 
 ### Option 2: clone + run the installer script (from source)
 
@@ -185,7 +210,7 @@ cd hermes-memory-pgvector
 That:
 
 1. `pip install`s `psycopg[binary]`, `psycopg-pool`, `PyYAML` (with the upper-bound pins).
-2. Copies `pgvector/` into `$HERMES_HOME/plugins/pgvector/` (defaults to `~/.hermes/plugins/pgvector/`).
+2. Copies `hermes_pgvector/` into `$HERMES_HOME/plugins/pgvector/` (defaults to `~/.hermes/plugins/pgvector/`).
 3. Prints the admin migration + activation commands you run next.
 
 ### Option 3: manual
@@ -196,7 +221,7 @@ pip install 'psycopg[binary]>=3.3.5,<4' 'psycopg-pool>=3.3.1,<4' 'PyYAML>=6.0,<7
 
 # Plugin module
 mkdir -p ~/.hermes/plugins
-cp -r pgvector ~/.hermes/plugins/pgvector
+cp -r hermes_pgvector ~/.hermes/plugins/pgvector
 ```
 
 ### Then (admin once)

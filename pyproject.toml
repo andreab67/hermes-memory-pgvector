@@ -54,6 +54,17 @@ test = [
 [project.scripts]
 hermes-pgvector = "hermes_pgvector.__main__:main"
 
+# Native plugin discovery. hermes-agent resolves memory providers from bundled
+# dirs, then user plugin dirs, then this entry-point group (plugins/memory/
+# __init__.py: ENTRY_POINTS_GROUP = "hermes_agent.memory_providers"); the
+# loader accepts a module exposing `register(ctx)`, which this package does.
+# With this declared, `pip install hermes-memory-pgvector` is sufficient on a
+# host new enough to support it -- no discovery shim, and nothing to go stale
+# on the next upgrade. The shim generator stays for older hosts, and a shim
+# DIRECTORY still wins over the entry point when one is present.
+[project.entry-points."hermes_agent.memory_providers"]
+pgvector = "hermes_pgvector"
+
 [project.urls]
 Homepage      = "https://github.com/andreab67/hermes-memory-pgvector"
 Source        = "https://github.com/andreab67/hermes-memory-pgvector"

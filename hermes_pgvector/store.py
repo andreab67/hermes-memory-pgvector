@@ -155,7 +155,7 @@ class MemoryStore:
                         "memory_entries table missing. Apply migrations as DB admin: "
                         "hermes-pgvector migrate --admin-dsn 'dbname=<db> user=postgres "
                         "host=/var/run/postgresql' (or psql -f the files in the "
-                        "installed package's pgvector/migrations/ directory, in order)"
+                        "installed package's hermes_pgvector/migrations/ directory, in order)"
                     )
 
     def apply_migration_as_admin(self, *, admin_dsn: str, migration: str = "001_schema.sql") -> None:

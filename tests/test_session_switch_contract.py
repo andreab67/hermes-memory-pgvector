@@ -92,23 +92,49 @@ def test_on_session_switch_undo_empty_string_does_not_erase_delegation_parent():
     )
 
 
-def test_on_session_switch_still_resets_per_session_log_and_dedup_state():
-    """The resets on_session_switch() DOES perform are correct and
-    intentional (same rationale as initialize()'s per-session reset): stale
-    one-shot warning flags would silence real signal for a new session, and a
-    stale fingerprint set would make on_session_end() wrongly skip turns that
-    belong to the NEW session. This is the counterpart assertion to the two
-    tests above -- on_session_switch must be surgical: reset exactly these
-    three, and nothing else (in particular, not _parent_session_id)."""
+def test_on_session_switch_resets_one_shot_log_flags():
+    """The one-shot warning flags MUST reset on a switch: leaving them set
+    would silence real signal (a broken embed endpoint, a dead database) for
+    the whole rest of the process."""
     p = _provider_with_delegation_parent()
     p._embed_warned = True
     p._db_warned = True
-    p._turn_fingerprints = {"stale-fingerprint-from-old-session"}
 
     p.on_session_switch("new-sess", parent_session_id="previous-lineage-sess")
 
     assert p._embed_warned is False
     assert p._db_warned is False
-    assert p._turn_fingerprints == set()
     # And still untouched, in the same call that performed the resets above.
     assert p._parent_session_id == "delegation-parent-1"
+
+
+def test_on_session_switch_does_not_clear_turn_fingerprints():
+    """Fingerprints must SURVIVE a session switch.
+
+    An earlier version cleared them here, on the stated guarantee that the host
+    always runs on_session_end (which consumes them) before on_session_switch.
+    That guarantee is false: it holds for MemoryManager.commit_session_boundary_async,
+    but agent/conversation_compression.py calls on_session_switch DIRECTLY with
+    no on_session_end at all -- and compression fires on any long session. With
+    the set cleared, the turn double-write the fingerprints exist to prevent
+    came straight back on every compression.
+
+    The set is bounded by _FINGERPRINT_CAP instead of by clearing."""
+    p = _provider_with_delegation_parent()
+    p._turn_fingerprints = {"fp-from-before-the-switch"}
+
+    p.on_session_switch("new-sess", parent_session_id="previous-lineage-sess")
+
+    assert "fp-from-before-the-switch" in p._turn_fingerprints, (
+        "clearing here re-opens the double-write on the compression path"
+    )
+
+
+def test_turn_fingerprints_are_bounded():
+    """The set is capped, so a long-lived provider cannot grow without limit."""
+    p = _provider_with_delegation_parent()
+    p._turn_fingerprints = {f"fp-{i}" for i in range(p._FINGERPRINT_CAP + 5)}
+
+    p.on_session_switch("new-sess")
+
+    assert len(p._turn_fingerprints) == 0, "over-cap set is reset wholesale"

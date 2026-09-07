@@ -125,7 +125,8 @@ The PII/bench buckets also gained the read-side half they never had. `whatsapp-d
 
 | Capability | Version |
 |---|---|
-| Import package `pgvector` → `hermes_pgvector`; shim import verified at install time | v0.5.0 |
+| Import package `pgvector` → `hermes_pgvector`; shim import verified in a clean subprocess at install time | v0.5.0 |
+| `hermes_agent.memory_providers` entry point declared — `pip install` alone is sufficient on a host that reads it, no shim to go stale | v0.5.0 |
 | Read-side exclusion of `whatsapp-dm` / `_bench` from `scope='all'` + explicit-scope rejection | v0.5.0 |
 | Config type-contract fixes (`allowed_themes` string/list, boolean toggles declared as strings) | v0.5.0 |
 | Turn double-write guard; `replace()` single-row UPDATE; fail-soft hardening | v0.5.0 |

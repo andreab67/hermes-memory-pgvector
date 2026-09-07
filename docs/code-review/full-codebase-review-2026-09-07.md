@@ -59,7 +59,7 @@ a correction to an earlier over-broad claim, are in section 10.
 ## 3. Scope reviewed
 
 Python 3.11+ single-package distribution: a Postgres + pgvector memory-provider
-plugin for hermes-agent. One package (`pgvector/`), one operator CLI
+plugin for hermes-agent. One package (`hermes_pgvector/`, renamed from `pgvector/` in this branch), one operator CLI
 (`hermes-pgvector`), four SQL migrations, one shell installer, five (now nine)
 test modules.
 
@@ -69,8 +69,8 @@ test modules.
 
 | Partition | Owner | Files |
 |---|---|---|
-| A | Sonnet reviewer | `pgvector/store.py` (1172 lines) |
-| B | Sonnet reviewer | `pgvector/__init__.py` (1173 lines) |
+| A | Sonnet reviewer | `hermes_pgvector/store.py` (1172 lines) |
+| B | Sonnet reviewer | `hermes_pgvector/__init__.py` (1173 lines) |
 | C | Sonnet reviewer | `writer.py`, `embed.py`, `identity.py`, `__main__.py`, `scripts/install.sh` |
 | D | Sonnet reviewer | 5 test modules, 4 migrations, `pyproject.toml`, `plugin.yaml`, `.gitignore`, `README.md`, `ROADMAP.md` |
 | E | Opus | Cross-cutting: invariants, contract drift, data integrity, migration/code coherence, identity end-to-end, config coherence |
@@ -261,6 +261,53 @@ not. It is recorded here rather than quietly corrected.
 
 ---
 
+### 6.3 Three false claims in my own output — caught by the third challenge
+
+The v0.5.0 work (read-side gate + import rename) went through a further
+adversarial pass. It found no correctness, security, or concurrency defect in
+the new code, but it did find that **three statements I had written were false**:
+
+1. **"`install` warns loudly if something shadows this package."** The check I
+   added was a tautology: `__main__.py` does `from . import DEFAULTS`, so the
+   package is already in `sys.modules` and `import hermes_pgvector` could never
+   resolve anywhere else. It could not fire under any circumstance, while the
+   README and this report both advertised it as a safety net. Replaced with a
+   real check that runs a clean subprocess — verified to fire against a decoy
+   package, and to correctly report a from-clone environment where the
+   distribution is not installed.
+
+2. **"The host runs `on_session_end` strictly before `on_session_switch`."**
+   True only for `commit_session_boundary_async`.
+   `agent/conversation_compression.py` calls `on_session_switch` directly with no
+   `on_session_end` at all — and compression fires on any long session. Because
+   the fix cleared the fingerprint set on switch, the turn double-write it exists
+   to prevent came straight back on every compression (reproduced: 4 enqueues
+   instead of 2). Fingerprints now survive session switches and are bounded by
+   `_FINGERPRINT_CAP` instead. The test that encoded the false guarantee was
+   rewritten to assert the correct contract.
+
+3. **"hermes-agent never looks at installed packages, so `pip install` alone is
+   invisible to it."** False against the checked-out host:
+   `plugins/memory/__init__.py` has supported the `hermes_agent.memory_providers`
+   entry-point group since 2026-05-02, and hermes-agent's own `CONTRIBUTING.md`
+   says "or via a pip entry point". This package now **declares that entry
+   point**, so on a supporting host `pip install` is sufficient and no shim is
+   needed. (A shim *directory* still takes precedence over the entry point, so a
+   stale shim still wins — which is why the upgrade instructions now recommend
+   removing it rather than regenerating it.)
+
+It also caught two operator-facing breaks the rename introduced, both blocking:
+shipped help text and the `SchemaNotApplied` message still told operators to run
+`python -m pgvector`, and the from-clone install path still said `cp -r pgvector`
+while `install.sh` advertised a console script it never installs.
+
+**The `python -m pgvector` break was live.** The deployed unit
+`/etc/systemd/system/hermes-pgvector-backfill.service` runs
+`ExecStart=.../python -m pgvector backfill`; upgrading to 0.5.0 would have
+stopped nightly re-embedding silently, leaving rows written during an embed
+outage permanently unsearchable. The README upgrade block now leads with that,
+including the `grep` to find affected units.
+
 ## 7. Tests added
 
 New: `tests/test_config_coercion.py`, `tests/test_async_writer.py`,
@@ -293,11 +340,11 @@ then restoring.
 | Command | Result |
 |---|---|
 | `python -m pytest tests/ -q` (baseline) | 24 passed, 34 skipped |
-| `python -m pytest tests/ -q` (final) | **72 passed, 35 skipped** |
-| `python -c "import pgvector, pgvector.store, pgvector.embed, pgvector.__main__"` | imports OK |
+| `python -m pytest tests/ -q` (final) | **74 passed, 35 skipped** |
+| `python -c "import hermes_pgvector, hermes_pgvector.store, hermes_pgvector.embed"` | imports OK |
 | `bash -n scripts/install.sh` | syntax OK |
-| `yaml.safe_load(open('pgvector/plugin.yaml'))` | valid; reflects all three changes |
-| `python -m pgvector install --help` | parses; `--force` present on subparser |
+| `yaml.safe_load(open('hermes_pgvector/plugin.yaml'))` | valid; reflects all three changes |
+| `python -m hermes_pgvector install --help` | parses; `--force` present on subparser |
 | Behavioral: `install --remove` on non-shim dir | refuses, exit 1, operator file survives |
 | Behavioral: `install --remove --force` | proceeds, exit 0 |
 | Behavioral: `_as_bool` / `_as_theme_list` / `normalize_identity` | string forms now handled correctly |
@@ -316,6 +363,9 @@ then restoring.
 | 2 | Controller self-check of its own change | 1 self-introduced regression found and fixed (section 6) |
 | 2 | Opus independent adversarial challenge + fresh full sweep | **NOT READY** — 1 HIGH regression in a controller-authored fix (section 6.2), plus 6 actionable non-blocking findings |
 | 2 | Repair round 2: revert the regression, guard remaining casts, bump to 0.4.4, close test gaps | blocking finding resolved; +8 tests |
+| 3 | Owner asked for the two deferred items; implemented read-side gate + import rename (v0.5.0) | +11 gate tests |
+| 3 | Opus independent challenge of v0.5.0 | **NOT READY** — 2 blocking operator-instruction defects introduced by the rename, plus 9 non-blocking findings including three false claims in my own docs |
+| 3 | Repair round 3: stale CLI invocations, from-clone path, real shim verification, fingerprint retention, entry point, doc corrections | blocking findings resolved; +2 tests |
 
 No two agents ever held write access to the same file. All review workers were
 read-only; the controller assigned every edit and owned all Git state.

@@ -43,7 +43,7 @@ try:
     from tools.registry import tool_error
     from hermes_cli.config import cfg_get
 except ImportError:  # pragma: no cover
-    # Standalone context (the `python -m pgvector` CLI / unit tests) — hermes-agent
+    # Standalone context (the `hermes-pgvector` CLI / unit tests) — hermes-agent
     # is not importable. Provide minimal fallbacks so the package still imports;
     # the provider class is never instantiated outside the agent, only the store/
     # embed/identity helpers + the maintenance CLI are used here.
@@ -295,6 +295,12 @@ def _load_plugin_config() -> dict:
 # ---------------------------------------------------------------------------
 
 class PgvectorMemoryProvider(MemoryProvider):
+    # Upper bound on the turn-fingerprint set. Fingerprints deliberately
+    # survive session switches (see on_session_switch), so this is what keeps
+    # a long-lived provider from growing without limit. ~60 fingerprints per
+    # session means this holds roughly 150 sessions before a reset.
+    _FINGERPRINT_CAP = 10000
+
     """Postgres mirror of built-in memory entries, with semantic recall."""
 
     def __init__(self, config: dict | None = None):
@@ -335,7 +341,9 @@ class PgvectorMemoryProvider(MemoryProvider):
         # lifetime — a later session with a broken endpoint gets zero signal.
         self._embed_warned = False
         self._db_warned = False
-        self._turn_fingerprints = set()
+        # _turn_fingerprints is deliberately NOT reset here either -- same
+        # reasoning as on_session_switch: the dedup guard must survive a
+        # re-initialize on a reused instance. The cap bounds it instead.
         # Per-agent theme scoping — priority order:
         #   1. gateway_session_key — from the `X-Hermes-Session-Key` header on
         #      API requests. This is the EXPLICIT minion-scope signal sent by
@@ -476,10 +484,20 @@ class PgvectorMemoryProvider(MemoryProvider):
         # the rest of the process.
         self._embed_warned = False
         self._db_warned = False
-        # Safe to clear here: the host runs on_session_end STRICTLY BEFORE
-        # on_session_switch (memory_manager.py:597-620), so the backstop has
-        # already consumed these.
-        self._turn_fingerprints = set()
+        # NOT cleared here. on_session_end runs before on_session_switch only
+        # on the commit_session_boundary_async path; conversation_compression.py
+        # calls on_session_switch DIRECTLY with no on_session_end, so clearing
+        # would let the turn double-write reappear on every context compression
+        # (which fires on any long session). Fingerprints therefore live for the
+        # provider's lifetime, bounded below.
+        if len(self._turn_fingerprints) > self._FINGERPRINT_CAP:
+            # Bound the memory: a very long-lived process may re-duplicate one
+            # turn after a reset, which is far cheaper than unbounded growth.
+            logger.debug(
+                "pgvector turn-fingerprint set exceeded %d; resetting",
+                self._FINGERPRINT_CAP,
+            )
+            self._turn_fingerprints = set()
         # NOTE: deliberately does NOT touch _parent_session_id. The host's
         # on_session_switch(parent_session_id=...) carries the PREVIOUS session
         # in this agent's own lineage (/new passes old_session_id, /undo passes
@@ -1138,6 +1156,12 @@ class PgvectorMemoryProvider(MemoryProvider):
             agent_filter = self._agent_identity
         elif scope == "session":
             session_filter = self._session_id or None
+            # Close the gate's last branch: with no session id (never produced
+            # by the current host, but the surrounding code already treats an
+            # empty id as possible) this would otherwise be a completely
+            # unfiltered cross-theme sweep INCLUDING both sinks.
+            if session_filter is None:
+                exclude = restricted or None
         elif scope == "all":
             # No agent filter, but never the PII/bench sinks.
             exclude = restricted or None
@@ -1303,12 +1327,12 @@ class PgvectorMemoryProvider(MemoryProvider):
             },
             {
                 "key": "ttl_days",
-                "description": "v0.4: advisory retention window for conversations (memory_entries are NEVER pruned). 0 = off. Pruning only ever happens when an operator runs `python -m pgvector prune` — this value is the default for that command, never an automatic background delete.",
+                "description": "v0.4: advisory retention window for conversations (memory_entries are NEVER pruned). 0 = off. Pruning only ever happens when an operator runs `hermes-pgvector prune` — this value is the default for that command, never an automatic background delete.",
                 "default": str(DEFAULTS["ttl_days"]),
             },
             {
                 "key": "embed_write_retries",
-                "description": "v0.4: bounded embed retries on the background writer path ONLY (the hot path — prefetch/recall/sync — always uses a single attempt). Durable recovery of missed embeddings is the `python -m pgvector backfill` sweep, not inline retries.",
+                "description": "v0.4: bounded embed retries on the background writer path ONLY (the hot path — prefetch/recall/sync — always uses a single attempt). Durable recovery of missed embeddings is the `hermes-pgvector backfill` sweep, not inline retries.",
                 "default": str(DEFAULTS["embed_write_retries"]),
             },
         ]

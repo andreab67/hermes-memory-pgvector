@@ -61,7 +61,7 @@ This script remains the from-clone alternative.
 Next steps (admin once):
   1. Apply ALL migrations (schema + attribution + FTS indexes + runtime
      grants) in one shot — from the repo root:
-       hermes-pgvector migrate --admin-dsn \\
+       python -m hermes_pgvector migrate --admin-dsn \\
            "dbname=<your-memory-db> user=postgres host=/var/run/postgresql"
      (or apply migrations/00*.sql in lexical order with psql -f; migration
       004 grants the runtime 'hermes' role DML on the 001 tables — no manual
