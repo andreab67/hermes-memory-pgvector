@@ -1,20 +1,20 @@
 {
- "pgvector/__init__.py||RECALL_CONVERSATION_SCHEMA||pgvector/__init__.py||RECALL_MEMORY_SCHEMA": {
+ "hermes_pgvector/__init__.py||RECALL_CONVERSATION_SCHEMA||hermes_pgvector/__init__.py||RECALL_MEMORY_SCHEMA": {
   "note": "Two distinct LLM-facing tool schemas returned together by get_tool_schemas(): different wire names (recall_conversation/recall_memory), different params (target enum vs session scope), and they cross-reference each other. Token overlap is shared query/scope/limit boilerplate; merging would change public API.",
   "ts": "2026-07-21T07:25:54.259392-06:00",
   "verdict": "not_duplicate"
  },
- "pgvector/store.py|MemoryStore.remap_identity|conv_old||pgvector/store.py|MemoryStore.remap_identity|dupes": {
+ "hermes_pgvector/store.py|MemoryStore.remap_identity|conv_old||hermes_pgvector/store.py|MemoryStore.remap_identity|dupes": {
   "note": "Different queries: dupes = memory_entries collision count via EXISTS against new_identity (gates the >10 force check at line 1056); conv_old = conversations count for old_identity. Only the scalar-read idiom is shared.",
   "ts": "2026-07-21T07:25:21.826355-06:00",
   "verdict": "not_duplicate"
  },
- "pgvector/store.py|MemoryStore.remap_identity|conv_old||pgvector/store.py|MemoryStore.remap_identity|me_old": {
+ "hermes_pgvector/store.py|MemoryStore.remap_identity|conv_old||hermes_pgvector/store.py|MemoryStore.remap_identity|me_old": {
   "note": "Distinct COUNT(*) results from different queries (conversations vs memory_entries for old_identity); cursor re-executed between fetches; line 1053 uses me_old - dupes and conv_old separately.",
   "ts": "2026-07-21T07:25:12.843788-06:00",
   "verdict": "not_duplicate"
  },
- "pgvector/store.py|MemoryStore.remap_identity|dupes||pgvector/store.py|MemoryStore.remap_identity|me_old": {
+ "hermes_pgvector/store.py|MemoryStore.remap_identity|dupes||hermes_pgvector/store.py|MemoryStore.remap_identity|me_old": {
   "note": "me_old = ALL memory_entries for old_identity; dupes = the colliding SUBSET vs new_identity (dupes <= me_old). Line 1053 computes me_old - dupes, so merging them would always yield 0 moved rows.",
   "ts": "2026-07-21T07:25:32.429900-06:00",
   "verdict": "not_duplicate"

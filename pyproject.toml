@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-pgvector"
-version = "0.4.3"
+version = "0.5.0"
 description = "Postgres + pgvector memory provider plugin for hermes-agent. Multi-agent storage layer with per-minion themes, identity governance, agent attribution + delegation provenance, async writer, no LLM in the memory hot path."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -52,7 +52,18 @@ test = [
 # Operator maintenance CLI (migrate / backfill / prune / stats / cleanup / remap).
 # Shipped as source — no built artifacts committed (repo convention).
 [project.scripts]
-hermes-pgvector = "pgvector.__main__:main"
+hermes-pgvector = "hermes_pgvector.__main__:main"
+
+# Native plugin discovery. hermes-agent resolves memory providers from bundled
+# dirs, then user plugin dirs, then this entry-point group (plugins/memory/
+# __init__.py: ENTRY_POINTS_GROUP = "hermes_agent.memory_providers"); the
+# loader accepts a module exposing `register(ctx)`, which this package does.
+# With this declared, `pip install hermes-memory-pgvector` is sufficient on a
+# host new enough to support it -- no discovery shim, and nothing to go stale
+# on the next upgrade. The shim generator stays for older hosts, and a shim
+# DIRECTORY still wins over the entry point when one is present.
+[project.entry-points."hermes_agent.memory_providers"]
+pgvector = "hermes_pgvector"
 
 [project.urls]
 Homepage      = "https://github.com/andreab67/hermes-memory-pgvector"
@@ -65,8 +76,8 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where   = ["."]
-include = ["pgvector*"]
+include = ["hermes_pgvector*"]
 exclude = ["tests*"]
 
 [tool.setuptools.package-data]
-pgvector = ["plugin.yaml", "migrations/*.sql"]
+hermes_pgvector = ["plugin.yaml", "migrations/*.sql"]

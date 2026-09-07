@@ -2,13 +2,13 @@
 
 Runs standalone (no hermes-agent runtime needed), so it is safe in cron:
 
-    python -m pgvector install  [--hermes-home ~/.hermes] [--remove] [--force]
-    python -m pgvector migrate  --admin-dsn "dbname=hermes_memory user=postgres host=/var/run/postgresql"
-    python -m pgvector stats    [--dsn ...]
-    python -m pgvector backfill [--dsn ...] [--embed-url ...] [--batch-size 100] [--dry-run]
-    python -m pgvector prune    --days 90 [--dsn ...] [--execute]
-    python -m pgvector cleanup  --identities "agent:main:whatsapp:dm:17192714834,skill-bench,skill-bench-ws" [--execute]
-    python -m pgvector remap    --old hermes --new agent-hermes [--execute] [--force]
+    hermes-pgvector install  [--hermes-home ~/.hermes] [--remove] [--force]
+    hermes-pgvector migrate  --admin-dsn "dbname=hermes_memory user=postgres host=/var/run/postgresql"
+    hermes-pgvector stats    [--dsn ...]
+    hermes-pgvector backfill [--dsn ...] [--embed-url ...] [--batch-size 100] [--dry-run]
+    hermes-pgvector prune    --days 90 [--dsn ...] [--execute]
+    hermes-pgvector cleanup  --identities "agent:main:whatsapp:dm:17192714834,skill-bench,skill-bench-ws" [--execute]
+    hermes-pgvector remap    --old hermes --new agent-hermes [--execute] [--force]
 
 `install` (v0.4.2) makes a pip-installed package discoverable by hermes-agent:
 it writes a tiny shim into $HERMES_HOME/plugins/pgvector/ that resolves to
@@ -66,9 +66,24 @@ def _make_store(args, file_cfg: dict) -> MemoryStore:
 
 
 def _make_embed_fn(args, file_cfg: dict):
+    """Embed closure for the operator CLI (backfill / bulk paths).
+
+    Uses embed_write_timeout, not embed_timeout: nothing interactive waits on a
+    nightly sweep, and this is the documented repair path for rows that landed
+    with a NULL embedding. Before v0.5.0 no timeout was passed here at all, so
+    the sweep inherited embed()'s hardcoded 10s -- which on a slow endpoint is
+    exactly the condition that produced the NULL rows in the first place, so
+    backfill kept failing at the one job it exists to do.
+    """
     base_url = _resolve(args, file_cfg, "embed_url")
     model = _resolve(args, file_cfg, "embed_model")
-    return lambda text: embed(text, base_url=base_url, model=model, retries=1)
+    try:
+        timeout = float(_resolve(args, file_cfg, "embed_write_timeout"))
+    except (TypeError, ValueError):
+        timeout = float(DEFAULTS["embed_write_timeout"])
+    return lambda text: embed(
+        text, base_url=base_url, model=model, timeout=timeout, retries=1
+    )
 
 
 # --- commands -------------------------------------------------------------
@@ -104,14 +119,17 @@ deactivate the plugin.
 hermes-agent discovers memory providers by scanning plugin DIRECTORIES —
 plugins/memory/<name>/ (bundled) and $HERMES_HOME/plugins/<name>/ (user) —
 for an __init__.py mentioning MemoryProvider / register_memory_provider.
-It never looks at installed packages, so `pip install hermes-memory-pgvector`
-alone is invisible to it. This shim bridges the gap: the loader imports this
+Older hosts scan directories ONLY, so `pip install` alone is invisible to them
+-- this shim bridges that gap. (Hosts new enough to read the
+`hermes_agent.memory_providers` entry-point group, which this package declares
+since v0.5.0, need no shim at all; a shim directory still takes precedence over
+the entry point when present.) The loader imports this
 file, and the absolute import below resolves to the real package installed
 in the SAME environment hermes-agent runs in. Uninstall the package and the
 import fails cleanly — the loader logs it and falls back to built-in memory.
 """
 
-from pgvector import PgvectorMemoryProvider, register  # noqa: F401
+from hermes_pgvector import PgvectorMemoryProvider, register  # noqa: F401
 '''
 
 
@@ -143,11 +161,13 @@ def cmd_install(args) -> int:
         if not shim_dir.exists():
             print(f"nothing to remove at {shim_dir}")
             return 0
-        if init_py.exists() and SHIM_MARKER not in init_py.read_text(
+        is_marked_shim = init_py.exists() and SHIM_MARKER in init_py.read_text(
             encoding="utf-8", errors="replace"
-        ):
+        )
+        if not is_marked_shim and not args.force:
             print(
-                f"refusing to remove {shim_dir}: not a generated shim (no marker)",
+                f"refusing to remove {shim_dir}: not a generated shim (no marker); "
+                "re-run with --force to remove it anyway",
                 file=sys.stderr,
             )
             return 1
@@ -197,7 +217,49 @@ def cmd_install(args) -> int:
         print(f"warning: could not copy plugin.yaml: {exc}", file=sys.stderr)
 
     print(f"installed discovery shim: {shim_dir}")
-    print("  -> resolves to the pip-installed `pgvector` package at import time")
+    print("  -> resolves to the pip-installed `hermes_pgvector` package at import time")
+
+    # Verify the shim actually loads. This runs in a SUBPROCESS with cwd set
+    # outside the package: checking `import hermes_pgvector` in THIS process
+    # would be a tautology, because importing __main__ already put the package
+    # in sys.modules. What matters is whether a fresh interpreter -- which is
+    # what hermes-agent's loader is -- can execute the shim we just wrote. If
+    # it cannot, the loader logs one line and falls back to built-in memory,
+    # taking the fleet's shared memory offline silently.
+    try:
+        import subprocess
+        probe = subprocess.run(
+            [sys.executable, "-c",
+             "import hermes_pgvector as m; "
+             "assert hasattr(m, 'PgvectorMemoryProvider') and hasattr(m, 'register'); "
+             "print(m.__file__)"],
+            cwd=str(Path(shim_dir).anchor or Path.home()),
+            capture_output=True, text=True, timeout=60,
+        )
+        if probe.returncode != 0:
+            detail = (probe.stderr or "").strip().splitlines()
+            print(
+                "WARNING: the shim will NOT load -- a fresh interpreter cannot "
+                "import hermes_pgvector: "
+                + (detail[-1] if detail else "(no output)")
+                + ". hermes-agent would fall back to built-in memory. Most "
+                "likely the distribution is not installed in THIS environment "
+                "(running from a clone without `pip install .` does exactly "
+                "this); the shim resolves by import, not by path.",
+                file=sys.stderr,
+            )
+        else:
+            resolved = Path(probe.stdout.strip()).resolve().parent
+            expected = Path(__file__).resolve().parent
+            if resolved != expected:
+                print(
+                    f"WARNING: `import hermes_pgvector` resolves to {resolved}, "
+                    f"not {expected} -- another package is shadowing this one.",
+                    file=sys.stderr,
+                )
+    except Exception as exc:  # noqa: BLE001 -- advisory only, never fail install
+        print(f"note: could not verify shim import ({exc})", file=sys.stderr)
+
     print("next steps:")
     print("  1. config.yaml:  memory.provider: pgvector   (+ plugins.pgvector settings)")
     print("  2. migrations (admin, once):")
@@ -305,7 +367,7 @@ def cmd_remap(args) -> int:
 
 
 def build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(prog="pgvector", description="hermes-memory-pgvector maintenance CLI")
+    p = argparse.ArgumentParser(prog="hermes-pgvector", description="hermes-memory-pgvector maintenance CLI")
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp):

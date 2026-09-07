@@ -1,9 +1,13 @@
 """Smoke tests for the pgvector memory plugin.
 
 These tests target the standalone modules (embed.py, store.py). The
-provider class itself imports hermes-agent internals (agent.memory_provider,
-tools.registry, …) and is only exercised when the plugin runs inside
-hermes-agent.
+provider class itself *prefers* hermes-agent internals (agent.memory_provider,
+tools.registry, hermes_cli.config) when they're importable, but that import
+is wrapped in a try/except (pgvector/__init__.py:41-63) precisely so
+PgvectorMemoryProvider can also be constructed standalone, outside
+hermes-agent -- see tests/test_tool_args_hardening.py and
+tests/test_turn_dedup.py, which do exactly that with no DB or embed
+endpoint.
 
 Run with:
     pytest tests/
@@ -31,7 +35,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 # ---------------------------------------------------------------------------
 
 def test_pgvector_literal_roundtrip():
-    from pgvector.embed import to_pgvector_literal
+    from hermes_pgvector.embed import to_pgvector_literal
 
     lit = to_pgvector_literal([0.1, -0.25, 0.333333])
     assert lit.startswith("[") and lit.endswith("]")
@@ -39,7 +43,7 @@ def test_pgvector_literal_roundtrip():
 
 
 def test_embed_empty_input_raises():
-    from pgvector.embed import embed, EmbeddingError
+    from hermes_pgvector.embed import embed, EmbeddingError
 
     with pytest.raises(EmbeddingError):
         embed("", base_url="http://localhost:11434")
@@ -48,7 +52,7 @@ def test_embed_empty_input_raises():
 
 
 def test_escape_like_literalizes_metacharacters():
-    from pgvector.store import _escape_like
+    from hermes_pgvector.store import _escape_like
 
     assert _escape_like("15% YoY") == "15\\% YoY"
     assert _escape_like("a_b") == "a\\_b"
@@ -61,7 +65,7 @@ def test_escape_like_literalizes_metacharacters():
     reason="PG_TEST_EMBED_URL not set",
 )
 def test_embed_live_returns_768_dims():
-    from pgvector.embed import embed
+    from hermes_pgvector.embed import embed
 
     base_url = os.environ["PG_TEST_EMBED_URL"]
     vec = embed("hello world", base_url=base_url, model="nomic-embed-text")
@@ -84,7 +88,7 @@ def store():
     if not dsn:
         pytest.skip("PG_TEST_DSN not set")
 
-    from pgvector.store import MemoryStore
+    from hermes_pgvector.store import MemoryStore
 
     s = MemoryStore(dsn)
     s.ensure_schema()
@@ -213,7 +217,16 @@ def test_bulk_upsert_md_skips_existing(store, tmp_path):
         "\n§\n"
         "second note: the gateway runs on port 8642"
         "\n§\n"
-        "third note: prefer pgvector over Holographic"
+        "third note: prefer pgvector over Holographic",
+        # encoding is REQUIRED here, not cosmetic. The entry delimiter is the
+        # section sign surrounded by newlines, and on a cp1252 default locale
+        # (Windows) write_text() emits that character as the single byte 0xA7.
+        # bulk_upsert_md reads utf-8 with errors='replace', turning it into
+        # U+FFFD, so the delimiter never matches and the file parses as ONE
+        # entry instead of three. Without this pin the test fails only on
+        # Windows -- which is exactly how it survived unnoticed until the
+        # live-DB suite was first executed on this machine.
+        encoding="utf-8",
     )
 
     # First run: inserts 3 rows. embed_fn=None → text-only writes.

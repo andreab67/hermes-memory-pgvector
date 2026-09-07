@@ -13,12 +13,13 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from pgvector.identity import (  # noqa: E402
+from hermes_pgvector.identity import (  # noqa: E402
     BENCH_BUCKET,
     DEFAULT_IDENTITY,
     DM_BUCKET,
     classify_kind,
     normalize_identity,
+    GROUP_BUCKET,
 )
 
 
@@ -145,3 +146,104 @@ def test_classify_kind():
     assert classify_kind(DM_BUCKET) == "dm"
     assert classify_kind(BENCH_BUCKET) == "bench"
     assert classify_kind(DEFAULT_IDENTITY) == "default"
+
+
+# ---------------------------------------------------------------------------
+# v0.5.0 -- multi-party (group / channel / thread) session keys.
+#
+# The host builds session keys as
+#   <ns>:<platform>:<chat_type>[:<chat_id>][:<thread_id>][:<user>]
+# (gateway/session.py:build_session_key). With group_sessions_per_user, which
+# is the DEFAULT, the trailing segment is the participant id -- a phone number
+# on WhatsApp/SMS/Signal. Before v0.5.0 these keys passed through untouched, so
+# a phone number was stored verbatim as an agent_identity: exactly failure mode
+# #1 that this module exists to prevent, just via a different chat_type. With
+# an allow-list configured they instead collapsed to `default`, where every
+# theme could read the external content.
+# ---------------------------------------------------------------------------
+
+GROUP_KEYS = [
+    "agent:main:whatsapp:group:120363@g.us:17192714834",
+    "agent:main:whatsapp:channel:120363@g.us:17192714834",
+    "agent:main:telegram:group:-1001234567890:55512345",
+    "agent:main:slack:thread:C0123:1699999999.123:U0456",
+    "agent:main:discord:channel:987654321:112233",
+    "agent:main:signal:group:abcd==:+15551234567",
+]
+
+
+def test_group_keys_collapse_to_the_group_bucket():
+    for key in GROUP_KEYS:
+        canonical, normalized, reason = normalize_identity(key)
+        assert canonical == GROUP_BUCKET, key
+        assert normalized is True
+        assert reason == "group-bucket"
+
+
+def test_group_bucketing_removes_the_participant_id():
+    """The whole point: no phone number may survive into the identity."""
+    canonical, _, _ = normalize_identity("agent:main:whatsapp:group:120363@g.us:17192714834")
+    assert "17192714834" not in canonical
+    assert "120363" not in canonical
+
+
+def test_group_bucket_survives_a_strict_allow_list():
+    """Isolation buckets are always permitted -- otherwise a configured
+    allow-list would route group traffic to `default`, where every theme can
+    read it, which is worse than bucketing it."""
+    canonical, _, reason = normalize_identity(
+        "agent:main:whatsapp:group:120363@g.us:17192714834",
+        allowed_themes=["marketing", "sales"],
+    )
+    assert canonical == GROUP_BUCKET
+    assert reason == "group-bucket"
+
+
+def test_dm_keys_still_win_over_group_matching():
+    canonical, _, reason = normalize_identity("agent:main:whatsapp:dm:17192714834")
+    assert canonical == DM_BUCKET
+    assert reason == "dm-bucket"
+
+
+def test_group_pattern_does_not_sweep_ordinary_colon_themes():
+    """Anchored on <platform>:<chat_type>:, not a bare chat-type token. A loose
+    pattern would swallow ordinary namespaced themes on a common word -- the
+    same trap the v0.4.2 note records for a bare ':signal:' alternative."""
+    for benign in (
+        "eng:channel:alerts",
+        "desk:signal:main",
+        "ops:group:oncall",
+        "thread:pool:tuning",
+        "marketing",
+        "intraday-trading",
+    ):
+        canonical, normalized, _ = normalize_identity(benign)
+        assert canonical == benign, benign
+        assert normalized is False
+
+
+def test_group_pattern_is_platform_agnostic():
+    """Anchored structurally on agent:<ns>:<platform>:, NOT on an enumerated
+    platform list. The host ships 26 platforms and plugins register more; an
+    earlier enumeration silently missed whatsapp_cloud, bluebubbles, qqbot,
+    msgraph_webhook and every other name it did not list."""
+    platforms = [
+        "local", "telegram", "discord", "whatsapp", "whatsapp_cloud", "slack",
+        "signal", "mattermost", "matrix", "homeassistant", "email", "sms",
+        "dingtalk", "webhook", "feishu", "wecom", "wecom_callback", "weixin",
+        "qqbot", "bluebubbles", "msgraph_webhook", "yuanbao", "relay",
+        "api_server", "plugin", "some_future_platform",
+    ]
+    for plat in platforms:
+        key = f"agent:main:{plat}:group:120363@g.us:17192714834"
+        canonical, _, reason = normalize_identity(key)
+        assert canonical == GROUP_BUCKET, f"{plat} not bucketed"
+        assert reason == "group-bucket"
+
+
+def test_group_bucket_has_its_own_registry_kind():
+    """classify_kind() tags memory_agents rows. The new PII sink must not be
+    registered as an ordinary theme, the way the other sinks are not."""
+    assert classify_kind(GROUP_BUCKET) == "group"
+    assert classify_kind(DM_BUCKET) == "dm"
+    assert classify_kind("marketing") == "theme"

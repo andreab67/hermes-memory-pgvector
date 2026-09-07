@@ -20,7 +20,7 @@ import json
 import logging
 import threading
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Sequence
 
 import psycopg
 from psycopg.rows import dict_row
@@ -100,8 +100,9 @@ class MemoryStore:
 
     def _get_pool(self) -> ConnectionPool:
         """Return the live pool, constructing it on first call. Thread-safe."""
-        if self._pool is not None:
-            return self._pool
+        pool = self._pool
+        if pool is not None:
+            return pool
         with self._lock:
             if self._pool is None:
                 self._pool = ConnectionPool(
@@ -114,7 +115,8 @@ class MemoryStore:
                     open=True,
                     name="pgvector-memory",
                 )
-        return self._pool
+            pool = self._pool
+        return pool
 
     def close(self) -> None:
         """Close the connection pool. Idempotent."""
@@ -153,7 +155,7 @@ class MemoryStore:
                         "memory_entries table missing. Apply migrations as DB admin: "
                         "hermes-pgvector migrate --admin-dsn 'dbname=<db> user=postgres "
                         "host=/var/run/postgresql' (or psql -f the files in the "
-                        "installed package's pgvector/migrations/ directory, in order)"
+                        "installed package's hermes_pgvector/migrations/ directory, in order)"
                     )
 
     def apply_migration_as_admin(self, *, admin_dsn: str, migration: str = "001_schema.sql") -> None:
@@ -256,11 +258,14 @@ class MemoryStore:
         new_content: str,
         new_embedding: Optional[List[float]] = None,
     ) -> int:
-        """Update entries in (agent_identity, target) where content contains old_text.
+        """Update the entry in (agent_identity, target) where content contains old_text.
 
-        Matches built-in semantics — old_text is a substring match. Returns
-        the number of rows updated (built-in updates the FIRST match; we
-        update all matches in the same scope for safety).
+        Matches built-in semantics — old_text is a substring match, and only
+        the FIRST match (lowest id) is updated. This also sidesteps
+        memory_entries_unique (UNIQUE(agent_identity, target, content),
+        001_schema.sql): a bulk UPDATE across every matching row would try to
+        set 2+ rows to the identical new_content and raise UniqueViolation,
+        rolling back the whole statement.
         """
         vec_literal = (
             to_pgvector_literal(new_embedding) if new_embedding is not None else None
@@ -270,12 +275,12 @@ class MemoryStore:
                 cur.execute(
                     """
                     UPDATE memory_entries
-                       SET content    = %s,
-                           embedding  = %s::vector,
-                           updated_at = now()
-                     WHERE agent_identity = %s
-                       AND target = %s
-                       AND content LIKE %s
+                       SET content = %s, embedding = %s::vector, updated_at = now()
+                     WHERE id = (
+                         SELECT id FROM memory_entries
+                          WHERE agent_identity = %s AND target = %s AND content LIKE %s
+                          ORDER BY id LIMIT 1
+                     )
                     """,
                     (new_content, vec_literal, agent_identity, target,
                      f"%{_escape_like(old_text)}%"),
@@ -350,11 +355,14 @@ class MemoryStore:
         target: Optional[str] = None,
         limit: int = 5,
         min_similarity: float = 0.0,
+        exclude_identities: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic recall via cosine distance.
 
         agent_identity=None → search across ALL agents (cross-theme recall).
         target=None → search both 'memory' and 'user'.
+        exclude_identities → themes omitted even from a cross-theme sweep, so
+        the PII/bench sinks stay out of ordinary recall (read-side gate).
         Returns rows with `score` = 1 - cosine_distance ∈ [0, 1].
         """
         vec_literal = to_pgvector_literal(query_embedding)
@@ -366,6 +374,9 @@ class MemoryStore:
         if target:
             clauses.append("target = %s")
             params.append(target)
+        if exclude_identities:
+            clauses.append("agent_identity <> ALL(%s)")
+            params.append(list(exclude_identities))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
         with self._get_pool().connection() as conn:
@@ -397,6 +408,7 @@ class MemoryStore:
         target: Optional[str] = None,
         limit: int = 5,
         pool: Optional[int] = None,
+        exclude_identities: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Hybrid recall over memory_entries: vector + full-text, fused by RRF.
 
@@ -434,6 +446,9 @@ class MemoryStore:
         if target:
             filters.append("target = %(target)s")
             params["target"] = target
+        if exclude_identities:
+            filters.append("agent_identity <> ALL(%(excl)s)")
+            params["excl"] = list(exclude_identities)
         extra = (" AND " + " AND ".join(filters)) if filters else ""
 
         sql = self._build_hybrid_sql(
@@ -671,6 +686,7 @@ class MemoryStore:
         session_id: Optional[str] = None,
         limit: int = 5,
         min_similarity: float = 0.0,
+        exclude_identities: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Semantic recall over conversation turns. Same shape as `search()`."""
         vec_literal = to_pgvector_literal(query_embedding)
@@ -682,6 +698,9 @@ class MemoryStore:
         if session_id:
             clauses.append("session_id = %s")
             params.append(session_id)
+        if exclude_identities:
+            clauses.append("agent_identity <> ALL(%s)")
+            params.append(list(exclude_identities))
         where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
 
         with self._get_pool().connection() as conn:
@@ -712,6 +731,7 @@ class MemoryStore:
         session_id: Optional[str] = None,
         limit: int = 5,
         pool: Optional[int] = None,
+        exclude_identities: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
         """Hybrid recall over conversation turns. RRF fusion, same shape as
         hybrid_search() but returns turn columns (session_id, role, ts)."""
@@ -730,6 +750,9 @@ class MemoryStore:
         if session_id:
             filters.append("session_id = %(session)s")
             params["session"] = session_id
+        if exclude_identities:
+            filters.append("agent_identity <> ALL(%(excl)s)")
+            params["excl"] = list(exclude_identities)
         extra = (" AND " + " AND ".join(filters)) if filters else ""
 
         sql = self._build_hybrid_sql(

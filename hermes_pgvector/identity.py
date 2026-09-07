@@ -47,17 +47,43 @@ _DM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Multi-party session keys (group / channel / thread). Host layout is
+# agent:<ns>:<platform>:<chat_type>[:<chat_id>][:<thread_id>][:<user>]
+# (gateway/session.py:build_session_key + _session_key_namespace, which always
+# emits the literal "agent:" prefix). With the default group_sessions_per_user
+# the TRAILING segment is the participant id -- a phone number on
+# WhatsApp/SMS/Signal -- so the same two failure modes the DM bucket exists for
+# apply here: PII stored as an agent_identity, and one theme per
+# (chat, participant) pair.
+#
+# Anchored STRUCTURALLY on the agent:<ns>:<platform>: prefix rather than on an
+# enumerated platform list. An enumeration is brittle -- the host ships 26
+# platforms today (whatsapp_cloud, bluebubbles, qqbot, msgraph_webhook, ...)
+# and plugins register more -- and an earlier version of this pattern silently
+# missed every platform it did not name. It also cannot over-match ordinary
+# colon-namespaced themes like 'eng:channel:alerts' or 'ops:group:oncall',
+# which do not carry the agent:<ns>:<platform>: prefix. That over-match is the
+# trap the v0.4.2 note below records for a bare ':signal:' alternative.
+_GROUP_RE = re.compile(
+    r"^agent:[^:]+:[^:]+:(?:group|channel|thread)(?::|$)",
+    re.IGNORECASE,
+)
+
 # Benchmark / test-harness identities that must not pollute durable prod memory.
 # 'skill-bench', 'skill-bench-ws', '<x>-bench', '<x>-bench-ws', 'bench'.
 _BENCH_RE = re.compile(r"^(?:.*-)?bench(?:-ws)?$", re.IGNORECASE)
 
 DM_BUCKET = "whatsapp-dm"
+# One bucket for ALL multi-party external traffic, mirroring DM_BUCKET: the
+# point is isolation, not a per-chat taxonomy. Keeping a theme per group chat
+# would trade the PII problem for the cardinality one.
+GROUP_BUCKET = "external-group"
 BENCH_BUCKET = "_bench"
 DEFAULT_IDENTITY = "default"
 
 # Governed sinks are always permitted, even under a strict allow-list — they are
 # isolation buckets, not user themes, so isolation must keep working regardless.
-_ALWAYS_ALLOWED = frozenset({DM_BUCKET, BENCH_BUCKET, DEFAULT_IDENTITY})
+_ALWAYS_ALLOWED = frozenset({DM_BUCKET, GROUP_BUCKET, BENCH_BUCKET, DEFAULT_IDENTITY})
 
 
 def normalize_identity(
@@ -106,6 +132,12 @@ def normalize_identity(
     if _DM_RE.search(canonical):
         return DM_BUCKET, (DM_BUCKET != raw), "dm-bucket"
 
+    # 2b. group / channel / thread keys -> single bucket, same rationale: with
+    # group_sessions_per_user (the host default) the trailing segment is the
+    # participant id, which is a phone number on WhatsApp/SMS/Signal.
+    if _GROUP_RE.search(canonical):
+        return GROUP_BUCKET, (GROUP_BUCKET != raw), "group-bucket"
+
     # 3. benchmark / test-harness traffic -> isolate or reject.
     if _BENCH_RE.match(canonical):
         if bench_mode == "reject":
@@ -133,6 +165,8 @@ def classify_kind(agent_identity: str) -> str:
         return "default"
     if agent_identity == DM_BUCKET:
         return "dm"
+    if agent_identity == GROUP_BUCKET:
+        return "group"
     if agent_identity == BENCH_BUCKET:
         return "bench"
     if agent_identity.startswith("agent-"):

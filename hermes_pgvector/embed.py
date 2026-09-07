@@ -40,6 +40,7 @@ def embed(
     timeout: float = 10.0,
     retries: int = 0,
     backoff: float = 0.1,
+    max_total: Optional[float] = None,
 ) -> List[float]:
     """Return a 768-dim embedding for `text`.
 
@@ -64,13 +65,28 @@ def embed(
 
     attempts = max(0, int(retries)) + 1
     last_exc: Optional[EmbeddingError] = None
+    started = time.monotonic()
     for i in range(attempts):
         try:
             return _embed_once(text, base_url=base_url, model=model, timeout=timeout)
         except EmbeddingError as exc:
             last_exc = exc
-            if i + 1 < attempts:
-                time.sleep(backoff * (2 ** i))
+            if i + 1 >= attempts:
+                break
+            # Deadline, not just a per-attempt timeout. Each attempt can cost up
+            # to 2 x `timeout` (the OpenAI-compat path then the Ollama-native
+            # fallback), so retries multiply a SLOW endpoint into minutes of
+            # blocking on the caller's thread -- for the writer drain that means
+            # the bounded queue fills and starts dropping writes. Transient
+            # failures, which is what retries are actually for, fail fast and
+            # are unaffected by this.
+            if max_total is not None and (time.monotonic() - started) >= max_total:
+                logger.debug(
+                    "embed: giving up after %.1fs (budget %.1fs), %d/%d attempts",
+                    time.monotonic() - started, max_total, i + 1, attempts,
+                )
+                break
+            time.sleep(backoff * (2 ** i))
     raise last_exc if last_exc else EmbeddingError("embed failed")
 
 
@@ -121,7 +137,7 @@ def _post(url: str, body: dict, *, timeout: float, extract) -> List[float]:
 
     try:
         vec = extract(payload)
-    except (KeyError, IndexError, TypeError) as exc:
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
         raise EmbeddingError(f"unexpected response shape: {exc}") from exc
 
     if not isinstance(vec, list) or not vec:

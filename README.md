@@ -44,7 +44,7 @@ Internals:
 
 - **`psycopg_pool.ConnectionPool`** (min=0, max=4, lazy + thread-safe, `max_idle=30s` / `max_lifetime=300s`) shared across the agent thread and the async-writer drain thread. `min_size=0` keeps an idle — or abandoned — pool at **zero** open connections, so a session the gateway never explicitly shuts down cannot strand a Postgres backend (see *Fixed in v0.3.1* below).
 - **`AsyncWriter`** — bounded queue + daemon drain thread. Memory write hooks return in microseconds. Worker embeds + writes in the background. Crash-resilient (auto-restart on next enqueue).
-- **Single migration** (`pgvector/migrations/001_schema.sql`) — `memory_entries` + `conversations` + HNSW indexes. Same tuning operators typically use elsewhere.
+- **Single migration** (`hermes_pgvector/migrations/001_schema.sql`) — `memory_entries` + `conversations` + HNSW indexes. Same tuning operators typically use elsewhere.
 - **Boilerplate filter** for turn capture — length floor + acknowledgement regex (`"ok"`, `"thanks"`, `"continue"`, …) so the recall table stays high-signal.
 
 ### Fixed in v0.3.1 — connection-leak hotfix
@@ -66,12 +66,12 @@ connection slots. Fixed by:
 
 Four capabilities, all storage-layer (still no LLM in the hot path):
 
-- **Identity governance.** The resolved `agent_identity` is normalized once at init: direct-message session keys like `agent:main:whatsapp:dm:<phone>` collapse to a single `whatsapp-dm` bucket (no PII, no per-contact theme explosion), benchmark traffic (`skill-bench*`) is isolated to `_bench`, and an optional `allowed_themes` allow-list routes typo'd/unknown themes to `default`. The M3 resolution priority is preserved — normalization runs *after* the chain, never at read time. See [`pgvector/identity.py`](pgvector/identity.py).
+- **Identity governance.** The resolved `agent_identity` is normalized once at init: direct-message session keys like `agent:main:whatsapp:dm:<phone>` collapse to a single `whatsapp-dm` bucket (no PII, no per-contact theme explosion), benchmark traffic (`skill-bench*`) is isolated to `_bench`, and an optional `allowed_themes` allow-list routes typo'd/unknown themes to `default`. The M3 resolution priority is preserved — normalization runs *after* the chain, never at read time. See [`hermes_pgvector/identity.py`](hermes_pgvector/identity.py).
 - **Agent attribution + delegation (M4).** Migration `002` adds `memory_agents` (registry) and `memory_agent_edges` (parent→child delegation provenance) plus `conversations.parent_session_id`. The `on_delegation` / `on_session_end` hooks capture which agent delegated what to whom — strictly enqueue-only and fail-soft. **Provenance only** (who/when), never a fact-store ontology. Query it via the `v_agent_memory` view.
-- **Embedding backfill + writer resilience.** Rows written text-only during an embed-endpoint outage are no longer permanently unsearchable: `python -m pgvector backfill` re-embeds `NULL`-embedding rows (idempotent, 768-dim-guarded). The background writer gains a small bounded retry; the hot path stays single-attempt.
-- **Conversation TTL + embed policy.** `python -m pgvector prune --days N` trims old turns (operator-triggered only; `memory_entries` are never pruned). `conversation_embed_policy` (`all` default / `substantive_only` / `none`) tunes embedding cost.
+- **Embedding backfill + writer resilience.** Rows written text-only during an embed-endpoint outage are no longer permanently unsearchable: `hermes-pgvector backfill` re-embeds `NULL`-embedding rows (idempotent, 768-dim-guarded). The background writer gains a small bounded retry; the hot path stays single-attempt.
+- **Conversation TTL + embed policy.** `hermes-pgvector prune --days N` trims old turns (operator-triggered only; `memory_entries` are never pruned). `conversation_embed_policy` (`all` default / `substantive_only` / `none`) tunes embedding cost.
 
-Maintenance CLI (`python -m pgvector`, installed as `hermes-pgvector`): `migrate · stats · backfill · prune · cleanup · remap` — destructive commands default to dry-run. v0.4.0 is a clean upgrade from v0.3.x: apply migration `002` to light up attribution/delegation; without it the new hooks no-op and everything else runs unchanged.
+Maintenance CLI (`hermes-pgvector`, or `python -m hermes_pgvector`): `migrate · stats · backfill · prune · cleanup · remap` — destructive commands default to dry-run. v0.4.0 is a clean upgrade from v0.3.x: apply migration `002` to light up attribution/delegation; without it the new hooks no-op and everything else runs unchanged.
 
 ## New in v0.4.1 — hybrid recall (vector + full-text)
 
@@ -82,15 +82,79 @@ Maintenance CLI (`python -m pgvector`, installed as `hermes-pgvector`): `migrate
 
 Still a storage-layer feature: **no LLM, no entity graph, no new tables or columns** — just a GIN index over the existing `content` column (migration `003`) and a fused query. It stays inside invariant #1 (a second index over the same text is not a parallel ontology). Fail-soft as ever: a hybrid hiccup degrades to the proven pure-vector path, and a query that *itself* fails to embed degrades to full-text-only instead of erroring. Toggle with `plugins.pgvector.hybrid_search` (default `true`); the ambient `prefetch()` path stays pure-vector. Works without migration `003` — the GIN index only makes the full-text leg faster.
 
-## New in v0.4.3 — psycopg 3.3.5 floor
-
-- **Dependency floor raised**: `psycopg[binary]>=3.3.5` (upstream bugfix release, 2026-08-31: prepared-statement invalidation on `ALTER`/`DISCARD`, DataError fixes for malformed COPY/jsonb data, client-encoding aliases). No code changes.
-
 ## New in v0.4.2 — pip-native install + hardening
 
 - **`hermes-pgvector install`** — makes a plain `pip install hermes-memory-pgvector` deployable on ANY hermes-agent install: generates the `$HERMES_HOME/plugins/pgvector/` discovery shim (see *Install · Option 1*). No more vendored copies or editable checkouts.
 - **Migration `004`** — `hermes-pgvector migrate` now grants the runtime role DML on `memory_entries`/`conversations` itself; the manual OWNER-transfer step is gone (fresh installs previously hit `permission denied` if it was skipped).
 - **Correctness fixes** from a full-codebase review: `replace`/`remove` now match `old_text` as a *literal* substring (LIKE `%`/`_`/`\` metacharacters no longer over- or under-match — parity with the built-in tool's `in` semantics); the async writer drains its queue on shutdown instead of silently abandoning up to 255 accepted writes when full; a wrong-dimension embed model now surfaces as `expected 768 dims, got N` instead of a masking 404; DM-key bucketing no longer sweeps ordinary `:signal:`-containing theme names into `whatsapp-dm`; bulk MEMORY.md import circuit-breaks after 3 consecutive embed failures (a hanging endpoint can no longer block session start for minutes); `remap` re-checks its duplicate-drop guard under the advisory lock; tool errors redact credential-looking fragments and preserve `score: null` for full-text-only hybrid hits (with `rrf_score` now included); `recall_memory(scope='session')` returns a helpful error instead of silently matching nothing.
+
+## New in v0.4.3 — psycopg 3.3.5 floor
+
+- **Dependency floor raised**: `psycopg[binary]>=3.3.5` (upstream bugfix release, 2026-08-31: prepared-statement invalidation on `ALTER`/`DISCARD`, DataError fixes for malformed COPY/jsonb data, client-encoding aliases). No code changes.
+
+## New in v0.5.0 — import rename (BREAKING), read-side identity gate, config-contract fixes
+
+> ### Breaking upgrade — read before installing
+>
+> **1. The import package is renamed** `pgvector` -> `hermes_pgvector`. Unchanged:
+> the distribution (`hermes-memory-pgvector`), the CLI (`hermes-pgvector`), and
+> the hermes provider name (`pgvector`, i.e. `memory.provider: pgvector`).
+>
+> Why: the old top-level name is owned by
+> [pgvector-python](https://pypi.org/project/pgvector/). Both in one venv meant
+> whichever installed last won, and this plugin's shim could import the wrong
+> module — taking the fleet's shared memory offline on a single log line.
+>
+> **2. Any `python -m pgvector ...` command breaks.** It is now
+> `hermes-pgvector ...` (or `python -m hermes_pgvector ...`). This matters most
+> for scheduled jobs, which fail *silently* — the nightly backfill simply stops,
+> and rows written during an embed outage stay permanently unsearchable. Check
+> your units before upgrading:
+>
+> ```bash
+> sudo grep -rl 'python -m pgvector' /etc/systemd/system/ /etc/cron.d/ 2>/dev/null
+> # e.g. hermes-pgvector-backfill.service:
+> #   ExecStart=.../python -m pgvector backfill   ->   -m hermes_pgvector backfill
+> sudo systemctl daemon-reload
+> ```
+>
+> **3. Upgrade steps.** An existing shim still reads `from pgvector import ...`;
+> after upgrading it fails, and the loader treats that as "plugin absent" and
+> falls back to built-in memory.
+>
+> ```bash
+> pip install -U hermes-memory-pgvector==0.5.0
+>
+> # Preferred, if your hermes-agent reads the `hermes_agent.memory_providers`
+> # entry-point group (this package now declares it): drop the shim entirely and
+> # let pip discovery take over -- nothing left to go stale on future upgrades.
+> hermes-pgvector install --remove
+>
+> # Otherwise (older host that only scans plugin directories): regenerate it.
+> hermes-pgvector install --force
+>
+> # restart hermes, then verify -- do not skip this:
+> hermes memory status        # expect: Provider: pgvector; Status: available
+> ```
+>
+> `hermes-pgvector install` now verifies in a clean subprocess that the shim it
+> just wrote can actually be imported, and warns if it cannot or if another
+> package shadows this one.
+
+- **Read-side identity gate.** The `whatsapp-dm` and `_bench` sinks were write-side only: `identity.py` stripped PII from the *identity*, but message bodies still live in `content`, and nothing filtered them on read. Any theme could pull DM content into its context via `scope='all'` or by naming the bucket directly — and with turn capture on, the reply quoting it was written back under the *reading* theme, permanently re-attributing DM data. `scope='all'` now excludes those sinks, and naming one explicitly is rejected. An agent that *is* the bucket keeps full access to its own rows, and ordinary cross-theme recall is unaffected. **Scope of the gate:** it excludes by bucket *name*, and bucketing happens at write time — rows are never retroactively rewritten (that is a deliberate invariant: historical rows keep their identity or they become unrecallable). So any row written *before* its key was bucketed still carries the raw identity and is still reachable. Verified on the reference deployment: **zero** such rows exist there (`whatsapp-dm` is already bucketed and no group traffic predates this release). If yours has them, `hermes-pgvector remap --old <raw> --new whatsapp-dm` moves them.
+
+
+Correctness release from a full-codebase review. **No schema changes and no new migrations** — but this release is not drop-in: the import package is renamed (see the upgrade box above), and `MemoryStore.search` / `hybrid_search` / `search_turns` / `hybrid_search_turns` gain an `exclude_identities` parameter. The hermes provider name, the CLI, and the on-disk schema are unchanged.
+
+- **Embed timeouts are configurable, and split by call path.** `timeout` was never plumbed from config at all — every caller silently took a hardcoded 10s. On an endpoint that answers in 6–17s that means a large share of background writes time out, fail soft, and land as rows with a NULL embedding, invisible to recall until `hermes-pgvector backfill` repairs them. Retries could not help: every attempt was capped *below* the latency the endpoint needs. There are now two keys, deliberately asymmetric — `embed_timeout` (default `10.0`) for the agent thread, where a timeout degrades recall to full-text-only and waiting longer would be worse; and `embed_write_timeout` (default `30.0`) for the background writer, where nothing is waiting and giving up costs a permanently unsearchable row. Measured against the reference endpoint: 1/3 writes succeeded at 10s, 3/3 at 30s.
+- **Group / channel / thread keys are bucketed.** Multi-party session keys like `agent:main:whatsapp:group:<chat>:<participant>` previously passed through untouched, so with the host's default `group_sessions_per_user` the trailing participant id — a phone number on WhatsApp/SMS/Signal — was stored verbatim as an `agent_identity`. That is the same PII failure the DM bucket exists to prevent, reached through a different `chat_type`. They now collapse to a single `external-group` bucket, which (like `whatsapp-dm` and `_bench`) is excluded from other themes' recall.
+- **`allowed_themes` accepts a string again.** The config schema declared it a scalar string while `normalize_identity()` consumed it as a list of names — so a string allow-list was iterated *character by character*, every theme failed the membership test, and the whole fleet was silently routed to `default`. Governance looked configured while doing the opposite. Comma-separated strings and YAML lists both work now.
+- **Boolean toggles honour `false` again.** `embed_on_write`, `sync_turns`, `hybrid_search` and `bulk_sync_on_init` are declared by the config schema as the *strings* `"true"`/`"false"`, but were read with plain truthiness — and `bool("false")` is `True`, so turning any of them off via that path did nothing.
+- **Conversation turns are no longer written twice.** `sync_turn()` (per exchange) and `on_session_end()` (whole transcript, again on session rotation) both captured the same turns, and `conversations` has no unique constraint. `on_session_end` is now a true backstop: it skips turns already accepted by the writer, and still re-captures ones a full queue dropped.
+- **`memory` replace mirrors correctly.** `replace()` issued one bulk `UPDATE` across every substring match, colliding with `UNIQUE(agent_identity, target, content)` — so a `replace` matching two or more entries raised `UniqueViolation` and updated **zero** rows. It now updates the first match, matching the built-in tool.
+- **A dead database is no longer silent.** Worker write failures logged at `debug` only, so a Postgres restart after a healthy init discarded every durable write for the rest of the session with no operator signal. The first failure now warns. Relatedly, `system_prompt_block` no longer tells the model "Empty store" when the count query merely *failed*.
+- **`save_config` stops deleting your settings.** It replaced the whole `plugins.pgvector` block with schema-declared keys, silently dropping hand-edited ones that are read at runtime (`identity_aliases`, `embed_write_backoff`). It merges now.
+- **Fail-soft hardening** (invariant #4): `sync_turn` is wrapped, config casts are guarded, and the recall tools coerce non-string `query`/`scope`/`target` instead of raising `AttributeError` out of the hook. `hermes-pgvector install --remove` now fails closed and requires `--force` on a directory that isn't a generated shim, instead of deleting it outright.
 
 ## Multi-agent / per-minion themes
 
@@ -135,7 +199,7 @@ sudo systemctl restart hermes.service
 hermes memory status             # expect: Provider: pgvector; Status: available
 ```
 
-**Why the shim?** hermes-agent discovers memory providers by scanning plugin *directories* — `plugins/memory/<name>/` (bundled) and `$HERMES_HOME/plugins/<name>/` (user) — and never looks at installed packages. `pip install` alone is therefore invisible to it. `hermes-pgvector install` writes a two-line shim whose absolute import resolves to the pip-installed package, so upgrades are just `pip install -U hermes-memory-pgvector` + restart, and rollback is `pip install hermes-memory-pgvector==<prev>` + restart — the shim never changes. `--remove` deletes it; if the package is uninstalled the shim import fails cleanly and hermes falls back to built-in memory.
+**Why the shim?** hermes-agent resolves a provider from bundled dirs, then `$HERMES_HOME/plugins/<name>/`, then the `hermes_agent.memory_providers` pip entry-point group. Since v0.5.0 this package **declares that entry point**, so on a host new enough to support it `pip install hermes-memory-pgvector` is sufficient on its own and no shim is needed. The shim remains for older hosts that only scan directories. Note a shim *directory* takes precedence over the entry point when one is present, so a stale shim still wins — which is why the v0.5.0 upgrade tells you to remove it. `hermes-pgvector install` writes a two-line shim whose absolute import resolves to the pip-installed package, so upgrades are just `pip install -U hermes-memory-pgvector` + restart, and rollback is `pip install hermes-memory-pgvector==<prev>` + restart — the shim never changes. `--remove` deletes it; if the package is uninstalled the shim import fails cleanly and hermes falls back to built-in memory.
 
 ### Option 2: clone + run the installer script (from source)
 
@@ -148,18 +212,18 @@ cd hermes-memory-pgvector
 That:
 
 1. `pip install`s `psycopg[binary]`, `psycopg-pool`, `PyYAML` (with the upper-bound pins).
-2. Copies `pgvector/` into `$HERMES_HOME/plugins/pgvector/` (defaults to `~/.hermes/plugins/pgvector/`).
+2. Copies `hermes_pgvector/` into `$HERMES_HOME/plugins/pgvector/` (defaults to `~/.hermes/plugins/pgvector/`).
 3. Prints the admin migration + activation commands you run next.
 
 ### Option 3: manual
 
 ```bash
 # Python deps
-pip install 'psycopg[binary]>=3.3.4,<4' 'psycopg-pool>=3.3.1,<4' 'PyYAML>=6.0,<7'
+pip install 'psycopg[binary]>=3.3.5,<4' 'psycopg-pool>=3.3.1,<4' 'PyYAML>=6.0,<7'
 
 # Plugin module
 mkdir -p ~/.hermes/plugins
-cp -r pgvector ~/.hermes/plugins/pgvector
+cp -r hermes_pgvector ~/.hermes/plugins/pgvector
 ```
 
 ### Then (admin once)
@@ -249,7 +313,7 @@ CREATE TABLE conversations (
 );
 ```
 
-Indexes: HNSW on each `embedding` column (m=16, ef_construction=64) plus per-agent + per-session btree timelines. Full DDL in [`pgvector/migrations/001_schema.sql`](pgvector/migrations/001_schema.sql).
+Indexes: HNSW on each `embedding` column (m=16, ef_construction=64) plus per-agent + per-session btree timelines. Full DDL in [`hermes_pgvector/migrations/001_schema.sql`](hermes_pgvector/migrations/001_schema.sql).
 
 ## Tests
 
@@ -302,7 +366,7 @@ Per the hermes-agent [`CONTRIBUTING.md`](https://github.com/NousResearch/hermes-
 
 > We are no longer accepting new memory providers into this repo. The set of built-in providers under `plugins/memory/` is closed. If you want to add a new memory backend, publish it as a standalone plugin repo that users install into `~/.hermes/plugins/` (or via a pip entry point).
 
-The discovery system (`plugins/memory/__init__.py` in hermes-agent) scans `$HERMES_HOME/plugins/<name>/` for any directory whose `__init__.py` calls `register_memory_provider`. This plugin's `pgvector/__init__.py` does exactly that — no upstream change required.
+The discovery system (`plugins/memory/__init__.py` in hermes-agent) scans `$HERMES_HOME/plugins/<name>/` for any directory whose `__init__.py` calls `register_memory_provider`. This plugin's `hermes_pgvector/__init__.py` does exactly that — no upstream change required.
 
 ## Contributing
 

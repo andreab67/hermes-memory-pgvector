@@ -43,7 +43,7 @@ try:
     from tools.registry import tool_error
     from hermes_cli.config import cfg_get
 except ImportError:  # pragma: no cover
-    # Standalone context (the `python -m pgvector` CLI / unit tests) — hermes-agent
+    # Standalone context (the `hermes-pgvector` CLI / unit tests) — hermes-agent
     # is not importable. Provide minimal fallbacks so the package still imports;
     # the provider class is never instantiated outside the agent, only the store/
     # embed/identity helpers + the maintenance CLI are used here.
@@ -63,7 +63,8 @@ except ImportError:  # pragma: no cover
         return cur
 
 from .embed import embed, EmbeddingError
-from .identity import classify_kind, normalize_identity
+from .identity import (BENCH_BUCKET, DM_BUCKET, GROUP_BUCKET, classify_kind,
+                       normalize_identity)
 from .store import MemoryStore
 from .writer import AsyncWriter, _PendingWrite
 
@@ -217,7 +218,78 @@ DEFAULTS = {
     # v0.4 — writer-path embed retries (hot path stays single-attempt)
     "embed_write_retries": 2,
     "embed_write_backoff": 0.1,
+    # v0.5.0 — embed timeouts, split by call context. Previously `timeout` was
+    # never plumbed from config at all: every caller took embed()'s hardcoded
+    # 10s. On a deployment whose endpoint answers in 6-17s (measured on the
+    # home k8s nomic-embed-text) that means a large share of writes time out,
+    # fail soft, and land with a NULL embedding -- unsearchable until the
+    # nightly backfill sweep. Retries could not rescue it, because every
+    # attempt was capped BELOW the latency the endpoint actually needs.
+    #
+    # Hot path stays short on purpose: prefetch and the recall tools run on the
+    # agent thread, and a slow query there degrades to full-text-only recall,
+    # which is a good outcome. Waiting longer would be the worse one.
+    "embed_timeout": 10.0,
+    # Writer drain only. Nothing is waiting on it, and the cost of giving up is
+    # a permanently unsearchable row, so it gets real headroom.
+    "embed_write_timeout": 30.0,
 }
+
+
+def _as_bool(value: Any, default: bool) -> bool:
+    """Coerce a config value to a real bool.
+
+    Config reaches us with three different types: DEFAULTS (real bools), a
+    hand-edited config.yaml (YAML bools), and save_config(), which persists
+    the config schema's declared values -- the STRINGS "true"/"false". A plain
+    truthiness test silently inverts the string form (bool("false") is True),
+    so every boolean toggle reads through here.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _as_int(value: Any, default: int) -> int:
+    """Coerce a config value to int, falling back to the default.
+
+    Same hazard as _as_bool: config values arrive as strings from
+    save_config(), and an empty or malformed entry must not raise on a
+    write path (invariant #4).
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _as_float(value: Any, default: float) -> float:
+    """Coerce a config value to float, falling back to the default."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _as_theme_list(value: Any) -> Optional[List[str]]:
+    """Coerce allowed_themes into a list of theme names.
+
+    The config schema declares this key as a scalar string; the README
+    documents it as a YAML list. A bare string must never reach
+    normalize_identity(), which iterates its argument -- a string iterates
+    CHARACTER BY CHARACTER, so every real theme fails the membership test and
+    the allow-list silently routes the entire fleet to 'default'.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [x.strip() for x in value.split(",") if x.strip()] or None
+    try:
+        return list(value) or None
+    except TypeError:
+        return None
 
 
 def _load_plugin_config() -> dict:
@@ -241,6 +313,12 @@ def _load_plugin_config() -> dict:
 class PgvectorMemoryProvider(MemoryProvider):
     """Postgres mirror of built-in memory entries, with semantic recall."""
 
+    # Upper bound on the turn-fingerprint set. Fingerprints deliberately
+    # survive session switches (see on_session_switch), so this is what keeps
+    # a long-lived provider from growing without limit. ~60 fingerprints per
+    # session means this holds roughly 150 sessions before a reset.
+    _FINGERPRINT_CAP = 10000
+
     def __init__(self, config: dict | None = None):
         self._config = {**DEFAULTS, **(config or {})}
         self._store: Optional[MemoryStore] = None
@@ -252,6 +330,11 @@ class PgvectorMemoryProvider(MemoryProvider):
         self._healthy: bool = False
         self._delegation_enabled: bool = False        # set in initialize() iff migration 002 applied
         self._embed_warned: bool = False
+        self._db_warned: bool = False
+        # Fingerprints of turns already enqueued by sync_turn this session, so
+        # on_session_end can act as a backstop without double-writing rows the
+        # per-turn path already captured (conversations has no unique key).
+        self._turn_fingerprints: set = set()
 
     @property
     def name(self) -> str:
@@ -273,6 +356,10 @@ class PgvectorMemoryProvider(MemoryProvider):
         # any past session silences the one-time warning for the process
         # lifetime — a later session with a broken endpoint gets zero signal.
         self._embed_warned = False
+        self._db_warned = False
+        # _turn_fingerprints is deliberately NOT reset here either -- same
+        # reasoning as on_session_switch: the dedup guard must survive a
+        # re-initialize on a reused instance. The cap bounds it instead.
         # Per-agent theme scoping — priority order:
         #   1. gateway_session_key — from the `X-Hermes-Session-Key` header on
         #      API requests. This is the EXPLICIT minion-scope signal sent by
@@ -306,7 +393,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         self._raw_identity = self._agent_identity
         canonical, normalized, reason = normalize_identity(
             self._agent_identity,
-            allowed_themes=self._config.get("allowed_themes"),
+            allowed_themes=_as_theme_list(self._config.get("allowed_themes")),
             aliases=self._config.get("identity_aliases") or {},
             bench_mode=self._config.get("bench_mode", "bucket"),
         )
@@ -351,10 +438,11 @@ class PgvectorMemoryProvider(MemoryProvider):
         # on_memory_write + sync_turn from the (potentially slow) embed +
         # DB write so the agent loop never blocks on a stalled embed
         # endpoint.
-        self._writer = AsyncWriter(
-            self._worker,
-            maxsize=int(self._config.get("write_queue_maxsize", 256)),
-        )
+        try:
+            _queue_max = int(self._config.get("write_queue_maxsize", 256))
+        except (TypeError, ValueError):
+            _queue_max = int(DEFAULTS["write_queue_maxsize"])
+        self._writer = AsyncWriter(self._worker, maxsize=_queue_max)
 
         # v0.4: agent attribution + delegation require migration 002. Probe it
         # SEPARATELY from ensure_schema() (which stays 001-only) so a v0.4 binary
@@ -383,9 +471,14 @@ class PgvectorMemoryProvider(MemoryProvider):
                 )
 
         # v0.1.1: bulk import existing MEMORY.md / USER.md content so the
-        # plugin sees pre-plugin entries + direct file edits, not just the
-        # new writes captured via on_memory_write.
-        if self._healthy and self._config.get("bulk_sync_on_init", True):
+        # plugin sees pre-plugin entries and entries ADDED by direct file
+        # edits, not just the new writes captured via on_memory_write.
+        # NOTE: this path is insert-only. It never reconciles removals or
+        # rewrites -- editing an existing line in MEMORY.md leaves the stale
+        # row in place alongside the new one, and recall (cosine / RRF, no
+        # recency tiebreak) can surface both. `hermes-pgvector cleanup` is
+        # the only remedy.
+        if self._healthy and _as_bool(self._config.get("bulk_sync_on_init"), True):
             self._bulk_sync_from_disk(kwargs.get("hermes_home"))
 
     def shutdown(self) -> None:
@@ -401,6 +494,34 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     def on_session_switch(self, new_session_id: str, **kwargs) -> None:
         self._session_id = new_session_id
+        # Per-session log-signal reset, same as initialize(): the provider
+        # instance is reused across sessions, so a single embed/DB failure in
+        # an earlier session would otherwise silence the one-shot warnings for
+        # the rest of the process.
+        self._embed_warned = False
+        self._db_warned = False
+        # NOT cleared here. on_session_end runs before on_session_switch only
+        # on the commit_session_boundary_async path; conversation_compression.py
+        # calls on_session_switch DIRECTLY with no on_session_end, so clearing
+        # would let the turn double-write reappear on every context compression
+        # (which fires on any long session). Fingerprints therefore live for the
+        # provider's lifetime, bounded below.
+        if len(self._turn_fingerprints) > self._FINGERPRINT_CAP:
+            # Bound the memory: a very long-lived process may re-duplicate one
+            # turn after a reset, which is far cheaper than unbounded growth.
+            logger.debug(
+                "pgvector turn-fingerprint set exceeded %d; resetting",
+                self._FINGERPRINT_CAP,
+            )
+            self._turn_fingerprints = set()
+        # NOTE: deliberately does NOT touch _parent_session_id. The host's
+        # on_session_switch(parent_session_id=...) carries the PREVIOUS session
+        # in this agent's own lineage (/new passes old_session_id, /undo passes
+        # ""), NOT a delegation parent. _parent_session_id feeds
+        # conversations.parent_session_id, which migration 002 defines as
+        # delegation traceback -- assigning lineage here would stamp a
+        # fabricated delegation edge on every write after a rotation, and the
+        # /undo path would erase a real subagent's parent.
 
     # -- System prompt + ambient recall --------------------------------------
 
@@ -410,8 +531,12 @@ class PgvectorMemoryProvider(MemoryProvider):
         try:
             count_scoped = self._store.count(agent_identity=self._agent_identity)
             count_all = self._store.count()
-        except Exception:  # noqa: BLE001
-            count_scoped = count_all = 0
+        except Exception as exc:  # noqa: BLE001
+            # A failed count is NOT an empty store. Falling through to the
+            # "Empty store" branch asserts something false to the model about
+            # a store that is merely unreachable; stay silent instead.
+            logger.debug("pgvector system_prompt_block count failed: %s", exc)
+            return ""
         if count_all == 0:
             return (
                 "# pgvector memory\n"
@@ -435,6 +560,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                 query,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
+                timeout=self._embed_timeout(),
             )
         except EmbeddingError as exc:
             logger.debug("pgvector prefetch embed failed: %s", exc)
@@ -446,8 +572,10 @@ class PgvectorMemoryProvider(MemoryProvider):
             rows = self._store.search(
                 query_embedding=vec,
                 agent_identity=self._agent_identity,
-                limit=int(self._config.get("prefetch_limit", 5)),
-                min_similarity=float(self._config.get("min_similarity", 0.30)),
+                limit=_as_int(self._config.get("prefetch_limit"),
+                              DEFAULTS["prefetch_limit"]),
+                min_similarity=_as_float(self._config.get("min_similarity"),
+                                         DEFAULTS["min_similarity"]),
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("pgvector prefetch query failed: %s", exc)
@@ -482,35 +610,105 @@ class PgvectorMemoryProvider(MemoryProvider):
         """
         if not self._healthy or not self._writer:
             return
-        if not self._config.get("sync_turns", True):
+        if not _as_bool(self._config.get("sync_turns"), True):
             return
 
         sid = session_id or self._session_id or "default"
-        min_chars = int(self._config.get("turn_min_chars", 40))
+        try:
+            min_chars = int(self._config.get("turn_min_chars", 40))
+        except (TypeError, ValueError):
+            min_chars = int(DEFAULTS["turn_min_chars"])
         policy = self._config.get("conversation_embed_policy", "all")
         psid = self._parent_session_id if self._delegation_enabled else None
 
-        for role, content in (("user", user_content), ("assistant", assistant_content)):
-            if not content:
-                continue
-            if self._is_noise(content, min_chars=min_chars):
-                continue
-            meta = {"session_id": sid}
-            if self._raw_identity != self._agent_identity:
-                meta["raw_identity"] = self._raw_identity
-            self._writer.enqueue(
-                action="turn",
-                agent_identity=self._agent_identity,
-                target="conversations",  # synthetic; worker dispatches on action
-                content=content,
-                extra={
-                    "role": role,
-                    "session_id": sid,
-                    "embed": self._should_embed_turn(role, content, policy),
-                    "parent_session_id": psid,
-                },
-                metadata=meta,
+        # Fail-soft (invariant #4): this is called on the agent's turn path,
+        # so nothing here may raise into the agent loop.
+        try:
+            for role, content in (("user", user_content), ("assistant", assistant_content)):
+                if not content:
+                    continue
+                if self._is_noise(content, min_chars=min_chars):
+                    continue
+                meta = {"session_id": sid}
+                if self._raw_identity != self._agent_identity:
+                    meta["raw_identity"] = self._raw_identity
+                accepted = self._writer.enqueue(
+                    action="turn",
+                    agent_identity=self._agent_identity,
+                    target="conversations",  # synthetic; worker dispatches on action
+                    content=content,
+                    extra={
+                        "role": role,
+                        "session_id": sid,
+                        "embed": self._should_embed_turn(role, content, policy),
+                        "parent_session_id": psid,
+                    },
+                    metadata=meta,
+                )
+                # Fingerprint ONLY on accept. enqueue() returns False when the
+                # queue is full and the write is dropped; recording it anyway
+                # would make on_session_end skip a turn that never landed,
+                # turning a recoverable drop into permanent data loss.
+                if accepted:
+                    self._remember_turn(self._turn_fingerprint(role, content))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("pgvector sync_turn failed (ignored): %s", exc)
+
+    @staticmethod
+    def _strip_skill_scaffolding(content: str) -> str:
+        """Normalize a user turn the way the host does before handing it to us.
+
+        The host calls sync_turn() with `_strip_skill_scaffolding(user_content)`
+        (agent/memory_manager.py:389 ->
+        agent.skill_commands.extract_user_instruction_from_skill_message) but
+        passes on_session_end() the RAW transcript. So a /skill turn reaches the
+        two hooks as two different strings, hashes to two different
+        fingerprints, and defeats the dedup -- it gets written twice, which is
+        the exact bug the fingerprints exist to prevent.
+
+        Guarded import, matching how this module already reaches for
+        `agent.memory_provider` / `hermes_constants`: outside hermes-agent the
+        content is simply used as-is.
+        """
+        try:
+            from agent.skill_commands import (
+                extract_user_instruction_from_skill_message as _strip,
             )
+            return _strip(content) or content
+        except Exception:  # noqa: BLE001 -- host internals are optional
+            return content
+
+    def _remember_turn(self, fingerprint: str) -> None:
+        """Record a captured turn, enforcing the cap at the point of growth.
+
+        The cap used to be checked only in on_session_switch(). On the gateway
+        every session calls initialize() rather than on_session_switch(), and
+        initialize() deliberately does not reset the set (clearing it would
+        re-open the double-write on the compression path), so the set could
+        grow without bound there. Checking here covers every path that can
+        add to it.
+        """
+        if len(self._turn_fingerprints) >= self._FINGERPRINT_CAP:
+            logger.debug(
+                "pgvector turn-fingerprint set hit %d; resetting",
+                self._FINGERPRINT_CAP,
+            )
+            self._turn_fingerprints = set()
+        self._turn_fingerprints.add(fingerprint)
+
+    @staticmethod
+    def _turn_fingerprint(role: str, content: str) -> str:
+        """Stable short digest of one captured turn.
+
+        on_session_end() replays the whole message list, which overlaps the
+        turns sync_turn() already enqueued during the session. `conversations`
+        has no unique constraint (unlike memory_entries), so without this the
+        same turn lands twice -- doubling the table, the embedding cost, and
+        the rows recall_conversation returns.
+        """
+        import hashlib
+        digest = hashlib.sha1(f"{role}:{content}".encode("utf-8", "replace"))
+        return digest.hexdigest()[:16]
 
     @staticmethod
     def _is_noise(content: str, *, min_chars: int) -> bool:
@@ -606,8 +804,18 @@ class PgvectorMemoryProvider(MemoryProvider):
                 metadata={},
             )
             # Capture substantive user/assistant turns for conversation recall.
-            if messages:
+            # Backstop only: sync_turn() already captured this session's turns
+            # per-exchange, and the host calls BOTH hooks (and calls this one
+            # again on session rotation), so anything already fingerprinted is
+            # skipped -- `conversations` has no unique constraint to catch it.
+            # Honors the same sync_turns toggle sync_turn() does; without this
+            # an operator who disabled turn capture still got turns persisted.
+            if messages and _as_bool(self._config.get("sync_turns"), True):
                 policy = self._config.get("conversation_embed_policy", "all")
+                try:
+                    min_chars = int(self._config.get("turn_min_chars", 40))
+                except (TypeError, ValueError):
+                    min_chars = int(DEFAULTS["turn_min_chars"])
                 for msg in messages:
                     role = (msg.get("role") or "").lower()
                     if role not in ("user", "assistant"):
@@ -620,9 +828,18 @@ class PgvectorMemoryProvider(MemoryProvider):
                             if isinstance(p, dict) and p.get("type") == "text"
                         ) if isinstance(raw, list) else str(raw)
                     )
-                    if self._is_noise(content, min_chars=40):
+                    if self._is_noise(content, min_chars=min_chars):
                         continue
-                    self._writer.enqueue(
+                    # Fingerprint the NORMALIZED form for user turns, so a
+                    # /skill turn matches what sync_turn() was handed.
+                    fp_content = (
+                        self._strip_skill_scaffolding(content)
+                        if role == "user" else content
+                    )
+                    fp = self._turn_fingerprint(role, fp_content)
+                    if fp in self._turn_fingerprints:
+                        continue  # already enqueued by sync_turn this session
+                    accepted = self._writer.enqueue(
                         action="turn",
                         agent_identity=self._agent_identity,
                         target="conversations",
@@ -635,6 +852,15 @@ class PgvectorMemoryProvider(MemoryProvider):
                         },
                         metadata={},
                     )
+                    # Same contract as sync_turn: fingerprint ONLY on accept.
+                    # enqueue() returns False on a full queue -- and a full
+                    # queue is most likely exactly here, since this replays a
+                    # whole transcript at once through a 256-slot queue. Marking
+                    # a dropped turn as captured would make the NEXT
+                    # on_session_end (session rotation replays the same list)
+                    # skip it, turning a recoverable drop into permanent loss.
+                    if accepted:
+                        self._remember_turn(fp)
         except Exception as exc:  # noqa: BLE001
             logger.debug("pgvector on_session_end failed (ignored): %s", exc)
 
@@ -764,13 +990,29 @@ class PgvectorMemoryProvider(MemoryProvider):
                     attrs=item.extra.get("attrs") or {},
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "pgvector worker (%s/%s/%s) failed: %s",
-                item.action,
-                item.agent_identity,
-                item.target,
-                str(exc)[:200],
-            )
+            # One-shot WARNING (mirrors the _embed_warned tripwire): _healthy is
+            # evaluated once at initialize() and never re-probed, so a Postgres
+            # restart after a healthy init silently discards every durable write
+            # for the rest of the session. At debug level that is invisible at
+            # the host's default log level -- total write loss, zero signal.
+            if not self._db_warned:
+                self._db_warned = True
+                logger.warning(
+                    "pgvector worker (%s/%s/%s) failed: %s -- further worker "
+                    "failures this session are logged at debug level",
+                    item.action,
+                    item.agent_identity,
+                    item.target,
+                    str(exc)[:200],
+                )
+            else:
+                logger.debug(
+                    "pgvector worker (%s/%s/%s) failed: %s",
+                    item.action,
+                    item.agent_identity,
+                    item.target,
+                    str(exc)[:200],
+                )
 
     # -- Bulk sync (v0.1.1) --------------------------------------------------
 
@@ -816,15 +1058,37 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     def _make_embed_fn(self):
         """Return a closure over the configured embed endpoint, or None."""
-        if not self._config.get("embed_on_write", True):
+        if not _as_bool(self._config.get("embed_on_write"), True):
             return None
         base_url = self._config["embed_url"]
         model = self._config["embed_model"]
+        timeout = self._embed_timeout()
         def _fn(text: str):
-            return embed(text, base_url=base_url, model=model)
+            return embed(text, base_url=base_url, model=model, timeout=timeout)
         return _fn
 
     # -- Tool surface --------------------------------------------------------
+
+    def _restricted_identities(self) -> List[str]:
+        """Sink themes this agent must not read out of.
+
+        identity.py buckets direct-message traffic into `whatsapp-dm`,
+        multi-party group/channel/thread traffic into `external-group`, and
+        benchmark traffic into `_bench`. That bucketing is WRITE-side only: it
+        strips PII from the *identity*, but the message bodies still land in
+        `content`. Without a read-side gate, any theme could pull DM content
+        (and discarded bench fixtures) into its context via scope='all' or by
+        naming the bucket directly -- and, with turn capture on, the reply
+        quoting it would be written back under the *reading* theme,
+        permanently re-attributing DM data into a production theme.
+
+        An agent that IS the bucket keeps full access to its own rows, so
+        DM-scoped recall still works for the DM agent itself.
+        """
+        return [
+            b for b in (DM_BUCKET, GROUP_BUCKET, BENCH_BUCKET)
+            if b != self._agent_identity
+        ]
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [RECALL_MEMORY_SCHEMA, RECALL_CONVERSATION_SCHEMA]
@@ -837,7 +1101,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         if not self._healthy or not self._store:
             return json.dumps({"results": [], "count": 0, "error": "pgvector unavailable"})
 
-        query = (args.get("query") or "").strip()
+        query = str(args.get("query") or "").strip()
         if not query:
             return tool_error("Missing required arg: query")
 
@@ -848,11 +1112,16 @@ class PgvectorMemoryProvider(MemoryProvider):
 
         # Scope resolution: 'current' → my agent_identity; 'all' → no filter;
         # anything else → treat as explicit theme name.
-        scope = (args.get("scope") or self._config.get("scope_default") or "current").strip()
+        scope = str(args.get("scope") or self._config.get("scope_default") or "current").strip()
+        restricted = self._restricted_identities()
+        exclude: Optional[List[str]] = None
         if scope == "current":
             agent_filter: Optional[str] = self._agent_identity
         elif scope == "all":
             agent_filter = None
+            # Cross-theme recall stays opt-in and broad, but never reaches the
+            # PII/bench sinks -- see _restricted_identities().
+            exclude = restricted or None
         elif scope == "session":
             # Only recall_conversation supports 'session'. Falling through
             # would silently filter on a literal 'session' theme and return
@@ -861,21 +1130,27 @@ class PgvectorMemoryProvider(MemoryProvider):
                 "scope='session' is only valid for recall_conversation; "
                 "use 'current', 'all', or a theme name here."
             )
+        elif scope in restricted:
+            return tool_error(
+                f"scope={scope!r} is a restricted sink (direct-message / bench "
+                "traffic) and is not readable from this theme."
+            )
         else:
             agent_filter = scope
 
         # Target resolution: 'memory'/'user'/'both'.
-        target_arg = (args.get("target") or "both").strip()
+        target_arg = str(args.get("target") or "both").strip()
         target_filter: Optional[str] = None if target_arg == "both" else target_arg
         if target_filter not in (None, "memory", "user"):
             return tool_error(f"Invalid target: {target_arg!r}")
 
-        hybrid = bool(self._config.get("hybrid_search", True))
+        hybrid = _as_bool(self._config.get("hybrid_search"), True)
         try:
             vec = embed(
                 query,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
+                timeout=self._embed_timeout(),
             )
         except EmbeddingError as exc:
             if not hybrid:
@@ -893,6 +1168,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     agent_identity=agent_filter,
                     target=target_filter,
                     limit=limit,
+                    exclude_identities=exclude,
                 )
             else:
                 rows = self._store.search(
@@ -900,6 +1176,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     agent_identity=agent_filter,
                     target=target_filter,
                     limit=limit,
+                    exclude_identities=exclude,
                 )
         except Exception as exc:  # noqa: BLE001
             # Fail-soft: a hybrid hiccup with a usable vector falls back to the
@@ -911,6 +1188,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                         agent_identity=agent_filter,
                         target=target_filter,
                         limit=limit,
+                        exclude_identities=exclude,
                     )
                 except Exception as exc2:  # noqa: BLE001
                     return json.dumps({"results": [], "count": 0, "error": f"db: {_safe_err(exc2)}"})
@@ -942,7 +1220,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         if not self._healthy or not self._store:
             return json.dumps({"results": [], "count": 0, "error": "pgvector unavailable"})
 
-        query = (args.get("query") or "").strip()
+        query = str(args.get("query") or "").strip()
         if not query:
             return tool_error("Missing required arg: query")
         try:
@@ -950,24 +1228,39 @@ class PgvectorMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             limit = 5
 
-        scope = (args.get("scope") or "current").strip()
+        scope = str(args.get("scope") or "current").strip()
         agent_filter: Optional[str] = None
         session_filter: Optional[str] = None
+        restricted = self._restricted_identities()
+        exclude: Optional[List[str]] = None
         if scope == "current":
             agent_filter = self._agent_identity
         elif scope == "session":
             session_filter = self._session_id or None
+            # Close the gate's last branch: with no session id (never produced
+            # by the current host, but the surrounding code already treats an
+            # empty id as possible) this would otherwise be a completely
+            # unfiltered cross-theme sweep INCLUDING both sinks.
+            if session_filter is None:
+                exclude = restricted or None
         elif scope == "all":
-            pass  # no filters
+            # No agent filter, but never the PII/bench sinks.
+            exclude = restricted or None
+        elif scope in restricted:
+            return tool_error(
+                f"scope={scope!r} is a restricted sink (direct-message / bench "
+                "traffic) and is not readable from this theme."
+            )
         else:
             agent_filter = scope  # treat as a specific theme name
 
-        hybrid = bool(self._config.get("hybrid_search", True))
+        hybrid = _as_bool(self._config.get("hybrid_search"), True)
         try:
             vec = embed(
                 query,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
+                timeout=self._embed_timeout(),
             )
         except EmbeddingError as exc:
             if not hybrid:
@@ -983,6 +1276,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     agent_identity=agent_filter,
                     session_id=session_filter,
                     limit=limit,
+                    exclude_identities=exclude,
                 )
             else:
                 rows = self._store.search_turns(
@@ -990,6 +1284,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     agent_identity=agent_filter,
                     session_id=session_filter,
                     limit=limit,
+                    exclude_identities=exclude,
                 )
         except Exception as exc:  # noqa: BLE001
             if hybrid and vec is not None:
@@ -999,6 +1294,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                         agent_identity=agent_filter,
                         session_id=session_filter,
                         limit=limit,
+                        exclude_identities=exclude,
                     )
                 except Exception as exc2:  # noqa: BLE001
                     return json.dumps({"results": [], "count": 0, "error": f"db: {_safe_err(exc2)}"})
@@ -1113,12 +1409,22 @@ class PgvectorMemoryProvider(MemoryProvider):
             },
             {
                 "key": "ttl_days",
-                "description": "v0.4: advisory retention window for conversations (memory_entries are NEVER pruned). 0 = off. Pruning only ever happens when an operator runs `python -m pgvector prune` — this value is the default for that command, never an automatic background delete.",
+                "description": "v0.4: advisory retention window for conversations (memory_entries are NEVER pruned). 0 = off. Pruning only ever happens when an operator runs `hermes-pgvector prune` — this value is the default for that command, never an automatic background delete.",
                 "default": str(DEFAULTS["ttl_days"]),
             },
             {
+                "key": "embed_timeout",
+                "description": "Seconds to wait for an embedding on the AGENT thread (prefetch, recall_memory, recall_conversation) and during the init-time bulk import. Kept short on purpose: a timeout here degrades recall to full-text-only, which beats making the agent wait. Raise it only if recall quality matters more than latency on your endpoint.",
+                "default": str(DEFAULTS["embed_timeout"]),
+            },
+            {
+                "key": "embed_write_timeout",
+                "description": "Seconds to wait for an embedding on the BACKGROUND writer path. Nothing waits on this, and giving up costs a permanently unsearchable row (recoverable only by `hermes-pgvector backfill`), so it is far more generous than embed_timeout. Raise it if your endpoint is slow: writes that time out land with a NULL embedding.",
+                "default": str(DEFAULTS["embed_write_timeout"]),
+            },
+            {
                 "key": "embed_write_retries",
-                "description": "v0.4: bounded embed retries on the background writer path ONLY (the hot path — prefetch/recall/sync — always uses a single attempt). Durable recovery of missed embeddings is the `python -m pgvector backfill` sweep, not inline retries.",
+                "description": "v0.4: bounded embed retries on the background writer path ONLY (the hot path — prefetch/recall/sync — always uses a single attempt). Durable recovery of missed embeddings is the `hermes-pgvector backfill` sweep, not inline retries.",
                 "default": str(DEFAULTS["embed_write_retries"]),
             },
         ]
@@ -1133,7 +1439,12 @@ class PgvectorMemoryProvider(MemoryProvider):
                 with open(config_path, encoding="utf-8-sig") as fh:
                     existing = yaml.safe_load(fh) or {}
             existing.setdefault("plugins", {})
-            existing["plugins"]["pgvector"] = values
+            # Merge, don't replace: `values` only carries keys declared by
+            # get_config_schema(), so a wholesale assignment silently deletes
+            # live hand-edited keys that are read at runtime but not declared
+            # (identity_aliases, embed_write_backoff).
+            current = existing["plugins"].get("pgvector") or {}
+            existing["plugins"]["pgvector"] = {**current, **values}
             with open(config_path, "w", encoding="utf-8") as fh:
                 yaml.dump(existing, fh, default_flow_style=False)
         except Exception as exc:  # noqa: BLE001
@@ -1141,9 +1452,22 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     # -- Helpers -------------------------------------------------------------
 
+    def _embed_timeout(self) -> float:
+        """Timeout for embeds on the agent thread (prefetch, recall tools) and
+        on the init-time bulk import.
+
+        Deliberately NOT the writer's timeout. A slow embed here degrades
+        recall to full-text-only, which is a good outcome; blocking the agent
+        longer is a worse one. The init-time bulk import shares it because it
+        runs before the first turn and would otherwise stall session start.
+        """
+        return _as_float(self._config.get("embed_timeout"), DEFAULTS["embed_timeout"])
+
     def _maybe_embed(self, content: str) -> Optional[List[float]]:
-        if not self._config.get("embed_on_write", True):
+        if not _as_bool(self._config.get("embed_on_write"), True):
             return None
+        _write_timeout = _as_float(self._config.get("embed_write_timeout"),
+                                   DEFAULTS["embed_write_timeout"])
         try:
             # This runs ONLY in the background AsyncWriter drain thread, so a
             # bounded retry here is safe (it never blocks the agent loop). The
@@ -1153,8 +1477,15 @@ class PgvectorMemoryProvider(MemoryProvider):
                 content,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
-                retries=int(self._config.get("embed_write_retries", 2)),
-                backoff=float(self._config.get("embed_write_backoff", 0.1)),
+                timeout=_write_timeout,
+                # Bound the WORST case, not just each attempt: retries x the
+                # two protocol paths would otherwise multiply a slow endpoint
+                # into minutes of drain-thread block, filling the queue.
+                max_total=_write_timeout * 2,
+                retries=_as_int(self._config.get("embed_write_retries"),
+                                DEFAULTS["embed_write_retries"]),
+                backoff=_as_float(self._config.get("embed_write_backoff"),
+                                  DEFAULTS["embed_write_backoff"]),
             )
         except EmbeddingError as exc:
             if not self._embed_warned:
