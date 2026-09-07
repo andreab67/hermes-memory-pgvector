@@ -169,7 +169,7 @@ Found in production: one `memory_entries` row sat with a NULL embedding and **ze
 
 ## New in v0.5.2 — documentation only
 
-**No code changes.** `git diff v0.5.1..v0.5.2` touches only `README.md` and one test file; nothing under `hermes_pgvector/` differs, so the installed behaviour is byte-for-byte identical to v0.5.1. There is no reason to redeploy for this release.
+**No behaviour changes.** `git diff v0.5.1..v0.5.2` shows four files: `README.md`, one test file, and the two version strings (`pyproject.toml` and `hermes_pgvector/plugin.yaml`). The only packaged file that differs is `plugin.yaml`, and only its `version:` line — no logic changed anywhere, so an installed 0.5.2 behaves identically to 0.5.1. There is no reason to redeploy for this release.
 
 It exists because PyPI renders a project's README **frozen at upload time**: two fixes that landed after v0.5.1 shipped were visible on GitHub but not on the package page.
 
