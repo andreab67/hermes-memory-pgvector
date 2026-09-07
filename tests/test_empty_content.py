@@ -176,10 +176,6 @@ def test_backfill_remaining_can_reach_zero_despite_an_empty_row(store):
     _insert_raw(s, agent, "another embeddable note for the sweep")
     assert _scoped_backlog(s, agent) == 1, "one embeddable row to start"
 
-    before = s.backfill_null_embeddings(
-        embed_fn=lambda t: [0.1] * 768, tables=["memory_entries"], dry_run=True
-    )["memory_entries"]["failed"]
-
     report = s.backfill_null_embeddings(
         embed_fn=lambda t: [0.1] * 768, tables=["memory_entries"]
     )
@@ -187,7 +183,13 @@ def test_backfill_remaining_can_reach_zero_despite_an_empty_row(store):
     assert _scoped_backlog(s, agent) == 0, (
         "the backlog must exclude un-embeddable rows so it can actually reach 0"
     )
-    assert report["memory_entries"]["failed"] == before, (
+    # Asserted directly, not as a delta against a dry-run baseline: dry_run
+    # hardcodes "failed": 0 (store.py), so such a baseline is always 0 and the
+    # comparison would be theatre. `failed` is table-wide, which is sound here
+    # only because this fixture requires a THROWAWAY database (see the module
+    # docstring) -- on a shared one, a pre-existing failing row would surface
+    # here, and that is worth knowing rather than hiding.
+    assert report["memory_entries"]["failed"] == 0, (
         "an un-embeddable row must be skipped, not counted as a failure"
     )
     assert report["memory_entries"]["unembeddable"] >= 1
