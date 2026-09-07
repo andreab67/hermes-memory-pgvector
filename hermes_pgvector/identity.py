@@ -47,25 +47,43 @@ _DM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Platform tokens, for the UNPREFIXED key shapes only. The gateway always
+# emits an "agent:<ns>:" prefix, but unprefixed keys demonstrably reach this
+# module -- _DM_RE below deliberately matches 'signal:dm:+1...',
+# 'whatsapp:17195550000' and 'telegram:+15551234', all pinned by tests. An
+# enumeration is the only way to recognise those without also swallowing
+# ordinary colon-namespaced themes like 'eng:channel:alerts'.
+_PLATFORMS = (
+    "local|telegram|discord|whatsapp_cloud|whatsapp|slack|signal|mattermost"
+    "|matrix|homeassistant|email|sms|dingtalk|webhook|feishu|wecom_callback"
+    "|wecom|weixin|qqbot|bluebubbles|msgraph_webhook|yuanbao|relay|api_server"
+)
+
 # Multi-party session keys (group / channel / thread). Host layout is
 # agent:<ns>:<platform>:<chat_type>[:<chat_id>][:<thread_id>][:<user>]
-# (gateway/session.py:build_session_key + _session_key_namespace, which always
-# emits the literal "agent:" prefix). With the default group_sessions_per_user
-# the TRAILING segment is the participant id -- a phone number on
-# WhatsApp/SMS/Signal -- so the same two failure modes the DM bucket exists for
-# apply here: PII stored as an agent_identity, and one theme per
-# (chat, participant) pair.
+# (gateway/session.py:build_session_key + _session_key_namespace). With the
+# default group_sessions_per_user the TRAILING segment is the participant id --
+# a phone number on WhatsApp/SMS/Signal -- so the same two failure modes the DM
+# bucket exists for apply here: PII stored as an agent_identity, and one theme
+# per (chat, participant) pair.
 #
-# Anchored STRUCTURALLY on the agent:<ns>:<platform>: prefix rather than on an
-# enumerated platform list. An enumeration is brittle -- the host ships 26
-# platforms today (whatsapp_cloud, bluebubbles, qqbot, msgraph_webhook, ...)
-# and plugins register more -- and an earlier version of this pattern silently
-# missed every platform it did not name. It also cannot over-match ordinary
-# colon-namespaced themes like 'eng:channel:alerts' or 'ops:group:oncall',
-# which do not carry the agent:<ns>:<platform>: prefix. That over-match is the
-# trap the v0.4.2 note below records for a bare ':signal:' alternative.
+# TWO alternatives, deliberately, because either one alone leaks:
+#
+#   1. Prefixed, STRUCTURAL: agent:<ns>:<platform>:<chat_type>. Platform-
+#      agnostic, so it covers all 26 shipped platforms and any a plugin adds
+#      later. An earlier enumeration-only version silently missed every
+#      platform it did not name (whatsapp_cloud, qqbot, bluebubbles, ...).
+#   2. Unprefixed, ENUMERATED: <platform>:<chat_type>. An earlier
+#      structural-only version dropped this shape entirely, so
+#      'whatsapp:group:<chat>:<phone>' passed through untouched and the phone
+#      number was stored verbatim -- the exact regression #1 was fixed for.
+#      The enumeration is required here: a bare '<anything>:<chat_type>:'
+#      would swallow ordinary themes like 'eng:channel:alerts' or
+#      'ops:group:oncall'. That over-match is the trap the v0.4.2 note below
+#      records for a bare ':signal:' alternative.
 _GROUP_RE = re.compile(
-    r"^agent:[^:]+:[^:]+:(?:group|channel|thread)(?::|$)",
+    r"^agent:[^:]+:[^:]+:(?:group|channel|thread)(?::|$)"
+    r"|(?:^|:)(?:" + _PLATFORMS + r"):(?:group|channel|thread)(?::|$)",
     re.IGNORECASE,
 )
 
