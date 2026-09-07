@@ -167,6 +167,17 @@ Found in production: one `memory_entries` row sat with a NULL embedding and **ze
 - **Nothing rejected empty content on write.** `on_memory_write` filtered on `target` and `action` but never on content, so an `add`/`replace` carrying nothing created a row that can never be embedded — `embed()` raises `EmbeddingError("empty input")` unconditionally for empty or whitespace text. Such writes are now ignored (`remove` is exempt: it legitimately arrives with empty content and targets the row via `old_text`).
 - **`backfill_null_embeddings` retried it forever.** The sweep selected `WHERE embedding IS NULL` with no content filter, so every nightly run re-fetched the row, called `embed()`, failed, and moved on — permanently pinning `failed` above zero and making `remaining == 0` unreachable. That is the damaging half: it destroys the one signal an operator watches, because you can no longer distinguish a permanently-stuck row from a new genuine failure. Un-embeddable rows are now **skipped and reported separately** as `unembeddable` (skipping them silently would be equally misleading), so `remaining` can actually reach zero again.
 
+## New in v0.5.2 — documentation only
+
+**No code changes.** `git diff v0.5.1..v0.5.2` touches only `README.md` and one test file; nothing under `hermes_pgvector/` differs, so the installed behaviour is byte-for-byte identical to v0.5.1. There is no reason to redeploy for this release.
+
+It exists because PyPI renders a project's README **frozen at upload time**: two fixes that landed after v0.5.1 shipped were visible on GitHub but not on the package page.
+
+- **The v0.5.1 release notes were out of order.** The section sat before v0.5.0 instead of after it, so the newest release was buried mid-list. These sections run oldest-to-newest.
+- A test asserted a `failed` count against a dry-run baseline that is hardcoded to `0`, making the comparison a no-op. Asserted directly now, with the reasoning recorded rather than the misleading framing.
+
+If you are on v0.5.1 you already have every fix in this release. If you are on **v0.5.0 or earlier, upgrade** — v0.5.1 fixed a data-loss bug where a single `memory remove` deleted a whole theme's mirrored memory.
+
 ## Multi-agent / per-minion themes
 
 Each systemd-run minion sets one header on its OpenAI client; everything else flows automatically:
