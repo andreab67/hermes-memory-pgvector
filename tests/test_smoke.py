@@ -1,9 +1,13 @@
 """Smoke tests for the pgvector memory plugin.
 
 These tests target the standalone modules (embed.py, store.py). The
-provider class itself imports hermes-agent internals (agent.memory_provider,
-tools.registry, …) and is only exercised when the plugin runs inside
-hermes-agent.
+provider class itself *prefers* hermes-agent internals (agent.memory_provider,
+tools.registry, hermes_cli.config) when they're importable, but that import
+is wrapped in a try/except (pgvector/__init__.py:41-63) precisely so
+PgvectorMemoryProvider can also be constructed standalone, outside
+hermes-agent -- see tests/test_tool_args_hardening.py and
+tests/test_turn_dedup.py, which do exactly that with no DB or embed
+endpoint.
 
 Run with:
     pytest tests/
