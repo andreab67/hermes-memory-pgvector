@@ -143,11 +143,13 @@ def cmd_install(args) -> int:
         if not shim_dir.exists():
             print(f"nothing to remove at {shim_dir}")
             return 0
-        if init_py.exists() and SHIM_MARKER not in init_py.read_text(
+        is_marked_shim = init_py.exists() and SHIM_MARKER in init_py.read_text(
             encoding="utf-8", errors="replace"
-        ):
+        )
+        if not is_marked_shim and not args.force:
             print(
-                f"refusing to remove {shim_dir}: not a generated shim (no marker)",
+                f"refusing to remove {shim_dir}: not a generated shim (no marker); "
+                "re-run with --force to remove it anyway",
                 file=sys.stderr,
             )
             return 1

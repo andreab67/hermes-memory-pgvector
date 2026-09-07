@@ -121,7 +121,7 @@ def _post(url: str, body: dict, *, timeout: float, extract) -> List[float]:
 
     try:
         vec = extract(payload)
-    except (KeyError, IndexError, TypeError) as exc:
+    except (KeyError, IndexError, TypeError, AttributeError) as exc:
         raise EmbeddingError(f"unexpected response shape: {exc}") from exc
 
     if not isinstance(vec, list) or not vec:

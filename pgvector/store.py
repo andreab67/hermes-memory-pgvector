@@ -100,8 +100,9 @@ class MemoryStore:
 
     def _get_pool(self) -> ConnectionPool:
         """Return the live pool, constructing it on first call. Thread-safe."""
-        if self._pool is not None:
-            return self._pool
+        pool = self._pool
+        if pool is not None:
+            return pool
         with self._lock:
             if self._pool is None:
                 self._pool = ConnectionPool(
@@ -114,7 +115,8 @@ class MemoryStore:
                     open=True,
                     name="pgvector-memory",
                 )
-        return self._pool
+            pool = self._pool
+        return pool
 
     def close(self) -> None:
         """Close the connection pool. Idempotent."""
@@ -256,11 +258,14 @@ class MemoryStore:
         new_content: str,
         new_embedding: Optional[List[float]] = None,
     ) -> int:
-        """Update entries in (agent_identity, target) where content contains old_text.
+        """Update the entry in (agent_identity, target) where content contains old_text.
 
-        Matches built-in semantics — old_text is a substring match. Returns
-        the number of rows updated (built-in updates the FIRST match; we
-        update all matches in the same scope for safety).
+        Matches built-in semantics — old_text is a substring match, and only
+        the FIRST match (lowest id) is updated. This also sidesteps
+        memory_entries_unique (UNIQUE(agent_identity, target, content),
+        001_schema.sql): a bulk UPDATE across every matching row would try to
+        set 2+ rows to the identical new_content and raise UniqueViolation,
+        rolling back the whole statement.
         """
         vec_literal = (
             to_pgvector_literal(new_embedding) if new_embedding is not None else None
@@ -270,12 +275,12 @@ class MemoryStore:
                 cur.execute(
                     """
                     UPDATE memory_entries
-                       SET content    = %s,
-                           embedding  = %s::vector,
-                           updated_at = now()
-                     WHERE agent_identity = %s
-                       AND target = %s
-                       AND content LIKE %s
+                       SET content = %s, embedding = %s::vector, updated_at = now()
+                     WHERE id = (
+                         SELECT id FROM memory_entries
+                          WHERE agent_identity = %s AND target = %s AND content LIKE %s
+                          ORDER BY id LIMIT 1
+                     )
                     """,
                     (new_content, vec_literal, agent_identity, target,
                      f"%{_escape_like(old_text)}%"),

@@ -220,6 +220,41 @@ DEFAULTS = {
 }
 
 
+def _as_bool(value: Any, default: bool) -> bool:
+    """Coerce a config value to a real bool.
+
+    Config reaches us with three different types: DEFAULTS (real bools), a
+    hand-edited config.yaml (YAML bools), and save_config(), which persists
+    the config schema's declared values -- the STRINGS "true"/"false". A plain
+    truthiness test silently inverts the string form (bool("false") is True),
+    so every boolean toggle reads through here.
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def _as_theme_list(value: Any) -> Optional[List[str]]:
+    """Coerce allowed_themes into a list of theme names.
+
+    The config schema declares this key as a scalar string; the README
+    documents it as a YAML list. A bare string must never reach
+    normalize_identity(), which iterates its argument -- a string iterates
+    CHARACTER BY CHARACTER, so every real theme fails the membership test and
+    the allow-list silently routes the entire fleet to 'default'.
+    """
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return [x.strip() for x in value.split(",") if x.strip()] or None
+    try:
+        return list(value) or None
+    except TypeError:
+        return None
+
+
 def _load_plugin_config() -> dict:
     try:
         from hermes_constants import get_hermes_home
@@ -252,6 +287,11 @@ class PgvectorMemoryProvider(MemoryProvider):
         self._healthy: bool = False
         self._delegation_enabled: bool = False        # set in initialize() iff migration 002 applied
         self._embed_warned: bool = False
+        self._db_warned: bool = False
+        # Fingerprints of turns already enqueued by sync_turn this session, so
+        # on_session_end can act as a backstop without double-writing rows the
+        # per-turn path already captured (conversations has no unique key).
+        self._turn_fingerprints: set = set()
 
     @property
     def name(self) -> str:
@@ -273,6 +313,8 @@ class PgvectorMemoryProvider(MemoryProvider):
         # any past session silences the one-time warning for the process
         # lifetime — a later session with a broken endpoint gets zero signal.
         self._embed_warned = False
+        self._db_warned = False
+        self._turn_fingerprints = set()
         # Per-agent theme scoping — priority order:
         #   1. gateway_session_key — from the `X-Hermes-Session-Key` header on
         #      API requests. This is the EXPLICIT minion-scope signal sent by
@@ -306,7 +348,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         self._raw_identity = self._agent_identity
         canonical, normalized, reason = normalize_identity(
             self._agent_identity,
-            allowed_themes=self._config.get("allowed_themes"),
+            allowed_themes=_as_theme_list(self._config.get("allowed_themes")),
             aliases=self._config.get("identity_aliases") or {},
             bench_mode=self._config.get("bench_mode", "bucket"),
         )
@@ -351,10 +393,11 @@ class PgvectorMemoryProvider(MemoryProvider):
         # on_memory_write + sync_turn from the (potentially slow) embed +
         # DB write so the agent loop never blocks on a stalled embed
         # endpoint.
-        self._writer = AsyncWriter(
-            self._worker,
-            maxsize=int(self._config.get("write_queue_maxsize", 256)),
-        )
+        try:
+            _queue_max = int(self._config.get("write_queue_maxsize", 256))
+        except (TypeError, ValueError):
+            _queue_max = int(DEFAULTS["write_queue_maxsize"])
+        self._writer = AsyncWriter(self._worker, maxsize=_queue_max)
 
         # v0.4: agent attribution + delegation require migration 002. Probe it
         # SEPARATELY from ensure_schema() (which stays 001-only) so a v0.4 binary
@@ -383,9 +426,14 @@ class PgvectorMemoryProvider(MemoryProvider):
                 )
 
         # v0.1.1: bulk import existing MEMORY.md / USER.md content so the
-        # plugin sees pre-plugin entries + direct file edits, not just the
-        # new writes captured via on_memory_write.
-        if self._healthy and self._config.get("bulk_sync_on_init", True):
+        # plugin sees pre-plugin entries and entries ADDED by direct file
+        # edits, not just the new writes captured via on_memory_write.
+        # NOTE: this path is insert-only. It never reconciles removals or
+        # rewrites -- editing an existing line in MEMORY.md leaves the stale
+        # row in place alongside the new one, and recall (cosine / RRF, no
+        # recency tiebreak) can surface both. `hermes-pgvector cleanup` is
+        # the only remedy.
+        if self._healthy and _as_bool(self._config.get("bulk_sync_on_init"), True):
             self._bulk_sync_from_disk(kwargs.get("hermes_home"))
 
     def shutdown(self) -> None:
@@ -401,6 +449,13 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     def on_session_switch(self, new_session_id: str, **kwargs) -> None:
         self._session_id = new_session_id
+        # Same per-session reset initialize() performs: the provider instance
+        # is reused across sessions, so leaving these stale tags the new
+        # session's writes with the OLD session's delegation parent (corrupting
+        # provenance) and silences the one-time embed warning.
+        self._parent_session_id = kwargs.get("parent_session_id") or None
+        self._embed_warned = False
+        self._turn_fingerprints = set()
 
     # -- System prompt + ambient recall --------------------------------------
 
@@ -410,8 +465,12 @@ class PgvectorMemoryProvider(MemoryProvider):
         try:
             count_scoped = self._store.count(agent_identity=self._agent_identity)
             count_all = self._store.count()
-        except Exception:  # noqa: BLE001
-            count_scoped = count_all = 0
+        except Exception as exc:  # noqa: BLE001
+            # A failed count is NOT an empty store. Falling through to the
+            # "Empty store" branch asserts something false to the model about
+            # a store that is merely unreachable; stay silent instead.
+            logger.debug("pgvector system_prompt_block count failed: %s", exc)
+            return ""
         if count_all == 0:
             return (
                 "# pgvector memory\n"
@@ -482,35 +541,63 @@ class PgvectorMemoryProvider(MemoryProvider):
         """
         if not self._healthy or not self._writer:
             return
-        if not self._config.get("sync_turns", True):
+        if not _as_bool(self._config.get("sync_turns"), True):
             return
 
         sid = session_id or self._session_id or "default"
-        min_chars = int(self._config.get("turn_min_chars", 40))
+        try:
+            min_chars = int(self._config.get("turn_min_chars", 40))
+        except (TypeError, ValueError):
+            min_chars = int(DEFAULTS["turn_min_chars"])
         policy = self._config.get("conversation_embed_policy", "all")
         psid = self._parent_session_id if self._delegation_enabled else None
 
-        for role, content in (("user", user_content), ("assistant", assistant_content)):
-            if not content:
-                continue
-            if self._is_noise(content, min_chars=min_chars):
-                continue
-            meta = {"session_id": sid}
-            if self._raw_identity != self._agent_identity:
-                meta["raw_identity"] = self._raw_identity
-            self._writer.enqueue(
-                action="turn",
-                agent_identity=self._agent_identity,
-                target="conversations",  # synthetic; worker dispatches on action
-                content=content,
-                extra={
-                    "role": role,
-                    "session_id": sid,
-                    "embed": self._should_embed_turn(role, content, policy),
-                    "parent_session_id": psid,
-                },
-                metadata=meta,
-            )
+        # Fail-soft (invariant #4): this is called on the agent's turn path,
+        # so nothing here may raise into the agent loop.
+        try:
+            for role, content in (("user", user_content), ("assistant", assistant_content)):
+                if not content:
+                    continue
+                if self._is_noise(content, min_chars=min_chars):
+                    continue
+                meta = {"session_id": sid}
+                if self._raw_identity != self._agent_identity:
+                    meta["raw_identity"] = self._raw_identity
+                accepted = self._writer.enqueue(
+                    action="turn",
+                    agent_identity=self._agent_identity,
+                    target="conversations",  # synthetic; worker dispatches on action
+                    content=content,
+                    extra={
+                        "role": role,
+                        "session_id": sid,
+                        "embed": self._should_embed_turn(role, content, policy),
+                        "parent_session_id": psid,
+                    },
+                    metadata=meta,
+                )
+                # Fingerprint ONLY on accept. enqueue() returns False when the
+                # queue is full and the write is dropped; recording it anyway
+                # would make on_session_end skip a turn that never landed,
+                # turning a recoverable drop into permanent data loss.
+                if accepted:
+                    self._turn_fingerprints.add(self._turn_fingerprint(role, content))
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("pgvector sync_turn failed (ignored): %s", exc)
+
+    @staticmethod
+    def _turn_fingerprint(role: str, content: str) -> str:
+        """Stable short digest of one captured turn.
+
+        on_session_end() replays the whole message list, which overlaps the
+        turns sync_turn() already enqueued during the session. `conversations`
+        has no unique constraint (unlike memory_entries), so without this the
+        same turn lands twice -- doubling the table, the embedding cost, and
+        the rows recall_conversation returns.
+        """
+        import hashlib
+        digest = hashlib.sha1(f"{role}:{content}".encode("utf-8", "replace"))
+        return digest.hexdigest()[:16]
 
     @staticmethod
     def _is_noise(content: str, *, min_chars: int) -> bool:
@@ -606,8 +693,18 @@ class PgvectorMemoryProvider(MemoryProvider):
                 metadata={},
             )
             # Capture substantive user/assistant turns for conversation recall.
-            if messages:
+            # Backstop only: sync_turn() already captured this session's turns
+            # per-exchange, and the host calls BOTH hooks (and calls this one
+            # again on session rotation), so anything already fingerprinted is
+            # skipped -- `conversations` has no unique constraint to catch it.
+            # Honors the same sync_turns toggle sync_turn() does; without this
+            # an operator who disabled turn capture still got turns persisted.
+            if messages and _as_bool(self._config.get("sync_turns"), True):
                 policy = self._config.get("conversation_embed_policy", "all")
+                try:
+                    min_chars = int(self._config.get("turn_min_chars", 40))
+                except (TypeError, ValueError):
+                    min_chars = int(DEFAULTS["turn_min_chars"])
                 for msg in messages:
                     role = (msg.get("role") or "").lower()
                     if role not in ("user", "assistant"):
@@ -620,8 +717,12 @@ class PgvectorMemoryProvider(MemoryProvider):
                             if isinstance(p, dict) and p.get("type") == "text"
                         ) if isinstance(raw, list) else str(raw)
                     )
-                    if self._is_noise(content, min_chars=40):
+                    if self._is_noise(content, min_chars=min_chars):
                         continue
+                    fp = self._turn_fingerprint(role, content)
+                    if fp in self._turn_fingerprints:
+                        continue  # already enqueued by sync_turn this session
+                    self._turn_fingerprints.add(fp)
                     self._writer.enqueue(
                         action="turn",
                         agent_identity=self._agent_identity,
@@ -764,13 +865,29 @@ class PgvectorMemoryProvider(MemoryProvider):
                     attrs=item.extra.get("attrs") or {},
                 )
         except Exception as exc:  # noqa: BLE001
-            logger.debug(
-                "pgvector worker (%s/%s/%s) failed: %s",
-                item.action,
-                item.agent_identity,
-                item.target,
-                str(exc)[:200],
-            )
+            # One-shot WARNING (mirrors the _embed_warned tripwire): _healthy is
+            # evaluated once at initialize() and never re-probed, so a Postgres
+            # restart after a healthy init silently discards every durable write
+            # for the rest of the session. At debug level that is invisible at
+            # the host's default log level -- total write loss, zero signal.
+            if not self._db_warned:
+                self._db_warned = True
+                logger.warning(
+                    "pgvector worker (%s/%s/%s) failed: %s -- further worker "
+                    "failures this session are logged at debug level",
+                    item.action,
+                    item.agent_identity,
+                    item.target,
+                    str(exc)[:200],
+                )
+            else:
+                logger.debug(
+                    "pgvector worker (%s/%s/%s) failed: %s",
+                    item.action,
+                    item.agent_identity,
+                    item.target,
+                    str(exc)[:200],
+                )
 
     # -- Bulk sync (v0.1.1) --------------------------------------------------
 
@@ -816,7 +933,7 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     def _make_embed_fn(self):
         """Return a closure over the configured embed endpoint, or None."""
-        if not self._config.get("embed_on_write", True):
+        if not _as_bool(self._config.get("embed_on_write"), True):
             return None
         base_url = self._config["embed_url"]
         model = self._config["embed_model"]
@@ -837,7 +954,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         if not self._healthy or not self._store:
             return json.dumps({"results": [], "count": 0, "error": "pgvector unavailable"})
 
-        query = (args.get("query") or "").strip()
+        query = str(args.get("query") or "").strip()
         if not query:
             return tool_error("Missing required arg: query")
 
@@ -848,7 +965,7 @@ class PgvectorMemoryProvider(MemoryProvider):
 
         # Scope resolution: 'current' → my agent_identity; 'all' → no filter;
         # anything else → treat as explicit theme name.
-        scope = (args.get("scope") or self._config.get("scope_default") or "current").strip()
+        scope = str(args.get("scope") or self._config.get("scope_default") or "current").strip()
         if scope == "current":
             agent_filter: Optional[str] = self._agent_identity
         elif scope == "all":
@@ -865,12 +982,12 @@ class PgvectorMemoryProvider(MemoryProvider):
             agent_filter = scope
 
         # Target resolution: 'memory'/'user'/'both'.
-        target_arg = (args.get("target") or "both").strip()
+        target_arg = str(args.get("target") or "both").strip()
         target_filter: Optional[str] = None if target_arg == "both" else target_arg
         if target_filter not in (None, "memory", "user"):
             return tool_error(f"Invalid target: {target_arg!r}")
 
-        hybrid = bool(self._config.get("hybrid_search", True))
+        hybrid = _as_bool(self._config.get("hybrid_search"), True)
         try:
             vec = embed(
                 query,
@@ -942,7 +1059,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         if not self._healthy or not self._store:
             return json.dumps({"results": [], "count": 0, "error": "pgvector unavailable"})
 
-        query = (args.get("query") or "").strip()
+        query = str(args.get("query") or "").strip()
         if not query:
             return tool_error("Missing required arg: query")
         try:
@@ -950,7 +1067,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             limit = 5
 
-        scope = (args.get("scope") or "current").strip()
+        scope = str(args.get("scope") or "current").strip()
         agent_filter: Optional[str] = None
         session_filter: Optional[str] = None
         if scope == "current":
@@ -962,7 +1079,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         else:
             agent_filter = scope  # treat as a specific theme name
 
-        hybrid = bool(self._config.get("hybrid_search", True))
+        hybrid = _as_bool(self._config.get("hybrid_search"), True)
         try:
             vec = embed(
                 query,
@@ -1133,7 +1250,12 @@ class PgvectorMemoryProvider(MemoryProvider):
                 with open(config_path, encoding="utf-8-sig") as fh:
                     existing = yaml.safe_load(fh) or {}
             existing.setdefault("plugins", {})
-            existing["plugins"]["pgvector"] = values
+            # Merge, don't replace: `values` only carries keys declared by
+            # get_config_schema(), so a wholesale assignment silently deletes
+            # live hand-edited keys that are read at runtime but not declared
+            # (identity_aliases, embed_write_backoff).
+            current = existing["plugins"].get("pgvector") or {}
+            existing["plugins"]["pgvector"] = {**current, **values}
             with open(config_path, "w", encoding="utf-8") as fh:
                 yaml.dump(existing, fh, default_flow_style=False)
         except Exception as exc:  # noqa: BLE001
@@ -1142,7 +1264,7 @@ class PgvectorMemoryProvider(MemoryProvider):
     # -- Helpers -------------------------------------------------------------
 
     def _maybe_embed(self, content: str) -> Optional[List[float]]:
-        if not self._config.get("embed_on_write", True):
+        if not _as_bool(self._config.get("embed_on_write"), True):
             return None
         try:
             # This runs ONLY in the background AsyncWriter drain thread, so a
