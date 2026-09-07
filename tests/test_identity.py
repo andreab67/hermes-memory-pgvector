@@ -247,3 +247,52 @@ def test_group_bucket_has_its_own_registry_kind():
     assert classify_kind(GROUP_BUCKET) == "group"
     assert classify_kind(DM_BUCKET) == "dm"
     assert classify_kind("marketing") == "theme"
+
+
+# ---------------------------------------------------------------------------
+# Group keys must bucket in BOTH shapes. Each half of _GROUP_RE was, at some
+# point, the whole pattern -- and each alone leaked:
+#
+#   * enumeration-only silently missed every platform it did not name
+#     (whatsapp_cloud, qqbot, bluebubbles, msgraph_webhook, ...)
+#   * structural-only ('^agent:') dropped unprefixed keys entirely, so
+#     'whatsapp:group:<chat>:<phone>' stored the phone number verbatim
+#
+# Unprefixed keys are not hypothetical: _DM_RE deliberately matches
+# 'signal:dm:+1-719-555-0000' / 'whatsapp:17195550000' / 'telegram:+15551234',
+# pinned by the DM tests above.
+# ---------------------------------------------------------------------------
+
+UNPREFIXED_GROUP_KEYS = [
+    "whatsapp:group:120363@g.us:17192714834",
+    "whatsapp_cloud:group:120363@g.us:17192714834",
+    "signal:group:abcd==:+15551234567",
+    "telegram:channel:-1001234567890:55512345",
+    "slack:thread:C0123:1699999999.123:U0456",
+    "discord:channel:987654321:112233",
+]
+
+
+def test_unprefixed_group_keys_are_bucketed():
+    """The regression: these passed through untouched under a structural-only
+    pattern, storing the participant's phone number as the agent_identity."""
+    for key in UNPREFIXED_GROUP_KEYS:
+        canonical, normalized, reason = normalize_identity(key)
+        assert canonical == GROUP_BUCKET, key
+        assert normalized is True
+        assert reason == "group-bucket"
+
+
+def test_unprefixed_group_keys_leave_no_participant_id_behind():
+    canonical, _, _ = normalize_identity("whatsapp:group:120363@g.us:17192714834")
+    assert "17192714834" not in canonical
+
+
+def test_prefixed_form_still_covers_platforms_outside_the_enumeration():
+    """The structural half is what makes the pattern future-proof: a platform
+    a plugin registers tomorrow is covered without touching this file."""
+    canonical, _, reason = normalize_identity(
+        "agent:main:some_future_platform:group:chat:participant"
+    )
+    assert canonical == GROUP_BUCKET
+    assert reason == "group-bucket"
