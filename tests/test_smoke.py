@@ -217,7 +217,16 @@ def test_bulk_upsert_md_skips_existing(store, tmp_path):
         "\n§\n"
         "second note: the gateway runs on port 8642"
         "\n§\n"
-        "third note: prefer pgvector over Holographic"
+        "third note: prefer pgvector over Holographic",
+        # encoding is REQUIRED here, not cosmetic. The entry delimiter is the
+        # section sign surrounded by newlines, and on a cp1252 default locale
+        # (Windows) write_text() emits that character as the single byte 0xA7.
+        # bulk_upsert_md reads utf-8 with errors='replace', turning it into
+        # U+FFFD, so the delimiter never matches and the file parses as ONE
+        # entry instead of three. Without this pin the test fails only on
+        # Windows -- which is exactly how it survived unnoticed until the
+        # live-DB suite was first executed on this machine.
+        encoding="utf-8",
     )
 
     # First run: inserts 3 rows. embed_fn=None → text-only writes.

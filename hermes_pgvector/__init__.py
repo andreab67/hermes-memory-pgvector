@@ -63,7 +63,8 @@ except ImportError:  # pragma: no cover
         return cur
 
 from .embed import embed, EmbeddingError
-from .identity import BENCH_BUCKET, DM_BUCKET, classify_kind, normalize_identity
+from .identity import (BENCH_BUCKET, DM_BUCKET, GROUP_BUCKET, classify_kind,
+                       normalize_identity)
 from .store import MemoryStore
 from .writer import AsyncWriter, _PendingWrite
 
@@ -772,8 +773,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     fp = self._turn_fingerprint(role, content)
                     if fp in self._turn_fingerprints:
                         continue  # already enqueued by sync_turn this session
-                    self._turn_fingerprints.add(fp)
-                    self._writer.enqueue(
+                    accepted = self._writer.enqueue(
                         action="turn",
                         agent_identity=self._agent_identity,
                         target="conversations",
@@ -786,6 +786,15 @@ class PgvectorMemoryProvider(MemoryProvider):
                         },
                         metadata={},
                     )
+                    # Same contract as sync_turn: fingerprint ONLY on accept.
+                    # enqueue() returns False on a full queue -- and a full
+                    # queue is most likely exactly here, since this replays a
+                    # whole transcript at once through a 256-slot queue. Marking
+                    # a dropped turn as captured would make the NEXT
+                    # on_session_end (session rotation replays the same list)
+                    # skip it, turning a recoverable drop into permanent loss.
+                    if accepted:
+                        self._turn_fingerprints.add(fp)
         except Exception as exc:  # noqa: BLE001
             logger.debug("pgvector on_session_end failed (ignored): %s", exc)
 
@@ -996,7 +1005,8 @@ class PgvectorMemoryProvider(MemoryProvider):
     def _restricted_identities(self) -> List[str]:
         """Sink themes this agent must not read out of.
 
-        identity.py buckets direct-message traffic into `whatsapp-dm` and
+        identity.py buckets direct-message traffic into `whatsapp-dm`,
+        multi-party group/channel/thread traffic into `external-group`, and
         benchmark traffic into `_bench`. That bucketing is WRITE-side only: it
         strips PII from the *identity*, but the message bodies still land in
         `content`. Without a read-side gate, any theme could pull DM content
@@ -1008,7 +1018,10 @@ class PgvectorMemoryProvider(MemoryProvider):
         An agent that IS the bucket keeps full access to its own rows, so
         DM-scoped recall still works for the DM agent itself.
         """
-        return [b for b in (DM_BUCKET, BENCH_BUCKET) if b != self._agent_identity]
+        return [
+            b for b in (DM_BUCKET, GROUP_BUCKET, BENCH_BUCKET)
+            if b != self._agent_identity
+        ]
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         return [RECALL_MEMORY_SCHEMA, RECALL_CONVERSATION_SCHEMA]

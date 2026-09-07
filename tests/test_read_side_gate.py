@@ -4,8 +4,9 @@ No DB, no embed endpoint -- the provider is built via the standalone-import
 fallback and handed a recording stub store, so these assert on the FILTERS the
 provider passes down rather than on query results.
 
-Why this exists. identity.py buckets direct-message traffic into `whatsapp-dm`
-and benchmark traffic into `_bench`. That bucketing was WRITE-side only: it
+Why this exists. identity.py buckets direct-message traffic into `whatsapp-dm`,
+multi-party group/channel/thread traffic into `external-group`, and benchmark
+traffic into `_bench`. That bucketing was WRITE-side only: it
 strips PII from the *identity*, but the message bodies still land in `content`.
 Nothing filtered on read, so any theme could pull DM content into its context
 with scope='all' -- or, because `scope` is free text, by naming the bucket
@@ -28,7 +29,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hermes_pgvector import PgvectorMemoryProvider  # noqa: E402
 import hermes_pgvector as pgvector_pkg  # noqa: E402
-from hermes_pgvector.identity import BENCH_BUCKET, DM_BUCKET  # noqa: E402
+from hermes_pgvector.identity import BENCH_BUCKET, DM_BUCKET, GROUP_BUCKET  # noqa: E402
 
 
 class _RecordingStore:
@@ -75,20 +76,20 @@ def test_recall_memory_scope_all_excludes_both_sinks(monkeypatch):
     p = _provider("marketing", monkeypatch)
     p.handle_tool_call("recall_memory", {"query": "q", "scope": "all"})
     assert p._store.kwargs.get("agent_identity") is None, "scope=all is still cross-theme"
-    assert set(p._store.kwargs.get("exclude_identities") or []) == {DM_BUCKET, BENCH_BUCKET}
+    assert set(p._store.kwargs.get("exclude_identities") or []) == {DM_BUCKET, GROUP_BUCKET, BENCH_BUCKET}
 
 
 def test_recall_conversation_scope_all_excludes_both_sinks(monkeypatch):
     p = _provider("marketing", monkeypatch)
     p.handle_tool_call("recall_conversation", {"query": "q", "scope": "all"})
-    assert set(p._store.kwargs.get("exclude_identities") or []) == {DM_BUCKET, BENCH_BUCKET}
+    assert set(p._store.kwargs.get("exclude_identities") or []) == {DM_BUCKET, GROUP_BUCKET, BENCH_BUCKET}
 
 
 def test_scope_all_excludes_sinks_on_the_non_hybrid_path(monkeypatch):
     p = _provider("marketing", monkeypatch, hybrid=False)
     p.handle_tool_call("recall_memory", {"query": "q", "scope": "all"})
     assert p._store.called == "search"
-    assert set(p._store.kwargs.get("exclude_identities") or []) == {DM_BUCKET, BENCH_BUCKET}
+    assert set(p._store.kwargs.get("exclude_identities") or []) == {DM_BUCKET, GROUP_BUCKET, BENCH_BUCKET}
 
 
 def test_scope_all_excludes_sinks_on_the_hybrid_failure_fallback(monkeypatch):
@@ -108,7 +109,7 @@ def test_scope_all_excludes_sinks_on_the_hybrid_failure_fallback(monkeypatch):
     p._store.hybrid_search = _boom
     p._store.search = _fallback
     p.handle_tool_call("recall_memory", {"query": "q", "scope": "all"})
-    assert set(calls.get("exclude_identities") or []) == {DM_BUCKET, BENCH_BUCKET}
+    assert set(calls.get("exclude_identities") or []) == {DM_BUCKET, GROUP_BUCKET, BENCH_BUCKET}
 
 
 # --- naming a sink directly must be refused --------------------------------
@@ -142,8 +143,8 @@ def test_dm_agent_keeps_access_to_its_own_rows(monkeypatch):
     p = _provider(DM_BUCKET, monkeypatch)
     p.handle_tool_call("recall_memory", {"query": "q", "scope": "all"})
     excl = set(p._store.kwargs.get("exclude_identities") or [])
-    assert DM_BUCKET not in excl
-    assert excl == {BENCH_BUCKET}
+    assert DM_BUCKET not in excl, "an agent must never be denied its own rows"
+    assert excl == {GROUP_BUCKET, BENCH_BUCKET}
 
 
 def test_dm_agent_scope_current_is_unaffected(monkeypatch):
@@ -167,3 +168,20 @@ def test_scope_current_carries_no_exclusion(monkeypatch):
     p.handle_tool_call("recall_memory", {"query": "q", "scope": "current"})
     assert p._store.kwargs.get("agent_identity") == "marketing"
     assert not p._store.kwargs.get("exclude_identities")
+
+
+def test_recall_memory_rejects_explicit_group_bucket(monkeypatch):
+    """Group/channel/thread traffic is external third-party content in the same
+    privacy class as DMs, so it is restricted on read for the same reason."""
+    p = _provider("marketing", monkeypatch)
+    out = json.loads(p.handle_tool_call("recall_memory", {"query": "q", "scope": GROUP_BUCKET}))
+    assert "restricted sink" in (out.get("error") or "")
+    assert p._store.called is None
+
+
+def test_group_agent_keeps_access_to_its_own_rows(monkeypatch):
+    p = _provider(GROUP_BUCKET, monkeypatch)
+    p.handle_tool_call("recall_memory", {"query": "q", "scope": "all"})
+    excl = set(p._store.kwargs.get("exclude_identities") or [])
+    assert GROUP_BUCKET not in excl
+    assert excl == {DM_BUCKET, BENCH_BUCKET}

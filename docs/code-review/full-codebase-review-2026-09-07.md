@@ -308,6 +308,42 @@ stopped nightly re-embedding silently, leaving rows written during an embed
 outage permanently unsearchable. The README upgrade block now leads with that,
 including the `grep` to find affected units.
 
+### 6.4 Round 4 — group-key PII, and a drop-safety bug the PR bot caught
+
+**Group / channel / thread keys were not bucketed.** Flagged in round 3 as
+pre-existing and deferred; the owner asked for it. The host builds session keys
+as `<ns>:<platform>:<chat_type>[:<chat_id>][:<thread_id>][:<user>]`
+(`gateway/session.py:build_session_key`), and with `group_sessions_per_user` —
+the default — the trailing segment is the participant id, a phone number on
+WhatsApp/SMS/Signal. Only `dm` was bucketed, so `group`, `channel` and `thread`
+keys stored that phone number verbatim as an `agent_identity`: the exact failure
+`identity.py` exists to prevent, reached through a different `chat_type`. Under a
+configured allow-list they instead collapsed to `default`, where every theme
+could read the external content.
+
+Now bucketed to a single `external-group` sink, added to `_ALWAYS_ALLOWED` (so a
+strict allow-list cannot route it to `default`) and to the read-side restricted
+set. The pattern is anchored on `<platform>:<chat_type>:` rather than a bare
+chat-type token, deliberately: a loose pattern would sweep ordinary namespaced
+themes like `eng:channel:alerts` — the same trap the v0.4.2 note records for a
+bare `:signal:` alternative. Tested against all six real key shapes plus six
+benign look-alikes.
+
+**`on_session_end` fingerprinted turns before the enqueue was accepted.** Found
+by the PR review bot, and it was right. The drop-safety contract was applied to
+`sync_turn` but not to `on_session_end` — and it matters *more* there, because
+that hook replays an entire transcript at once through a 256-slot queue, so a
+full queue is most likely exactly at that moment. A dropped turn was marked
+captured, and since fingerprints now survive session switches (section 6.3), the
+next replay skipped it permanently.
+
+My earlier reasoning for leaving it — "on_session_end is the last chance, so it
+does not matter" — was simply wrong: the host calls it *again* on session
+rotation with the same message list. Fixed to fingerprint only on accept, with
+two regression tests verified to fail against the reintroduced defect.
+
+---
+
 ## 7. Tests added
 
 New: `tests/test_config_coercion.py`, `tests/test_async_writer.py`,
@@ -340,6 +376,7 @@ then restoring.
 | Command | Result |
 |---|---|
 | `python -m pytest tests/ -q` (baseline) | 24 passed, 34 skipped |
+| **`PG_TEST_DSN=... python -m pytest tests/ -q`** (live) | **126 passed** (see 8.1) |
 | `python -m pytest tests/ -q` (final) | **74 passed, 35 skipped** |
 | `python -c "import hermes_pgvector, hermes_pgvector.store, hermes_pgvector.embed"` | imports OK |
 | `bash -n scripts/install.sh` | syntax OK |
@@ -350,6 +387,55 @@ then restoring.
 | Behavioral: `_as_bool` / `_as_theme_list` / `normalize_identity` | string forms now handled correctly |
 | Behavioral: revert-one-coercion | target test fails as predicted, then restored |
 | Secret scan of full diff | no secret-shaped additions |
+
+---
+
+### 8.1 The live-DB run
+
+The earlier passes could not execute anything touching real SQL. That gap is now
+closed. A throwaway Postgres 16 + pgvector 0.8.6 container was provisioned, all
+four migrations applied through the real `hermes-pgvector migrate` path, and the
+full suite run against it.
+
+**Result: 126 passed.** Everything previously verified only by reading is now
+executed — including `replace()`'s single-row UPDATE (the fix for the
+`UniqueViolation` that silently updated zero rows) and the new
+`agent_identity <> ALL(%s)` exclusion filter.
+
+Two things worth recording:
+
+**A defect only execution could find.** `test_bulk_upsert_md_skips_existing`
+failed: expected 3 parsed entries, got 1. Cause: the test called
+`md.write_text(...)` with no `encoding=`, so on a cp1252 default locale
+(Windows) the `§` entry delimiter was written as the single byte `0xA7`.
+`bulk_upsert_md` reads UTF-8 with `errors="replace"`, turning it into U+FFFD, so
+the delimiter never matched and the file parsed as one entry. A **test
+portability bug, not a product bug** — and proof this suite had never been
+executed on this platform. Fixed by pinning the encoding, with the reason
+recorded in the test so it is not "cleaned up" later.
+
+**Live coverage added for the exclusion filter.** The gate's *policy* was already
+covered DB-free, but the SQL was not. `tests/test_exclude_identities_live.py`
+now exercises `exclude_identities` against real Postgres on all four store
+methods, in both the positional and named-parameter binding forms, plus the
+full-text-only RRF leg, an empty list, an absent identity, and a literal
+containing `%` and a quote (proving it is a bound parameter, not interpolation).
+Verified non-vacuous: neutering the positional filter fails exactly the three
+positional tests.
+
+### 8.2 An operational finding from the live run
+
+The one test still failing under `PG_TEST_EMBED_URL` is not a code defect. The
+configured embed endpoint (`192.168.100.50:11434`, nomic-embed-text) responds in
+**6.6–16.7 s** across repeated back-to-back calls, while `embed()`'s default
+timeout is **10 s**. So a substantial share of production embeds time out, take
+the fail-soft path, and land as text-only rows with NULL embeddings.
+
+That is by design — but it means the plugin depends heavily on the nightly
+backfill sweep to make those rows searchable again, **and that sweep is exactly
+what the `python -m pgvector` break in section 6.3 would have silently killed**.
+The two findings compound. Worth deciding whether to raise the default timeout,
+independently of this branch.
 
 ---
 
@@ -418,10 +504,10 @@ final-SHA status belongs in the merge proposal and the final response.
 
 ## 11. Residual risks
 
-1. **34 live-DB tests never ran.** Everything touching real SQL — including the
-   `replace()` rewrite (STORE-1), the single most behaviorally significant code
-   change — is covered by reading, not execution. **Running the suite once with
-   `PG_TEST_DSN` set against a scratch database is the highest-value follow-up.**
+1. ~~34 live-DB tests never ran.~~ **RESOLVED — they were executed.** See
+   section 8.1. All migrations applied and the full suite ran against a real
+   Postgres 16 + pgvector 0.8.6 instance: **126 passed**. This surfaced one
+   defect that no amount of reading would have (section 8.1).
 2. **No CI**, so nothing prevents this class of drift from recurring. The stale
    psycopg pin appeared in two files and survived a release; a three-line
    consistency check comparing `pyproject.toml` against `plugin.yaml`,

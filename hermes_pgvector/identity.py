@@ -47,17 +47,40 @@ _DM_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Multi-party session keys (group / channel / thread). Host layout is
+# <ns>:<platform>:<chat_type>[:<chat_id>][:<thread_id>][:<user>]
+# (gateway/session.py:build_session_key), and with the default
+# group_sessions_per_user=True the TRAILING segment is the participant id --
+# a phone number on WhatsApp/SMS/Signal. So the same two failure modes the DM
+# bucket exists for apply here: PII stored as an agent_identity, and one theme
+# per (chat, participant) pair.
+#
+# Deliberately anchored on <platform>:<chat_type>: rather than a bare chat-type
+# token. The v0.4.2 note below explains why a loose alternative is dangerous --
+# a bare ':channel:' would sweep ordinary colon-namespaced themes like
+# 'eng:channel:alerts' into the bucket on nothing but a common word.
+_GROUP_RE = re.compile(
+    r"(?:^|:)(?:local|telegram|discord|whatsapp|slack|signal|mattermost|matrix"
+    r"|homeassistant|email|sms|dingtalk|webhook|feishu|wecom)"
+    r":(?:group|channel|thread):",
+    re.IGNORECASE,
+)
+
 # Benchmark / test-harness identities that must not pollute durable prod memory.
 # 'skill-bench', 'skill-bench-ws', '<x>-bench', '<x>-bench-ws', 'bench'.
 _BENCH_RE = re.compile(r"^(?:.*-)?bench(?:-ws)?$", re.IGNORECASE)
 
 DM_BUCKET = "whatsapp-dm"
+# One bucket for ALL multi-party external traffic, mirroring DM_BUCKET: the
+# point is isolation, not a per-chat taxonomy. Keeping a theme per group chat
+# would trade the PII problem for the cardinality one.
+GROUP_BUCKET = "external-group"
 BENCH_BUCKET = "_bench"
 DEFAULT_IDENTITY = "default"
 
 # Governed sinks are always permitted, even under a strict allow-list — they are
 # isolation buckets, not user themes, so isolation must keep working regardless.
-_ALWAYS_ALLOWED = frozenset({DM_BUCKET, BENCH_BUCKET, DEFAULT_IDENTITY})
+_ALWAYS_ALLOWED = frozenset({DM_BUCKET, GROUP_BUCKET, BENCH_BUCKET, DEFAULT_IDENTITY})
 
 
 def normalize_identity(
@@ -105,6 +128,12 @@ def normalize_identity(
     # 2. DM / direct-message session keys -> single bucket (PII + cardinality).
     if _DM_RE.search(canonical):
         return DM_BUCKET, (DM_BUCKET != raw), "dm-bucket"
+
+    # 2b. group / channel / thread keys -> single bucket, same rationale: with
+    # group_sessions_per_user (the host default) the trailing segment is the
+    # participant id, which is a phone number on WhatsApp/SMS/Signal.
+    if _GROUP_RE.search(canonical):
+        return GROUP_BUCKET, (GROUP_BUCKET != raw), "group-bucket"
 
     # 3. benchmark / test-harness traffic -> isolate or reject.
     if _BENCH_RE.match(canonical):

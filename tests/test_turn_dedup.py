@@ -86,22 +86,29 @@ def test_dedup_contract_same_turn_fingerprinted_twice_collapses_in_a_set():
 # ---------------------------------------------------------------------------
 
 class _RejectingWriter:
-    """Writer stand-in whose queue is always full (enqueue always drops)."""
+    """Writer stand-in whose queue is always full (enqueue always drops).
+
+    Counts only action="turn" so on_session_end's register_agent enqueue does
+    not inflate the total."""
 
     def __init__(self):
         self.calls = 0
 
     def enqueue(self, **kwargs) -> bool:
-        self.calls += 1
+        if kwargs.get("action") == "turn":
+            self.calls += 1
         return False
 
 
 class _AcceptingWriter:
+    """Counts only action="turn" -- see _RejectingWriter."""
+
     def __init__(self):
         self.calls = 0
 
     def enqueue(self, **kwargs) -> bool:
-        self.calls += 1
+        if kwargs.get("action") == "turn":
+            self.calls += 1
         return True
 
 
@@ -210,3 +217,64 @@ def test_on_session_end_skips_a_turn_already_captured_by_sync_turn():
     # just confirms the writer stub is actually wired into both hooks.
     register_calls = [a for a in writer.actions if a == "register_agent"]
     assert len(register_calls) == 1
+
+
+# ---------------------------------------------------------------------------
+# Drop-safety, on_session_end side.
+#
+# The same contract as sync_turn, and arguably more important here: this hook
+# replays an entire transcript at once through a 256-slot queue, so a full
+# queue is MOST likely exactly at this moment. Fingerprinting a dropped turn
+# would make the next on_session_end -- session rotation replays the same
+# message list -- skip it, converting a recoverable drop into permanent loss.
+# ---------------------------------------------------------------------------
+
+_LONG_U = "A substantive user turn well past the noise threshold for capture."
+_LONG_A = "A substantive assistant reply, also long enough to be captured here."
+_MSGS = [{"role": "user", "content": _LONG_U}, {"role": "assistant", "content": _LONG_A}]
+
+
+def _end_provider(writer):
+    p = PgvectorMemoryProvider()
+    p._healthy = True
+    p._delegation_enabled = True          # on_session_end no-ops without 002
+    p._writer = writer
+    p._agent_identity = "default"
+    p._raw_identity = "default"
+    p._session_id = "sess-end"
+    p._turn_fingerprints = set()
+    return p
+
+
+def test_on_session_end_does_not_fingerprint_dropped_turns():
+    writer = _RejectingWriter()
+    p = _end_provider(writer)
+    p.on_session_end(_MSGS)
+    assert p._turn_fingerprints == set(), (
+        "a turn the writer refused must stay un-fingerprinted, or the next "
+        "on_session_end will skip a row that never reached Postgres"
+    )
+
+
+def test_on_session_end_retries_a_previously_dropped_turn():
+    """End-to-end of the above: drop, then a later replay must re-offer it."""
+    p = _end_provider(_RejectingWriter())
+    p.on_session_end(_MSGS)
+
+    accepting = _AcceptingWriter()
+    p._writer = accepting
+    p.on_session_end(_MSGS)
+
+    turns = accepting.calls
+    assert turns == 2, f"dropped turns must be retried on replay, got {turns}"
+    assert len(p._turn_fingerprints) == 2
+
+
+def test_on_session_end_still_skips_turns_that_were_accepted():
+    """The dedup itself must survive the drop-safety change."""
+    accepting = _AcceptingWriter()
+    p = _end_provider(accepting)
+    p.on_session_end(_MSGS)
+    first = accepting.calls
+    p.on_session_end(_MSGS)          # rotation replays the same list
+    assert accepting.calls == first, "accepted turns must not be written twice"
