@@ -888,6 +888,27 @@ class PgvectorMemoryProvider(MemoryProvider):
         if action not in ("add", "replace", "remove"):
             logger.debug("pgvector ignoring unknown action: %r", action)
             return
+        # An add/replace with no content produces a row that can NEVER be
+        # embedded: embed() raises EmbeddingError("empty input") on empty or
+        # whitespace text. Such a row is retried by every nightly backfill
+        # forever, always fails, and permanently prevents the NULL-embedding
+        # count from reaching zero -- destroying the one signal an operator
+        # watches. It also carries no information worth mirroring. `remove`
+        # is exempt: it legitimately arrives with empty content and targets
+        # the row via old_text.
+        if action in ("add", "replace") and not (content or "").strip():
+            # Not routine. on_memory_write only fires for writes the built-in
+            # tool COMMITTED, and it rejects empty add/replace content -- so
+            # arriving here means real content landed on disk and reached us
+            # as ''. Skipping keeps an un-embeddable row out of the table, but
+            # the mirror is now missing an entry the agent believes it saved,
+            # which is worth more than a debug line.
+            logger.warning(
+                "pgvector: %r for target=%r arrived with empty content; "
+                "skipping (the built-in store has it, the mirror will not)",
+                action, target,
+            )
+            return
 
         meta = dict(metadata or {})
         meta.setdefault("session_id", self._session_id)
@@ -957,11 +978,27 @@ class PgvectorMemoryProvider(MemoryProvider):
                         metadata=item.metadata,
                     )
             elif item.action == "remove":
-                self._store.remove(
-                    agent_identity=item.agent_identity,
-                    target=item.target,
-                    old_text=item.content,
-                )
+                # The removal target lives in extra["old_text"], NOT in content.
+                # The built-in tool's remove op takes old_text and leaves content
+                # empty (tools/memory_tool.py: remove -> store.remove(target,
+                # old_text)), and the host forwards old_text via METADATA
+                # (memory_manager.notify_memory_tool_write). Reading item.content
+                # here meant remove() was called with "", which becomes
+                # `content LIKE '%%'` -- matching every row and deleting the
+                # entire mirror for that (agent_identity, target).
+                old_text = item.extra.get("old_text") or item.content
+                if not (old_text or "").strip():
+                    logger.warning(
+                        "pgvector refusing remove with no old_text for %s/%s "
+                        "(would match every row)",
+                        item.agent_identity, item.target,
+                    )
+                else:
+                    self._store.remove(
+                        agent_identity=item.agent_identity,
+                        target=item.target,
+                        old_text=old_text,
+                    )
             elif item.action == "turn":
                 role = item.extra.get("role") or "user"
                 sid = item.extra.get("session_id") or "default"

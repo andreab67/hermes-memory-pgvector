@@ -277,10 +277,17 @@ def cmd_stats(args) -> int:
     conv = store.count_turns()
     print(f"memory_entries: {mem} rows")
     print(f"conversations:  {conv} rows")
-    # null-embedding counts (dry-run backfill returns remaining-null per table)
+    # null-embedding counts (dry-run backfill returns remaining-null per table).
+    # `remaining` counts only rows that CAN be embedded; empty/whitespace rows
+    # are reported separately, because they never shrink and would otherwise
+    # make this number look permanently stuck for no actionable reason.
     nulls = store.backfill_null_embeddings(embed_fn=lambda t: [0.0] * 768, dry_run=True)
     for table, info in nulls.items():
-        print(f"  {table}: {info['remaining']} null-embedding rows")
+        line = f"  {table}: {info['remaining']} null-embedding rows (backfillable)"
+        stuck = info.get("unembeddable")
+        if stuck:
+            line += f", {stuck} un-embeddable (empty content — will never backfill)"
+        print(line)
     if store.ensure_migration_002_applied():
         print("migration 002: applied — per-agent attribution:")
         for row in store.agent_attribution():

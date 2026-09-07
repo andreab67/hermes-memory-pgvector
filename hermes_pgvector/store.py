@@ -296,18 +296,41 @@ class MemoryStore:
         target: str,
         old_text: str,
     ) -> int:
-        """Delete entries in (agent_identity, target) matching old_text substring.
+        """Delete THE entry in (agent_identity, target) matching old_text.
 
-        Returns the number of rows deleted.
+        Deletes at most ONE row (lowest id), matching both the built-in tool
+        and this class's own replace(). The built-in requires a UNIQUE match
+        and errors on ambiguity (memory_tool_store._edit -> _find_unique_match),
+        so one built-in remove is one entry; a mirror that deleted every
+        substring match would remove strictly more -- and the mirror is the
+        side that accumulates stale rows MEMORY.md no longer has, so "every
+        match" is wider here than it would be there.
+
+        Returns the number of rows deleted (0 or 1).
+
+        REFUSES an empty or whitespace-only old_text. `%{""}%` is `LIKE '%%'`,
+        which matches every row -- so a caller that lost the removal target
+        would silently delete the entire mirror for that (agent_identity,
+        target) instead of one entry. A delete this destructive must never be
+        reachable by omission; the caller has to say what it means to remove.
         """
+        if not (old_text or "").strip():
+            raise ValueError(
+                "remove() requires a non-empty old_text: an empty pattern is "
+                "LIKE '%%', which would delete every entry in this scope"
+            )
         with self._get_pool().connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
                     """
                     DELETE FROM memory_entries
-                     WHERE agent_identity = %s
-                       AND target = %s
-                       AND content LIKE %s
+                     WHERE id = (
+                         SELECT id FROM memory_entries
+                          WHERE agent_identity = %s
+                            AND target = %s
+                            AND content LIKE %s
+                          ORDER BY id LIMIT 1
+                     )
                     """,
                     (agent_identity, target, f"%{_escape_like(old_text)}%"),
                 )
@@ -922,7 +945,15 @@ class MemoryStore:
         fail fast, never write a wrong-dim vector). If the embed endpoint is
         unreachable, the run aborts cleanly (nothing to backfill right now).
 
-        Returns {table: {processed, succeeded, failed, remaining}}.
+        Rows whose content is empty or whitespace are EXCLUDED, not failed.
+        embed() raises EmbeddingError("empty input") on such text, so selecting
+        them means retrying a guaranteed failure on every nightly run forever,
+        permanently pinning `failed` above zero and making "remaining == 0"
+        unreachable -- which destroys the one signal an operator watches. They
+        are reported separately as `unembeddable` so they are skipped, not
+        hidden.
+
+        Returns {table: {processed, succeeded, failed, remaining, unembeddable}}.
         """
         tables = self._assert_whitelisted(tables)
         result: Dict[str, Dict[str, Any]] = {}
@@ -933,7 +964,8 @@ class MemoryStore:
             except Exception as exc:  # noqa: BLE001
                 logger.warning("backfill aborted — embed endpoint unavailable: %s", str(exc)[:200])
                 return {t: {"processed": 0, "succeeded": 0, "failed": 0,
-                            "remaining": None, "note": "embed-unavailable"} for t in tables}
+                            "remaining": None, "unembeddable": None,
+                            "note": "embed-unavailable"} for t in tables}
             if not isinstance(probe, list) or len(probe) != 768:
                 got = len(probe) if isinstance(probe, list) else type(probe).__name__
                 raise ValueError(
@@ -944,10 +976,31 @@ class MemoryStore:
         for t in tables:
             with self._get_pool().connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(f"SELECT count(*) FROM {t} WHERE embedding IS NULL")
-                    remaining = int(cur.fetchone()[0])
+                    cur.execute(
+                        # content ~ '\S' means "has at least one non-whitespace
+                        # character", which matches Python's str.strip()
+                        # exactly. Postgres trim() defaults to SPACES ONLY, so a
+                        # row holding just a newline or a tab would still be
+                        # selected here, still raise EmbeddingError("empty
+                        # input"), and still fail on every run -- the very bug
+                        # this filter exists to stop.
+                        rf"SELECT count(*) FILTER (WHERE content ~ '\S'), "
+                        rf"       count(*) FILTER (WHERE content !~ '\S' OR content IS NULL) "
+                        f"FROM {t} WHERE embedding IS NULL"
+                    )
+                    row = cur.fetchone()
+                    remaining, unembeddable = int(row[0]), int(row[1])
+            if unembeddable:
+                # Surfaced, not swallowed: these are permanently un-embeddable
+                # and would otherwise be invisible now that they are skipped.
+                logger.info(
+                    "backfill %s: skipping %d row(s) with empty content "
+                    "(cannot be embedded; delete them or leave them text-only)",
+                    t, unembeddable,
+                )
             if dry_run:
-                result[t] = {"processed": 0, "succeeded": 0, "failed": 0, "remaining": remaining}
+                result[t] = {"processed": 0, "succeeded": 0, "failed": 0,
+                             "remaining": remaining, "unembeddable": unembeddable}
                 continue
 
             processed = succeeded = failed = 0
@@ -955,7 +1008,10 @@ class MemoryStore:
                 with self._get_pool().connection() as conn:
                     with conn.cursor(row_factory=dict_row) as cur:
                         cur.execute(
-                            f"SELECT id, content FROM {t} WHERE embedding IS NULL ORDER BY id LIMIT %s",
+                            f"SELECT id, content FROM {t} "
+                            f"WHERE embedding IS NULL "
+                            rf"  AND content ~ '\S' "
+                            f"ORDER BY id LIMIT %s",
                             (batch_size,),
                         )
                         rows = list(cur.fetchall())
@@ -991,10 +1047,14 @@ class MemoryStore:
 
             with self._get_pool().connection() as conn:
                 with conn.cursor() as cur:
-                    cur.execute(f"SELECT count(*) FROM {t} WHERE embedding IS NULL")
+                    cur.execute(
+                        f"SELECT count(*) FROM {t} "
+                        rf"WHERE embedding IS NULL AND content ~ '\S'"
+                    )
                     remaining = int(cur.fetchone()[0])
             result[t] = {"processed": processed, "succeeded": succeeded,
-                         "failed": failed, "remaining": remaining}
+                         "failed": failed, "remaining": remaining,
+                         "unembeddable": unembeddable}
         return result
 
     def prune_conversations(self, *, older_than_days: int, dry_run: bool = False) -> int:
