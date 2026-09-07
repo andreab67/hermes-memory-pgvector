@@ -107,7 +107,7 @@ By severity (confirmed): critical 0 · high 6 · medium 12 · low 4.
 | INIT-2 | medium | `__init__.py` `sync_turn` | No try/except anywhere; an unguarded `int()` cast on config could raise into the agent turn path (INV-4). Body now fail-soft. |
 | INIT-3 | medium | `__init__.py`, 5 sites | `.strip()` called on unvalidated tool args; a non-string `scope`/`target`/`query` raised AttributeError out of a `recall_*` hook. The adjacent `limit` parse was already guarded, confirming the asymmetry was an oversight. |
 | INIT-4 | medium | `__init__.py` `initialize` | Unguarded `int(write_queue_maxsize)` aborted bootstrap on a non-numeric config value. |
-| INIT-5 | medium | `__init__.py` `on_session_switch` | Reset only `_session_id`, leaving `_parent_session_id` stale, so session B's writes were tagged with session A's delegation parent (provenance corruption); `_embed_warned` likewise stale. |
+| INIT-5 | medium | `__init__.py` `on_session_switch` | **PARTIALLY WITHDRAWN — see section 6.2.** The `_embed_warned` / `_db_warned` / `_turn_fingerprints` resets are correct and were kept. The `_parent_session_id` half was WRONG and has been reverted: the host's `on_session_switch(parent_session_id=...)` carries the previous session in the agent's own lineage, not a delegation parent. |
 | CORE-1 | medium | `embed.py:124` | Extractor guard omitted AttributeError; the Ollama Path B extractor uses `d.get()`, so a non-dict JSON payload escaped `embed()` uncaught. |
 | CORE-2 | medium | `__main__.py` `cmd_install --remove` | The marker check short-circuited when `__init__.py` was absent, so a directory that was demonstrably not a generated shim was `rmtree`'d unconditionally without `--force`. Now fails closed. **Proven behaviorally.** |
 | XCUT-5 | medium | `__init__.py` `save_config` | Replaced the whole `plugins.pgvector` subtree with schema-declared keys only, silently deleting live runtime-read keys (`identity_aliases`, `embed_write_backoff`). Now merges. |
@@ -161,7 +161,11 @@ review branch.
 - Writer shutdown-then-re-enqueue race — ruled out; the item is delayed, not
   dropped.
 - **`on_session_end` signature mismatch — controller hypothesis, refuted by
-  evidence.** `server.py`'s `invoke_hook` targets the CLI plugin system; the
+  evidence.** (Note: `CLAUDE.md` states the hermes-agent checkout is gone
+  from this workstation. **That note is stale — the checkout exists at
+  `~/hermes-agent`**, and the final review pass used it directly. Earlier
+  passes had to read the deployed copy on the hermes VM instead. Worth
+  correcting in `CLAUDE.md`.) `server.py`'s `invoke_hook` targets the CLI plugin system; the
   memory provider is driven by `memory_manager.py:988`, which calls
   `provider.on_session_end(messages)` positionally. The signature is correct.
 
@@ -182,6 +186,45 @@ Caught by checking `writer.py`'s actual drop semantics rather than assuming
 them. Fixed to fingerprint **only on accepted enqueue**, and pinned by two new
 tests (`test_dropped_turn_is_not_fingerprinted`,
 `test_accepted_turn_is_fingerprinted`).
+
+### 6.2 A second regression — caught by the independent challenge, not by me
+
+The INIT-5 fix added `self._parent_session_id = kwargs.get("parent_session_id")`
+to `on_session_switch`. That was **wrong, and worse than the defect it claimed
+to fix.**
+
+The host's `on_session_switch(parent_session_id=...)` does not carry a
+delegation parent. It carries **the previous session in the same agent's
+lineage**: `hermes_cli/cli_session_mixin.py:585` passes `old_session_id` on
+`/new`, `cli_commands_mixin.py:349` the original session on `/resume` and
+`/branch`, `conversation_compression.py:1431` the boundary parent on
+compression, and `cli_session_mixin.py:903` passes an empty string on `/undo`.
+
+But the plugin uses `_parent_session_id` *exclusively* for delegation
+provenance — it flows into `conversations.parent_session_id`, which
+`migrations/002_agent_attribution.sql:74` defines as "parent-session linkage for
+delegation traceback". So the fix would have stamped a **fabricated delegation
+edge** on every turn and memory write after any `/new`, `/resume`, `/branch` or
+context compression — which fires on any long session, so continuously in
+production — and the `/undo` path would have **erased a genuine subagent's real
+delegation parent** mid-session.
+
+Worse, the defect it was meant to fix was unreachable on the primary path:
+`agent/agent_init.py:_memory_provider_init_kwargs` never passes
+`parent_session_id` to the provider at all, so the field was always `None` there
+to begin with.
+
+**Reverted.** The `_embed_warned` / `_db_warned` / `_turn_fingerprints` resets in
+the same method are correct and were kept; clearing the fingerprints is provably
+safe because the host runs `on_session_end` strictly before `on_session_switch`
+(`memory_manager.py:597-620`). A regression test now pins the contract so the
+line is not "helpfully" re-added.
+
+**Why this matters for confidence in the whole pass:** this was the one change
+in the set with no test, and it was authored by the controller rather than a
+worker. It was caught only because an independent reviewer was given an explicit
+mandate to refute the fixes, and had access to evidence the earlier passes did
+not. It is recorded here rather than quietly corrected.
 
 ---
 
@@ -212,7 +255,7 @@ then restoring.
 | Command | Result |
 |---|---|
 | `python -m pytest tests/ -q` (baseline) | 24 passed, 34 skipped |
-| `python -m pytest tests/ -q` (final) | **53 passed, 34 skipped** |
+| `python -m pytest tests/ -q` (final) | **61 passed, 35 skipped** |
 | `python -c "import pgvector, pgvector.store, pgvector.embed, pgvector.__main__"` | imports OK |
 | `bash -n scripts/install.sh` | syntax OK |
 | `yaml.safe_load(open('pgvector/plugin.yaml'))` | valid; reflects all three changes |
@@ -233,7 +276,8 @@ then restoring.
 | 1 | Repair: 2 Sonnet implementers (disjoint file ownership) + controller on `__init__.py` | 20 fixed; 2 deferred with rationale |
 | 1 | Test coverage: 1 Sonnet implementer | +29 tests |
 | 2 | Controller self-check of its own change | 1 self-introduced regression found and fixed (section 6) |
-| 2 | Opus independent adversarial challenge + fresh full sweep | recorded in the final response |
+| 2 | Opus independent adversarial challenge + fresh full sweep | **NOT READY** — 1 HIGH regression in a controller-authored fix (section 6.2), plus 6 actionable non-blocking findings |
+| 2 | Repair round 2: revert the regression, guard remaining casts, bump to 0.4.4, close test gaps | blocking finding resolved; +8 tests |
 
 No two agents ever held write access to the same file. All review workers were
 read-only; the controller assigned every edit and owned all Git state.
@@ -306,3 +350,8 @@ live-DB tests — the `replace()` rewrite is the highest-impact change and is
 currently unexecuted.
 
 **After merge:** decide XCUT-6, schedule XCUT-7, and add a minimal CI workflow.
+
+**Correct `CLAUDE.md`:** it states the hermes-agent checkout is gone from this
+workstation. It exists at `~/hermes-agent`, and having it available materially
+improved the final review pass — the blocking regression in section 6.2 was only
+provable against that source.

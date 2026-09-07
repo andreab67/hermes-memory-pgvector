@@ -236,6 +236,27 @@ def _as_bool(value: Any, default: bool) -> bool:
     return str(value).strip().lower() in ("1", "true", "yes", "on")
 
 
+def _as_int(value: Any, default: int) -> int:
+    """Coerce a config value to int, falling back to the default.
+
+    Same hazard as _as_bool: config values arrive as strings from
+    save_config(), and an empty or malformed entry must not raise on a
+    write path (invariant #4).
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return int(default)
+
+
+def _as_float(value: Any, default: float) -> float:
+    """Coerce a config value to float, falling back to the default."""
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return float(default)
+
+
 def _as_theme_list(value: Any) -> Optional[List[str]]:
     """Coerce allowed_themes into a list of theme names.
 
@@ -449,13 +470,24 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     def on_session_switch(self, new_session_id: str, **kwargs) -> None:
         self._session_id = new_session_id
-        # Same per-session reset initialize() performs: the provider instance
-        # is reused across sessions, so leaving these stale tags the new
-        # session's writes with the OLD session's delegation parent (corrupting
-        # provenance) and silences the one-time embed warning.
-        self._parent_session_id = kwargs.get("parent_session_id") or None
+        # Per-session log-signal reset, same as initialize(): the provider
+        # instance is reused across sessions, so a single embed/DB failure in
+        # an earlier session would otherwise silence the one-shot warnings for
+        # the rest of the process.
         self._embed_warned = False
+        self._db_warned = False
+        # Safe to clear here: the host runs on_session_end STRICTLY BEFORE
+        # on_session_switch (memory_manager.py:597-620), so the backstop has
+        # already consumed these.
         self._turn_fingerprints = set()
+        # NOTE: deliberately does NOT touch _parent_session_id. The host's
+        # on_session_switch(parent_session_id=...) carries the PREVIOUS session
+        # in this agent's own lineage (/new passes old_session_id, /undo passes
+        # ""), NOT a delegation parent. _parent_session_id feeds
+        # conversations.parent_session_id, which migration 002 defines as
+        # delegation traceback -- assigning lineage here would stamp a
+        # fabricated delegation edge on every write after a rotation, and the
+        # /undo path would erase a real subagent's parent.
 
     # -- System prompt + ambient recall --------------------------------------
 
@@ -1275,8 +1307,10 @@ class PgvectorMemoryProvider(MemoryProvider):
                 content,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
-                retries=int(self._config.get("embed_write_retries", 2)),
-                backoff=float(self._config.get("embed_write_backoff", 0.1)),
+                retries=_as_int(self._config.get("embed_write_retries"),
+                                DEFAULTS["embed_write_retries"]),
+                backoff=_as_float(self._config.get("embed_write_backoff"),
+                                  DEFAULTS["embed_write_backoff"]),
             )
         except EmbeddingError as exc:
             if not self._embed_warned:

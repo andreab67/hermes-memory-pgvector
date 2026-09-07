@@ -10,6 +10,12 @@ twice -- doubling the table, the embedding cost, and the rows
 recall_conversation returns for that turn. _turn_fingerprint() is the key
 that guard is keyed on; these tests lock in that it is stable per (role,
 content) and that dedup-by-set actually collapses repeats.
+
+The tests above only cover the PRODUCER side (_turn_fingerprint itself, and
+that sync_turn() only fingerprints accepted writes). The bottom section
+covers the CONSUMER side: that on_session_end() actually consults
+self._turn_fingerprints and skips a turn sync_turn() already enqueued this
+session, instead of just building the set and never reading it back.
 """
 
 from __future__ import annotations
@@ -140,3 +146,67 @@ def test_accepted_turn_is_fingerprinted():
         PgvectorMemoryProvider._turn_fingerprint("assistant", _LONG_ASSISTANT),
     }
     assert p._turn_fingerprints == expected
+
+
+# ---------------------------------------------------------------------------
+# Consumer side: on_session_end() must actually SKIP a turn already
+# fingerprinted by sync_turn(), not just let sync_turn() populate a set
+# nobody reads. Requires _delegation_enabled=True -- on_session_end() is a
+# no-op until migration 002 is applied (see pgvector/__init__.py).
+# ---------------------------------------------------------------------------
+
+class _CountingWriter:
+    """Writer stand-in that accepts every write and records each call's
+    `action`, so a test can isolate action=="turn" enqueues from the
+    action=="register_agent" enqueue on_session_end() always issues."""
+
+    def __init__(self):
+        self.actions: list = []
+
+    def enqueue(self, **kwargs) -> bool:
+        self.actions.append(kwargs.get("action"))
+        return True
+
+
+def _provider_for_session_end(writer) -> PgvectorMemoryProvider:
+    p = PgvectorMemoryProvider()
+    p._healthy = True
+    p._delegation_enabled = True  # on_session_end() no-ops otherwise
+    p._writer = writer
+    p._agent_identity = "default"
+    p._raw_identity = "default"
+    p._session_id = "sess-consumer-dedup"
+    p._turn_fingerprints = set()
+    return p
+
+
+def test_on_session_end_skips_a_turn_already_captured_by_sync_turn():
+    """The actual consumer-side contract: sync_turn() fingerprints the
+    (user, assistant) exchange as it happens; on_session_end() then replays
+    the full message list (the host calls both hooks, and calls
+    on_session_end() again on session rotation). Without on_session_end()
+    checking `fp in self._turn_fingerprints` and skipping, the same two
+    turns get enqueued a second time -- 4 action=="turn" enqueues instead of
+    2. If that skip were ever removed, this test fails: 4 != 2."""
+    writer = _CountingWriter()
+    p = _provider_for_session_end(writer)
+
+    p.sync_turn(_LONG_USER, _LONG_ASSISTANT)
+    p.on_session_end(
+        [
+            {"role": "user", "content": _LONG_USER},
+            {"role": "assistant", "content": _LONG_ASSISTANT},
+        ]
+    )
+
+    turn_calls = [a for a in writer.actions if a == "turn"]
+    assert len(turn_calls) == 2, (
+        f"expected exactly 2 action=='turn' enqueues (sync_turn's own two), "
+        f"got {len(turn_calls)} -- on_session_end() is re-enqueuing turns "
+        f"sync_turn() already fingerprinted this session"
+    )
+    # Sanity: on_session_end() does independently enqueue one
+    # action=="register_agent" every call -- not part of the dedup contract,
+    # just confirms the writer stub is actually wired into both hooks.
+    register_calls = [a for a in writer.actions if a == "register_agent"]
+    assert len(register_calls) == 1

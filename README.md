@@ -92,6 +92,18 @@ Still a storage-layer feature: **no LLM, no entity graph, no new tables or colum
 
 - **Dependency floor raised**: `psycopg[binary]>=3.3.5` (upstream bugfix release, 2026-08-31: prepared-statement invalidation on `ALTER`/`DISCARD`, DataError fixes for malformed COPY/jsonb data, client-encoding aliases). No code changes.
 
+## New in v0.4.4 — config-contract and fail-soft fixes
+
+Correctness release from a full-codebase review. No schema changes, no new migrations, no API changes.
+
+- **`allowed_themes` accepts a string again.** The config schema declared it a scalar string while `normalize_identity()` consumed it as a list of names — so a string allow-list was iterated *character by character*, every theme failed the membership test, and the whole fleet was silently routed to `default`. Governance looked configured while doing the opposite. Comma-separated strings and YAML lists both work now.
+- **Boolean toggles honour `false` again.** `embed_on_write`, `sync_turns`, `hybrid_search` and `bulk_sync_on_init` are declared by the config schema as the *strings* `"true"`/`"false"`, but were read with plain truthiness — and `bool("false")` is `True`, so turning any of them off via that path did nothing.
+- **Conversation turns are no longer written twice.** `sync_turn()` (per exchange) and `on_session_end()` (whole transcript, again on session rotation) both captured the same turns, and `conversations` has no unique constraint. `on_session_end` is now a true backstop: it skips turns already accepted by the writer, and still re-captures ones a full queue dropped.
+- **`memory` replace mirrors correctly.** `replace()` issued one bulk `UPDATE` across every substring match, colliding with `UNIQUE(agent_identity, target, content)` — so a `replace` matching two or more entries raised `UniqueViolation` and updated **zero** rows. It now updates the first match, matching the built-in tool.
+- **A dead database is no longer silent.** Worker write failures logged at `debug` only, so a Postgres restart after a healthy init discarded every durable write for the rest of the session with no operator signal. The first failure now warns. Relatedly, `system_prompt_block` no longer tells the model "Empty store" when the count query merely *failed*.
+- **`save_config` stops deleting your settings.** It replaced the whole `plugins.pgvector` block with schema-declared keys, silently dropping hand-edited ones that are read at runtime (`identity_aliases`, `embed_write_backoff`). It merges now.
+- **Fail-soft hardening** (invariant #4): `sync_turn` is wrapped, config casts are guarded, and the recall tools coerce non-string `query`/`scope`/`target` instead of raising `AttributeError` out of the hook. `hermes-pgvector install --remove` now fails closed and requires `--force` on a directory that isn't a generated shim, instead of deleting it outright.
+
 ## Multi-agent / per-minion themes
 
 Each systemd-run minion sets one header on its OpenAI client; everything else flows automatically:

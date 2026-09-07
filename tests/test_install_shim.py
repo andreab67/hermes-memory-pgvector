@@ -72,3 +72,33 @@ def test_remove_refuses_foreign_dir(tmp_path):
     (d / "__init__.py").write_text("# hand-written plugin, not a shim\n", encoding="utf-8")
     assert main(["install", "--hermes-home", str(tmp_path), "--remove"]) == 1
     assert d.exists()
+
+
+# ---------------------------------------------------------------------------
+# The actual fail-closed fix: test_remove_refuses_foreign_dir (above) only
+# exercises a dir that HAS a non-shim __init__.py -- that branch already
+# refused correctly pre-fix. The real gap was a dir with NO __init__.py at
+# all: `is_marked_shim = init_py.exists() and SHIM_MARKER in ...` must
+# short-circuit to False (fail closed) rather than treating "no __init__.py"
+# as "nothing to check" and falling through to shutil.rmtree(). These two
+# tests pin that: --remove without --force must refuse (and leave the
+# directory + its contents untouched); --remove --force must still delete it.
+# ---------------------------------------------------------------------------
+
+def test_remove_refuses_dir_with_no_init_py(tmp_path):
+    d = tmp_path / "plugins" / "pgvector"
+    d.mkdir(parents=True)
+    other = d / "notes.txt"
+    other.write_text("some unrelated file; no __init__.py present at all\n", encoding="utf-8")
+    assert main(["install", "--hermes-home", str(tmp_path), "--remove"]) == 1
+    # Fail closed: nothing should have been deleted.
+    assert d.exists()
+    assert other.exists()
+
+
+def test_remove_force_deletes_dir_with_no_init_py(tmp_path):
+    d = tmp_path / "plugins" / "pgvector"
+    d.mkdir(parents=True)
+    (d / "notes.txt").write_text("some unrelated file; no __init__.py present at all\n", encoding="utf-8")
+    assert main(["install", "--hermes-home", str(tmp_path), "--remove", "--force"]) == 0
+    assert not d.exists()

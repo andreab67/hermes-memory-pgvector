@@ -120,6 +120,37 @@ def test_remap_identity_merges_and_dedupes(store):
 
 # --- LIKE-literal substring semantics (v0.4.2) -----------------------------
 
+def test_replace_updates_single_row_when_multiple_rows_share_a_substring(store):
+    """v0.4.3 regression -- LIVE DB ONLY (needs the real UNIQUE constraint).
+
+    replace() used to be a bulk UPDATE across every row whose content
+    matched the LIKE pattern. When 2+ rows in the same (agent_identity,
+    target) share a substring, a bulk UPDATE tries to set ALL of them to the
+    identical new_content in one statement -- which collides with
+    memory_entries_unique (UNIQUE(agent_identity, target, content),
+    001_schema.sql) the instant the second row would-be-duplicate is
+    written, raising UniqueViolation and rolling back the WHOLE statement:
+    zero rows updated, an exception surfacing instead. The fix scopes the
+    UPDATE to a single first-match row via a correlated subquery
+    (`WHERE id = (SELECT id ... ORDER BY id LIMIT 1)`), matching the
+    built-in memory tool's own "first match only" replace semantics.
+
+    Only a real Postgres UNIQUE constraint can reproduce the collision a
+    mock can't, so this stays DB-gated like the rest of this file.
+    """
+    s, agent = store
+    s.add(agent_identity=agent, target="memory", content="deploy window opens at 9am UTC")
+    s.add(agent_identity=agent, target="memory", content="deploy window closes at 5pm UTC")
+
+    n = s.replace(
+        agent_identity=agent, target="memory",
+        old_text="deploy window",
+        new_content="deploy window moved to 10am UTC",
+    )
+    assert n == 1  # exactly one row updated, no UniqueViolation raised
+    assert s.count(agent_identity=agent, target="memory") == 2  # neither row was lost
+
+
 def test_replace_treats_percent_as_literal(store):
     s, agent = store
     s.add(agent_identity=agent, target="memory", content="Q3 revenue grew 15 million YoY")
