@@ -311,13 +311,13 @@ def _load_plugin_config() -> dict:
 # ---------------------------------------------------------------------------
 
 class PgvectorMemoryProvider(MemoryProvider):
+    """Postgres mirror of built-in memory entries, with semantic recall."""
+
     # Upper bound on the turn-fingerprint set. Fingerprints deliberately
     # survive session switches (see on_session_switch), so this is what keeps
     # a long-lived provider from growing without limit. ~60 fingerprints per
     # session means this holds roughly 150 sessions before a reset.
     _FINGERPRINT_CAP = 10000
-
-    """Postgres mirror of built-in memory entries, with semantic recall."""
 
     def __init__(self, config: dict | None = None):
         self._config = {**DEFAULTS, **(config or {})}
@@ -572,8 +572,10 @@ class PgvectorMemoryProvider(MemoryProvider):
             rows = self._store.search(
                 query_embedding=vec,
                 agent_identity=self._agent_identity,
-                limit=int(self._config.get("prefetch_limit", 5)),
-                min_similarity=float(self._config.get("min_similarity", 0.30)),
+                limit=_as_int(self._config.get("prefetch_limit"),
+                              DEFAULTS["prefetch_limit"]),
+                min_similarity=_as_float(self._config.get("min_similarity"),
+                                         DEFAULTS["min_similarity"]),
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("pgvector prefetch query failed: %s", exc)
@@ -648,9 +650,51 @@ class PgvectorMemoryProvider(MemoryProvider):
                 # would make on_session_end skip a turn that never landed,
                 # turning a recoverable drop into permanent data loss.
                 if accepted:
-                    self._turn_fingerprints.add(self._turn_fingerprint(role, content))
+                    self._remember_turn(self._turn_fingerprint(role, content))
         except Exception as exc:  # noqa: BLE001
             logger.debug("pgvector sync_turn failed (ignored): %s", exc)
+
+    @staticmethod
+    def _strip_skill_scaffolding(content: str) -> str:
+        """Normalize a user turn the way the host does before handing it to us.
+
+        The host calls sync_turn() with `_strip_skill_scaffolding(user_content)`
+        (agent/memory_manager.py:389 ->
+        agent.skill_commands.extract_user_instruction_from_skill_message) but
+        passes on_session_end() the RAW transcript. So a /skill turn reaches the
+        two hooks as two different strings, hashes to two different
+        fingerprints, and defeats the dedup -- it gets written twice, which is
+        the exact bug the fingerprints exist to prevent.
+
+        Guarded import, matching how this module already reaches for
+        `agent.memory_provider` / `hermes_constants`: outside hermes-agent the
+        content is simply used as-is.
+        """
+        try:
+            from agent.skill_commands import (
+                extract_user_instruction_from_skill_message as _strip,
+            )
+            return _strip(content) or content
+        except Exception:  # noqa: BLE001 -- host internals are optional
+            return content
+
+    def _remember_turn(self, fingerprint: str) -> None:
+        """Record a captured turn, enforcing the cap at the point of growth.
+
+        The cap used to be checked only in on_session_switch(). On the gateway
+        every session calls initialize() rather than on_session_switch(), and
+        initialize() deliberately does not reset the set (clearing it would
+        re-open the double-write on the compression path), so the set could
+        grow without bound there. Checking here covers every path that can
+        add to it.
+        """
+        if len(self._turn_fingerprints) >= self._FINGERPRINT_CAP:
+            logger.debug(
+                "pgvector turn-fingerprint set hit %d; resetting",
+                self._FINGERPRINT_CAP,
+            )
+            self._turn_fingerprints = set()
+        self._turn_fingerprints.add(fingerprint)
 
     @staticmethod
     def _turn_fingerprint(role: str, content: str) -> str:
@@ -786,7 +830,13 @@ class PgvectorMemoryProvider(MemoryProvider):
                     )
                     if self._is_noise(content, min_chars=min_chars):
                         continue
-                    fp = self._turn_fingerprint(role, content)
+                    # Fingerprint the NORMALIZED form for user turns, so a
+                    # /skill turn matches what sync_turn() was handed.
+                    fp_content = (
+                        self._strip_skill_scaffolding(content)
+                        if role == "user" else content
+                    )
+                    fp = self._turn_fingerprint(role, fp_content)
                     if fp in self._turn_fingerprints:
                         continue  # already enqueued by sync_turn this session
                     accepted = self._writer.enqueue(
@@ -810,7 +860,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     # on_session_end (session rotation replays the same list)
                     # skip it, turning a recoverable drop into permanent loss.
                     if accepted:
-                        self._turn_fingerprints.add(fp)
+                        self._remember_turn(fp)
         except Exception as exc:  # noqa: BLE001
             logger.debug("pgvector on_session_end failed (ignored): %s", exc)
 
@@ -1416,6 +1466,8 @@ class PgvectorMemoryProvider(MemoryProvider):
     def _maybe_embed(self, content: str) -> Optional[List[float]]:
         if not _as_bool(self._config.get("embed_on_write"), True):
             return None
+        _write_timeout = _as_float(self._config.get("embed_write_timeout"),
+                                   DEFAULTS["embed_write_timeout"])
         try:
             # This runs ONLY in the background AsyncWriter drain thread, so a
             # bounded retry here is safe (it never blocks the agent loop). The
@@ -1425,8 +1477,11 @@ class PgvectorMemoryProvider(MemoryProvider):
                 content,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
-                timeout=_as_float(self._config.get("embed_write_timeout"),
-                                  DEFAULTS["embed_write_timeout"]),
+                timeout=_write_timeout,
+                # Bound the WORST case, not just each attempt: retries x the
+                # two protocol paths would otherwise multiply a slow endpoint
+                # into minutes of drain-thread block, filling the queue.
+                max_total=_write_timeout * 2,
                 retries=_as_int(self._config.get("embed_write_retries"),
                                 DEFAULTS["embed_write_retries"]),
                 backoff=_as_float(self._config.get("embed_write_backoff"),

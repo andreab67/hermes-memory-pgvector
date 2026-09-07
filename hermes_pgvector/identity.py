@@ -48,21 +48,24 @@ _DM_RE = re.compile(
 )
 
 # Multi-party session keys (group / channel / thread). Host layout is
-# <ns>:<platform>:<chat_type>[:<chat_id>][:<thread_id>][:<user>]
-# (gateway/session.py:build_session_key), and with the default
-# group_sessions_per_user=True the TRAILING segment is the participant id --
-# a phone number on WhatsApp/SMS/Signal. So the same two failure modes the DM
-# bucket exists for apply here: PII stored as an agent_identity, and one theme
-# per (chat, participant) pair.
+# agent:<ns>:<platform>:<chat_type>[:<chat_id>][:<thread_id>][:<user>]
+# (gateway/session.py:build_session_key + _session_key_namespace, which always
+# emits the literal "agent:" prefix). With the default group_sessions_per_user
+# the TRAILING segment is the participant id -- a phone number on
+# WhatsApp/SMS/Signal -- so the same two failure modes the DM bucket exists for
+# apply here: PII stored as an agent_identity, and one theme per
+# (chat, participant) pair.
 #
-# Deliberately anchored on <platform>:<chat_type>: rather than a bare chat-type
-# token. The v0.4.2 note below explains why a loose alternative is dangerous --
-# a bare ':channel:' would sweep ordinary colon-namespaced themes like
-# 'eng:channel:alerts' into the bucket on nothing but a common word.
+# Anchored STRUCTURALLY on the agent:<ns>:<platform>: prefix rather than on an
+# enumerated platform list. An enumeration is brittle -- the host ships 26
+# platforms today (whatsapp_cloud, bluebubbles, qqbot, msgraph_webhook, ...)
+# and plugins register more -- and an earlier version of this pattern silently
+# missed every platform it did not name. It also cannot over-match ordinary
+# colon-namespaced themes like 'eng:channel:alerts' or 'ops:group:oncall',
+# which do not carry the agent:<ns>:<platform>: prefix. That over-match is the
+# trap the v0.4.2 note below records for a bare ':signal:' alternative.
 _GROUP_RE = re.compile(
-    r"(?:^|:)(?:local|telegram|discord|whatsapp|slack|signal|mattermost|matrix"
-    r"|homeassistant|email|sms|dingtalk|webhook|feishu|wecom)"
-    r":(?:group|channel|thread):",
+    r"^agent:[^:]+:[^:]+:(?:group|channel|thread)(?::|$)",
     re.IGNORECASE,
 )
 
@@ -162,6 +165,8 @@ def classify_kind(agent_identity: str) -> str:
         return "default"
     if agent_identity == DM_BUCKET:
         return "dm"
+    if agent_identity == GROUP_BUCKET:
+        return "group"
     if agent_identity == BENCH_BUCKET:
         return "bench"
     if agent_identity.startswith("agent-"):

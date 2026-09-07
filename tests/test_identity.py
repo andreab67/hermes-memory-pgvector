@@ -220,3 +220,30 @@ def test_group_pattern_does_not_sweep_ordinary_colon_themes():
         canonical, normalized, _ = normalize_identity(benign)
         assert canonical == benign, benign
         assert normalized is False
+
+
+def test_group_pattern_is_platform_agnostic():
+    """Anchored structurally on agent:<ns>:<platform>:, NOT on an enumerated
+    platform list. The host ships 26 platforms and plugins register more; an
+    earlier enumeration silently missed whatsapp_cloud, bluebubbles, qqbot,
+    msgraph_webhook and every other name it did not list."""
+    platforms = [
+        "local", "telegram", "discord", "whatsapp", "whatsapp_cloud", "slack",
+        "signal", "mattermost", "matrix", "homeassistant", "email", "sms",
+        "dingtalk", "webhook", "feishu", "wecom", "wecom_callback", "weixin",
+        "qqbot", "bluebubbles", "msgraph_webhook", "yuanbao", "relay",
+        "api_server", "plugin", "some_future_platform",
+    ]
+    for plat in platforms:
+        key = f"agent:main:{plat}:group:120363@g.us:17192714834"
+        canonical, _, reason = normalize_identity(key)
+        assert canonical == GROUP_BUCKET, f"{plat} not bucketed"
+        assert reason == "group-bucket"
+
+
+def test_group_bucket_has_its_own_registry_kind():
+    """classify_kind() tags memory_agents rows. The new PII sink must not be
+    registered as an ordinary theme, the way the other sinks are not."""
+    assert classify_kind(GROUP_BUCKET) == "group"
+    assert classify_kind(DM_BUCKET) == "dm"
+    assert classify_kind("marketing") == "theme"

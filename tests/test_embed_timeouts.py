@@ -147,3 +147,103 @@ def test_both_timeouts_are_exposed_in_the_config_schema():
     keys = {e["key"] for e in PgvectorMemoryProvider().get_config_schema()}
     assert "embed_timeout" in keys
     assert "embed_write_timeout" in keys
+
+
+# ---------------------------------------------------------------------------
+# The CLI recovery path, and the retry budget.
+# ---------------------------------------------------------------------------
+
+def test_backfill_cli_uses_the_write_timeout(monkeypatch):
+    """`hermes-pgvector backfill` is the documented repair path for rows that
+    landed with a NULL embedding. It used to pass NO timeout, so it inherited
+    embed()'s hardcoded 10s -- the very condition that produced those rows on a
+    slow endpoint, so the sweep kept failing at the one job it exists to do."""
+    import hermes_pgvector.__main__ as cli
+
+    rec = _Recorder()
+    monkeypatch.setattr(cli, "embed", rec)
+
+    class _Args:
+        dsn = embed_url = embed_model = None
+        config = None
+    fn = cli._make_embed_fn(_Args(), {"embed_write_timeout": 45.0})
+    fn("a row being re-embedded by the nightly sweep")
+    assert rec.timeouts == [45.0], f"backfill did not plumb the timeout: {rec.timeouts}"
+
+
+def test_backfill_cli_falls_back_to_the_default_timeout(monkeypatch):
+    import hermes_pgvector.__main__ as cli
+
+    rec = _Recorder()
+    monkeypatch.setattr(cli, "embed", rec)
+
+    class _Args:
+        dsn = embed_url = embed_model = None
+        config = None
+    fn = cli._make_embed_fn(_Args(), {"embed_write_timeout": "not-a-number"})
+    fn("text")
+    assert rec.timeouts == [DEFAULTS["embed_write_timeout"]]
+
+
+def test_retries_stop_at_the_total_budget():
+    """Retries exist for TRANSIENT failures, which fail fast. They must not
+    multiply a slow endpoint's per-attempt timeout into minutes of blocking:
+    each attempt can cost 2x timeout (OpenAI-compat path, then the Ollama
+    fallback), so 3 attempts x 2 paths x 30s would be 180s on the writer's
+    drain thread, filling the bounded queue and dropping writes."""
+    import time as _time
+    # NB: hermes_pgvector/__init__.py does `from .embed import embed`, which
+    # shadows the submodule attribute -- `hermes_pgvector.embed` is the
+    # FUNCTION. import_module reaches the real module via sys.modules.
+    from importlib import import_module
+    embed_mod = import_module("hermes_pgvector.embed")
+
+    attempts = {"n": 0}
+
+    def _slow_fail(text, *, base_url, model, timeout):
+        attempts["n"] += 1
+        _time.sleep(0.05)
+        raise embed_mod.EmbeddingError("endpoint is slow and failing")
+
+    orig = embed_mod._embed_once
+    embed_mod._embed_once = _slow_fail
+    try:
+        try:
+            embed_mod.embed(
+                "x", base_url="http://example.invalid", model="m",
+                timeout=1.0, retries=10, backoff=0.0, max_total=0.12,
+            )
+        except embed_mod.EmbeddingError:
+            pass
+    finally:
+        embed_mod._embed_once = orig
+
+    assert attempts["n"] < 11, "the budget must cut retries short"
+    assert attempts["n"] >= 2, "it must still retry at least once before the budget"
+
+
+def test_no_budget_means_all_retries_still_run():
+    """max_total=None preserves the old behaviour for callers that want it."""
+    # NB: hermes_pgvector/__init__.py does `from .embed import embed`, which
+    # shadows the submodule attribute -- `hermes_pgvector.embed` is the
+    # FUNCTION. import_module reaches the real module via sys.modules.
+    from importlib import import_module
+    embed_mod = import_module("hermes_pgvector.embed")
+
+    attempts = {"n": 0}
+
+    def _fail(text, *, base_url, model, timeout):
+        attempts["n"] += 1
+        raise embed_mod.EmbeddingError("nope")
+
+    orig = embed_mod._embed_once
+    embed_mod._embed_once = _fail
+    try:
+        try:
+            embed_mod.embed("x", base_url="http://example.invalid", model="m",
+                            retries=3, backoff=0.0)
+        except embed_mod.EmbeddingError:
+            pass
+    finally:
+        embed_mod._embed_once = orig
+    assert attempts["n"] == 4

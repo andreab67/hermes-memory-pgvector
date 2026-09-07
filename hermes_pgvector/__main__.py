@@ -66,9 +66,24 @@ def _make_store(args, file_cfg: dict) -> MemoryStore:
 
 
 def _make_embed_fn(args, file_cfg: dict):
+    """Embed closure for the operator CLI (backfill / bulk paths).
+
+    Uses embed_write_timeout, not embed_timeout: nothing interactive waits on a
+    nightly sweep, and this is the documented repair path for rows that landed
+    with a NULL embedding. Before v0.5.0 no timeout was passed here at all, so
+    the sweep inherited embed()'s hardcoded 10s -- which on a slow endpoint is
+    exactly the condition that produced the NULL rows in the first place, so
+    backfill kept failing at the one job it exists to do.
+    """
     base_url = _resolve(args, file_cfg, "embed_url")
     model = _resolve(args, file_cfg, "embed_model")
-    return lambda text: embed(text, base_url=base_url, model=model, retries=1)
+    try:
+        timeout = float(_resolve(args, file_cfg, "embed_write_timeout"))
+    except (TypeError, ValueError):
+        timeout = float(DEFAULTS["embed_write_timeout"])
+    return lambda text: embed(
+        text, base_url=base_url, model=model, timeout=timeout, retries=1
+    )
 
 
 # --- commands -------------------------------------------------------------
