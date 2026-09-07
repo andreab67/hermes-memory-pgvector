@@ -434,8 +434,24 @@ the fail-soft path, and land as text-only rows with NULL embeddings.
 That is by design — but it means the plugin depends heavily on the nightly
 backfill sweep to make those rows searchable again, **and that sweep is exactly
 what the `python -m pgvector` break in section 6.3 would have silently killed**.
-The two findings compound. Worth deciding whether to raise the default timeout,
-independently of this branch.
+The two findings compound.
+
+**FIXED.** Investigating it turned up a sharper defect than "the default is too
+low": `timeout` was never plumbed from config *at all* — every call site took
+embed()'s hardcoded `10.0`. And `embed_write_retries` could not compensate,
+because each attempt was capped below the latency the endpoint actually needs,
+so retrying burned the budget and failed identically.
+
+There are now two keys, deliberately asymmetric by call path:
+
+| Key | Default | Path | Why |
+|---|---|---|---|
+| `embed_timeout` | 10.0 | prefetch, recall tools, init-time bulk import | Runs on the agent thread. A timeout here degrades recall to full-text-only, which is a good outcome; making the agent wait is worse. The bulk import shares it because it blocks session start. |
+| `embed_write_timeout` | 30.0 | background writer drain | Nothing waits on it, and giving up costs a permanently unsearchable row. |
+
+Measured against the reference endpoint, three calls each: **1/3 succeeded at
+10s, 3/3 at 30s.** Ten regression tests pin the plumbing; six of them fail
+against the unplumbed code.
 
 ---
 

@@ -218,6 +218,21 @@ DEFAULTS = {
     # v0.4 — writer-path embed retries (hot path stays single-attempt)
     "embed_write_retries": 2,
     "embed_write_backoff": 0.1,
+    # v0.5.0 — embed timeouts, split by call context. Previously `timeout` was
+    # never plumbed from config at all: every caller took embed()'s hardcoded
+    # 10s. On a deployment whose endpoint answers in 6-17s (measured on the
+    # home k8s nomic-embed-text) that means a large share of writes time out,
+    # fail soft, and land with a NULL embedding -- unsearchable until the
+    # nightly backfill sweep. Retries could not rescue it, because every
+    # attempt was capped BELOW the latency the endpoint actually needs.
+    #
+    # Hot path stays short on purpose: prefetch and the recall tools run on the
+    # agent thread, and a slow query there degrades to full-text-only recall,
+    # which is a good outcome. Waiting longer would be the worse one.
+    "embed_timeout": 10.0,
+    # Writer drain only. Nothing is waiting on it, and the cost of giving up is
+    # a permanently unsearchable row, so it gets real headroom.
+    "embed_write_timeout": 30.0,
 }
 
 
@@ -545,6 +560,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                 query,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
+                timeout=self._embed_timeout(),
             )
         except EmbeddingError as exc:
             logger.debug("pgvector prefetch embed failed: %s", exc)
@@ -996,8 +1012,9 @@ class PgvectorMemoryProvider(MemoryProvider):
             return None
         base_url = self._config["embed_url"]
         model = self._config["embed_model"]
+        timeout = self._embed_timeout()
         def _fn(text: str):
-            return embed(text, base_url=base_url, model=model)
+            return embed(text, base_url=base_url, model=model, timeout=timeout)
         return _fn
 
     # -- Tool surface --------------------------------------------------------
@@ -1083,6 +1100,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                 query,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
+                timeout=self._embed_timeout(),
             )
         except EmbeddingError as exc:
             if not hybrid:
@@ -1192,6 +1210,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                 query,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
+                timeout=self._embed_timeout(),
             )
         except EmbeddingError as exc:
             if not hybrid:
@@ -1344,6 +1363,16 @@ class PgvectorMemoryProvider(MemoryProvider):
                 "default": str(DEFAULTS["ttl_days"]),
             },
             {
+                "key": "embed_timeout",
+                "description": "Seconds to wait for an embedding on the AGENT thread (prefetch, recall_memory, recall_conversation) and during the init-time bulk import. Kept short on purpose: a timeout here degrades recall to full-text-only, which beats making the agent wait. Raise it only if recall quality matters more than latency on your endpoint.",
+                "default": str(DEFAULTS["embed_timeout"]),
+            },
+            {
+                "key": "embed_write_timeout",
+                "description": "Seconds to wait for an embedding on the BACKGROUND writer path. Nothing waits on this, and giving up costs a permanently unsearchable row (recoverable only by `hermes-pgvector backfill`), so it is far more generous than embed_timeout. Raise it if your endpoint is slow: writes that time out land with a NULL embedding.",
+                "default": str(DEFAULTS["embed_write_timeout"]),
+            },
+            {
                 "key": "embed_write_retries",
                 "description": "v0.4: bounded embed retries on the background writer path ONLY (the hot path — prefetch/recall/sync — always uses a single attempt). Durable recovery of missed embeddings is the `hermes-pgvector backfill` sweep, not inline retries.",
                 "default": str(DEFAULTS["embed_write_retries"]),
@@ -1373,6 +1402,17 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     # -- Helpers -------------------------------------------------------------
 
+    def _embed_timeout(self) -> float:
+        """Timeout for embeds on the agent thread (prefetch, recall tools) and
+        on the init-time bulk import.
+
+        Deliberately NOT the writer's timeout. A slow embed here degrades
+        recall to full-text-only, which is a good outcome; blocking the agent
+        longer is a worse one. The init-time bulk import shares it because it
+        runs before the first turn and would otherwise stall session start.
+        """
+        return _as_float(self._config.get("embed_timeout"), DEFAULTS["embed_timeout"])
+
     def _maybe_embed(self, content: str) -> Optional[List[float]]:
         if not _as_bool(self._config.get("embed_on_write"), True):
             return None
@@ -1385,6 +1425,8 @@ class PgvectorMemoryProvider(MemoryProvider):
                 content,
                 base_url=self._config["embed_url"],
                 model=self._config["embed_model"],
+                timeout=_as_float(self._config.get("embed_write_timeout"),
+                                  DEFAULTS["embed_write_timeout"]),
                 retries=_as_int(self._config.get("embed_write_retries"),
                                 DEFAULTS["embed_write_retries"]),
                 backoff=_as_float(self._config.get("embed_write_backoff"),
