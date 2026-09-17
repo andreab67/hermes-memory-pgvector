@@ -5,7 +5,8 @@ Runs standalone (no hermes-agent runtime needed), so it is safe in cron:
     hermes-pgvector install  [--hermes-home ~/.hermes] [--remove] [--force]
     hermes-pgvector migrate  --admin-dsn "dbname=hermes_memory user=postgres host=/var/run/postgresql"
     hermes-pgvector stats    [--dsn ...]
-    hermes-pgvector backfill [--dsn ...] [--embed-url ...] [--batch-size 100] [--dry-run]
+    hermes-pgvector backfill [--dsn ...] [--embed-url ...] [--embed-dim 768] [--embed-protocol auto]
+                             [--embed-api-key-env NAME] [--batch-size 100] [--dry-run]
     hermes-pgvector prune    --days 90 [--dsn ...] [--execute]
     hermes-pgvector cleanup  --identities "agent:main:whatsapp:dm:17192714834,skill-bench,skill-bench-ws" [--execute]
     hermes-pgvector remap    --old hermes --new agent-hermes [--execute] [--force]
@@ -32,8 +33,8 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-from . import DEFAULTS
-from .embed import embed
+from . import DEFAULTS, _embed_dim, _embed_with_config
+from .embed import EMBED_PROTOCOLS
 from .store import MemoryStore
 
 
@@ -65,6 +66,19 @@ def _make_store(args, file_cfg: dict) -> MemoryStore:
     return MemoryStore(_resolve(args, file_cfg, "dsn"))
 
 
+_EMBED_KEYS = ("embed_url", "embed_model", "embed_dim", "embed_api_key_env", "embed_protocol")
+
+
+def _embed_config(args, file_cfg: dict) -> dict:
+    """Embed endpoint settings, each resolved CLI flag > config file > DEFAULTS.
+
+    Handed to the same _embed_with_config() helper the provider uses, so the
+    nightly sweep embeds with exactly the model, dimension, credentials and
+    protocol the running agents do.
+    """
+    return {key: _resolve(args, file_cfg, key) for key in _EMBED_KEYS}
+
+
 def _make_embed_fn(args, file_cfg: dict):
     """Embed closure for the operator CLI (backfill / bulk paths).
 
@@ -75,15 +89,12 @@ def _make_embed_fn(args, file_cfg: dict):
     exactly the condition that produced the NULL rows in the first place, so
     backfill kept failing at the one job it exists to do.
     """
-    base_url = _resolve(args, file_cfg, "embed_url")
-    model = _resolve(args, file_cfg, "embed_model")
+    cfg = _embed_config(args, file_cfg)
     try:
         timeout = float(_resolve(args, file_cfg, "embed_write_timeout"))
     except (TypeError, ValueError):
         timeout = float(DEFAULTS["embed_write_timeout"])
-    return lambda text: embed(
-        text, base_url=base_url, model=model, timeout=timeout, retries=1
-    )
+    return lambda text: _embed_with_config(text, cfg, timeout=timeout, retries=1)
 
 
 # --- commands -------------------------------------------------------------
@@ -281,7 +292,10 @@ def cmd_stats(args) -> int:
     # `remaining` counts only rows that CAN be embedded; empty/whitespace rows
     # are reported separately, because they never shrink and would otherwise
     # make this number look permanently stuck for no actionable reason.
-    nulls = store.backfill_null_embeddings(embed_fn=lambda t: [0.0] * 768, dry_run=True)
+    dim = _embed_dim(_embed_config(args, file_cfg))
+    nulls = store.backfill_null_embeddings(
+        embed_fn=lambda t: [0.0] * dim, dry_run=True, expected_dim=dim
+    )
     for table, info in nulls.items():
         line = f"  {table}: {info['remaining']} null-embedding rows (backfillable)"
         stuck = info.get("unembeddable")
@@ -307,6 +321,7 @@ def cmd_backfill(args) -> int:
     embed_fn = _make_embed_fn(args, file_cfg)
     result = store.backfill_null_embeddings(
         embed_fn=embed_fn, tables=tables, batch_size=args.batch_size, dry_run=args.dry_run,
+        expected_dim=_embed_dim(_embed_config(args, file_cfg)),
     )
     print(json.dumps(result, indent=2))
     if not args.dry_run:
@@ -408,6 +423,12 @@ def build_parser() -> argparse.ArgumentParser:
     add_common(b)
     b.add_argument("--embed-url", default=None)
     b.add_argument("--embed-model", default=None)
+    b.add_argument("--embed-dim", type=int, default=None, help="expected vector length (default: config embed_dim, else 768)")
+    b.add_argument(
+        "--embed-api-key-env", default=None,
+        help="NAME of the env var holding the embed endpoint's bearer token (not the token)",
+    )
+    b.add_argument("--embed-protocol", default=None, choices=EMBED_PROTOCOLS)
     b.add_argument("--tables", default=None, help="comma list (default: memory_entries,conversations)")
     b.add_argument("--batch-size", type=int, default=100)
     b.add_argument("--dry-run", action="store_true", help="count nulls only, embed nothing")

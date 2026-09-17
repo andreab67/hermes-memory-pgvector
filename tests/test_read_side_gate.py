@@ -59,7 +59,7 @@ class _RecordingStore:
 
 def _provider(identity: str, monkeypatch, *, hybrid: bool = True):
     # Never touch the network: the recall handlers embed the query first.
-    monkeypatch.setattr(pgvector_pkg, "embed", lambda *a, **k: [0.0] * 768)
+    monkeypatch.setattr(pgvector_pkg, "_embed_text", lambda *a, **k: [0.0] * 768)
     p = PgvectorMemoryProvider()
     p._healthy = True
     p._store = _RecordingStore()

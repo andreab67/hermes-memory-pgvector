@@ -178,6 +178,17 @@ It exists because PyPI renders a project's README **frozen at upload time**: two
 
 If you are on v0.5.1 you already have every fix in this release. If you are on **v0.5.0 or earlier, upgrade** — v0.5.1 fixed a data-loss bug where a single `memory remove` deleted a whole theme's mirrored memory.
 
+## New in v0.5.3 - configurable embedding model (dimension, auth, protocol)
+
+**Defaults are unchanged:** 768 dimensions, no `Authorization` header, `auto` protocol. No schema changes and no new migrations; a deployment that sets none of the new keys behaves as before, apart from the two fixes at the end of this list.
+
+- **The embedding dimension is configuration, not code.** `embed_dim` (default `768`) replaces the literal 768 in the response check, in the backfill dimension guard (`backfill_null_embeddings(expected_dim=...)`), and in the `stats` dry-run. The check was moved, not relaxed: a mismatch still fails fast with `expected N dims (embed_dim), got M`. Changing the value on a database that already holds vectors needs a column migration; see [Changing the embedding dimension](#changing-the-embedding-dimension).
+- **Bearer auth for hosted endpoints.** `embed_api_key_env` holds the *name* of an environment variable (for example `OPENROUTER_API_KEY`). When that variable is set and non-empty, the plugin sends `Authorization: Bearer <value>`. The value is read at call time and is never logged, stored in config, or included in exception messages. Unset or empty means no header, as before.
+- **Explicit protocol selection.** `embed_protocol: openai` uses only `/v1/embeddings`, so a 401 or an unknown-model error from a hosted endpoint is reported as-is instead of being replaced by a 404 from the Ollama-native fallback. `ollama` uses only `/api/embed`. `auto` keeps the old try-OpenAI-then-Ollama behaviour. Unknown values fall back to `auto` with a warning.
+- **One embed path.** Prefetch, both recall tools, the init-time bulk import, the writer drain and `hermes-pgvector backfill` all resolve the endpoint through one helper, so the settings apply the same way everywhere (`stats` reads the same `embed_dim`). Timeouts and retries are unchanged: one attempt on the agent thread, bounded retries on the writer. `backfill` gains `--embed-dim`, `--embed-api-key-env` and `--embed-protocol` (CLI flag > `--config` file > default).
+- **Fixed: embeds broke under hermes-agent's plugin loader.** After it runs the package, `plugins/plugin_loader.py:load_plugin_module` binds every sibling module back onto it, including `setattr(pkg, "embed", <the embed submodule>)`. That replaced the `embed` function the provider called, so every embed raised `TypeError: 'module' object is not callable`. That is not an `EmbeddingError`, so nothing degraded gracefully: prefetch and the recall tools raised out of the hook, and the writer dropped each mirrored write and captured turn outright instead of storing it text-only. Call sites now use a private alias the loader never touches. An external patch that re-binds `embed` inside `register()` is no longer needed, and does no harm if it is still present. `from hermes_pgvector import embed` still works.
+- **Fixed: a read timeout escaped as a bare `TimeoutError`.** urllib wraps errors raised while *sending* a request, but a server that accepts the connection and answers slower than the timeout raises `TimeoutError` from the response read. That slipped past every `except EmbeddingError`: on the agent thread it raised out of prefetch and the recall tools, `auto` never tried its fallback, and on the writer the retries never ran and the write was dropped instead of being stored text-only. It is now an `EmbeddingError`, like every other endpoint failure.
+
 ## Multi-agent / per-minion themes
 
 Each systemd-run minion sets one header on its OpenAI client; everything else flows automatically:
@@ -290,6 +301,9 @@ plugins:
     dsn: "dbname=hermes_memory user=hermes host=/var/run/postgresql"
     embed_url: "http://your-embed-endpoint:11434"
     embed_model: "nomic-embed-text"
+    embed_dim: 768                # v0.5.3: must match the model AND the vector(N) columns
+    embed_api_key_env: ""         # v0.5.3: NAME of an env var holding a bearer token
+    embed_protocol: "auto"        # v0.5.3: auto | openai | ollama
     prefetch_limit: 5
     min_similarity: 0.30
     embed_on_write: true
@@ -306,7 +320,58 @@ plugins:
     embed_write_retries: 2        # writer-path only; hot path stays single-attempt
 ```
 
-The embed endpoint can be any OpenAI-compatible `/v1/embeddings` or Ollama-native `/api/embed` URL that returns **768-dim vectors** (the schema is hard-coded to `vector(768)` to match `nomic-embed-text`). Use a different model only if it produces 768-dim output, or edit the migration before applying it.
+The embed endpoint can be any OpenAI-compatible `/v1/embeddings` or Ollama-native `/api/embed` URL. Its vectors must be exactly `embed_dim` long, and `embed_dim` must match the database's `vector(N)` columns. Migration 001 creates `vector(768)` to match `nomic-embed-text`, which is why 768 is the default.
+
+### Embedding endpoint keys (v0.5.3)
+
+| Key | Default | Meaning |
+|---|---|---|
+| `embed_dim` | `768` | Vector length the model returns. Every embedding is checked against it, and so is the `hermes-pgvector backfill` probe. It must equal the `vector(N)` column size: changing it on an existing database is a migration, see [below](#changing-the-embedding-dimension). |
+| `embed_api_key_env` | unset | **Name** of an environment variable holding a bearer token, e.g. `OPENROUTER_API_KEY`. Never put the token itself in config. The variable is read on every request; when it is set and non-empty the plugin sends `Authorization: Bearer <value>`, otherwise no header. |
+| `embed_protocol` | `auto` | `auto`: try `/v1/embeddings`, then fall back to `/api/embed`. `openai`: `/v1/embeddings` only, so auth and model errors surface as-is (use this for hosted OpenAI-compatible APIs). `ollama`: `/api/embed` only. Unknown values fall back to `auto` with a warning. |
+
+Example: OpenAI `text-embedding-3-small` (1536 dimensions) through OpenRouter:
+
+```yaml
+plugins:
+  pgvector:
+    embed_url: "https://openrouter.ai/api"        # the plugin appends /v1/embeddings
+    embed_model: "openai/text-embedding-3-small"
+    embed_dim: 1536
+    embed_api_key_env: "OPENROUTER_API_KEY"       # the variable's NAME, not the key
+    embed_protocol: "openai"
+```
+
+The variable has to be in the environment of every process that loads the provider (each hermes service) and of any `hermes-pgvector backfill` job. To call OpenAI directly instead, use `embed_url: "https://api.openai.com"`, `embed_model: "text-embedding-3-small"` and a variable holding an OpenAI key.
+
+### Changing the embedding dimension
+
+`embed_dim` has to agree with the columns, so switching to a model with a different output size is a migration, not a config edit. Vectors from two different models are not comparable anyway, so every row must be re-embedded. Until config and columns agree, Postgres rejects each write whose vector has the wrong length (`expected 1536 dimensions, not 768`), and the whole row is lost, not stored text-only. Stop the services first.
+
+The shipped migration files are not meant to be edited for this. As the table owner:
+
+```sql
+-- 1. With every hermes service that loads the provider stopped:
+BEGIN;
+DROP INDEX IF EXISTS ix_memory_entries_embedding_hnsw;
+DROP INDEX IF EXISTS ix_conversations_embedding_hnsw;
+ALTER TABLE memory_entries ALTER COLUMN embedding TYPE vector(1536) USING NULL::vector(1536);
+ALTER TABLE conversations  ALTER COLUMN embedding TYPE vector(1536) USING NULL::vector(1536);
+COMMIT;
+```
+
+2. Set `embed_model` and `embed_dim` (plus `embed_url`, `embed_api_key_env` and `embed_protocol` as needed), then start the services. New writes are embedded with the new model.
+3. Re-embed the existing rows, which are all NULL now: `hermes-pgvector backfill --config $HERMES_HOME/config.yaml`. Repeat until every table reports `remaining: 0`. If the endpoint does not return `embed_dim`-length vectors, the run aborts on its first probe, before touching any row, and the logged warning names both sizes.
+4. Rebuild the HNSW indexes with the shipped tuning. Building them after the backfill is faster than maintaining them during it:
+
+```sql
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_memory_entries_embedding_hnsw
+  ON memory_entries USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+CREATE INDEX CONCURRENTLY IF NOT EXISTS ix_conversations_embedding_hnsw
+  ON conversations USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);
+```
+
+Until step 3 completes, rows without a vector are reachable only through full-text recall (`hybrid_search: true`). pgvector's HNSW index supports `vector` columns of up to 2,000 dimensions. The plugin maintains only `memory_entries` and `conversations`; any other embedding columns in the same database need the same change from whatever writes them.
 
 ## Schema
 
@@ -336,6 +401,8 @@ CREATE TABLE conversations (
 ```
 
 Indexes: HNSW on each `embedding` column (m=16, ef_construction=64) plus per-agent + per-session btree timelines. Full DDL in [`hermes_pgvector/migrations/001_schema.sql`](hermes_pgvector/migrations/001_schema.sql).
+
+`vector(768)` is the size migration 001 creates. A deployment on a model with a different output size changes both columns and sets `embed_dim` to match; see [Changing the embedding dimension](#changing-the-embedding-dimension).
 
 ## Tests
 

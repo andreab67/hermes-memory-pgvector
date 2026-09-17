@@ -115,6 +115,22 @@ Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolati
 
 ---
 
+### M4.5 - Configurable embedding model + plugin-loader fix (v0.5.3) DONE
+
+The reference deployment moved its vector columns to `vector(1536)` and re-embedded with an OpenRouter-hosted OpenAI model, and the plugin could not follow through configuration: the 768-dim check was a literal in the response parser and in the backfill guard, and no `Authorization` header was ever sent. The dimension is now configuration. A mismatch still fails fast, because the check moved to config rather than being relaxed. Changing the dimension on an existing database remains a documented column migration plus a re-embed; the shipped migrations are untouched.
+
+The same release fixes embeds under hermes-agent's directory loader, which binds each sibling module back onto the package after running it. That replaced the `embed` function with the `embed` submodule, so every embed raised `TypeError`. It also fixes a read timeout escaping as a bare `TimeoutError` instead of an `EmbeddingError`.
+
+| Capability | Version |
+|---|---|
+| `embed_dim` (default 768) drives the response check, backfill `expected_dim` guard and `stats` dry-run | v0.5.3 |
+| `embed_api_key_env`: bearer token read from a named env var at call time, never logged | v0.5.3 |
+| `embed_protocol`: `auto` / `openai` (no fallback, errors surface) / `ollama` | v0.5.3 |
+| One config-driven embed helper for prefetch, recall tools, bulk import, writer drain and CLI | v0.5.3 |
+| Loader clobber of `embed` fixed natively (private alias); read timeouts become `EmbeddingError` | v0.5.3 |
+
+---
+
 ### M4.4 — Remove-path data-loss fix + backfill signal repair (v0.5.1) ✅ DONE
 
 Two defects found by reviewing the v0.5.1 candidate, one of them data-loss.

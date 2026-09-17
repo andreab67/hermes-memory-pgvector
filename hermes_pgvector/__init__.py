@@ -1,8 +1,9 @@
 """pgvector — Postgres + pgvector memory provider for hermes-agent.
 
 Mirrors hermes-agent's built-in `memory` tool entries (MEMORY.md / USER.md
-in tools/memory_tool.py) into a single Postgres table, adds 768-dim
-embeddings for semantic recall, and scopes by `agent_identity` so each
+in tools/memory_tool.py) into a single Postgres table, adds embeddings
+(768-dim by default; see embed_dim) for semantic recall, and scopes by
+`agent_identity` so each
 named agent (marketing / sales / trading / incident / …) has its own
 theme.
 
@@ -19,6 +20,9 @@ Config in $HERMES_HOME/config.yaml under plugins.pgvector:
         dsn:        "dbname=hermes_memory user=hermes host=/var/run/postgresql"
         embed_url:  "http://192.168.100.50:11434"
         embed_model: "nomic-embed-text"
+        embed_dim: 768             # must match the model AND the vector(N) columns
+        embed_api_key_env: ""      # NAME of an env var holding a bearer token
+        embed_protocol: "auto"     # 'auto' | 'openai' | 'ollama'
         prefetch_limit: 5
         min_similarity: 0.30
         embed_on_write: true
@@ -62,7 +66,17 @@ except ImportError:  # pragma: no cover
                 return default
         return cur
 
-from .embed import embed, EmbeddingError
+from .embed import EmbeddingError
+# Public re-export only (`from hermes_pgvector import embed` keeps working).
+# Code in this file must NEVER call the bare name `embed`: hermes-agent's
+# directory loader (plugins/plugin_loader.py:load_plugin_module) runs
+# `setattr(package, "embed", <the embed SUBMODULE>)` after executing this file,
+# which rebinds that global to a module object -- every `embed(...)` here then
+# raised `TypeError: 'module' object is not callable`. Call sites go through
+# _embed_with_config(), which uses the private alias below; the loader only
+# rebinds names that match a sibling file, so the alias is never clobbered.
+from .embed import embed  # noqa: F401
+from .embed import embed as _embed_text
 from .identity import (BENCH_BUCKET, DM_BUCKET, GROUP_BUCKET, classify_kind,
                        normalize_identity)
 from .store import MemoryStore
@@ -191,6 +205,17 @@ DEFAULTS = {
     "dsn": "dbname=hermes_memory user=hermes host=/var/run/postgresql connect_timeout=5",
     "embed_url": "http://192.168.100.50:11434",
     "embed_model": "nomic-embed-text",
+    # v0.5.3 -- the embedding contract is configuration, not code. Defaults
+    # reproduce the pre-0.5.3 behaviour exactly: 768 dims, no Authorization
+    # header, OpenAI-compatible path with the Ollama-native fallback.
+    # embed_dim must equal the model's output AND the vector(N) columns;
+    # changing it on an existing database needs a column migration + re-embed
+    # (see README, "Changing the embedding dimension").
+    "embed_dim": 768,
+    # NAME of an environment variable holding a bearer token (e.g.
+    # "OPENROUTER_API_KEY"), never the token itself. Read at call time.
+    "embed_api_key_env": None,
+    "embed_protocol": "auto",  # auto | openai | ollama
     "prefetch_limit": 5,
     "min_similarity": 0.30,
     "embed_on_write": True,
@@ -290,6 +315,53 @@ def _as_theme_list(value: Any) -> Optional[List[str]]:
         return list(value) or None
     except TypeError:
         return None
+
+
+def _embed_dim(config: Dict[str, Any]) -> int:
+    """embed_dim as a positive int; missing, malformed or <= 0 -> the default.
+
+    A bad value is not guessed at: the endpoint's real dimension then fails
+    the check with "expected 768 dims (embed_dim), got N", which names the key
+    to fix.
+    """
+    dim = _as_int(config.get("embed_dim"), DEFAULTS["embed_dim"])
+    return dim if dim > 0 else int(DEFAULTS["embed_dim"])
+
+
+def _embed_with_config(
+    text: str,
+    config: Dict[str, Any],
+    *,
+    timeout: float,
+    retries: int = 0,
+    backoff: float = 0.1,
+    max_total: Optional[float] = None,
+) -> List[float]:
+    """Embed `text` using the endpoint settings in `config`.
+
+    The ONE place this package requests an embedding: prefetch, both recall
+    tools, the init-time bulk import, the writer drain and the operator CLI
+    all come through here, so embed_url / embed_model / embed_dim /
+    embed_api_key_env / embed_protocol apply identically on every path.
+    Callers keep owning the timing policy -- the agent-thread paths pass
+    embed_timeout with a single attempt; the writer drain passes
+    embed_write_timeout with bounded retries (invariant #2).
+
+    Uses `_embed_text`, not the global `embed`; see the import note above.
+    """
+    key_env = config.get("embed_api_key_env")
+    return _embed_text(
+        text,
+        base_url=config.get("embed_url", DEFAULTS["embed_url"]),
+        model=config.get("embed_model", DEFAULTS["embed_model"]),
+        timeout=timeout,
+        retries=retries,
+        backoff=backoff,
+        max_total=max_total,
+        dim=_embed_dim(config),
+        api_key_env=str(key_env).strip() if key_env else None,
+        protocol=config.get("embed_protocol", DEFAULTS["embed_protocol"]),
+    )
 
 
 def _load_plugin_config() -> dict:
@@ -556,12 +628,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         if not self._healthy or not self._store or not query:
             return ""
         try:
-            vec = embed(
-                query,
-                base_url=self._config["embed_url"],
-                model=self._config["embed_model"],
-                timeout=self._embed_timeout(),
-            )
+            vec = _embed_with_config(query, self._config, timeout=self._embed_timeout())
         except EmbeddingError as exc:
             logger.debug("pgvector prefetch embed failed: %s", exc)
             return ""
@@ -1097,11 +1164,10 @@ class PgvectorMemoryProvider(MemoryProvider):
         """Return a closure over the configured embed endpoint, or None."""
         if not _as_bool(self._config.get("embed_on_write"), True):
             return None
-        base_url = self._config["embed_url"]
-        model = self._config["embed_model"]
+        config = self._config
         timeout = self._embed_timeout()
         def _fn(text: str):
-            return embed(text, base_url=base_url, model=model, timeout=timeout)
+            return _embed_with_config(text, config, timeout=timeout)
         return _fn
 
     # -- Tool surface --------------------------------------------------------
@@ -1183,12 +1249,7 @@ class PgvectorMemoryProvider(MemoryProvider):
 
         hybrid = _as_bool(self._config.get("hybrid_search"), True)
         try:
-            vec = embed(
-                query,
-                base_url=self._config["embed_url"],
-                model=self._config["embed_model"],
-                timeout=self._embed_timeout(),
-            )
+            vec = _embed_with_config(query, self._config, timeout=self._embed_timeout())
         except EmbeddingError as exc:
             if not hybrid:
                 return json.dumps({"results": [], "count": 0, "error": f"embed: {_safe_err(exc)}"})
@@ -1293,12 +1354,7 @@ class PgvectorMemoryProvider(MemoryProvider):
 
         hybrid = _as_bool(self._config.get("hybrid_search"), True)
         try:
-            vec = embed(
-                query,
-                base_url=self._config["embed_url"],
-                model=self._config["embed_model"],
-                timeout=self._embed_timeout(),
-            )
+            vec = _embed_with_config(query, self._config, timeout=self._embed_timeout())
         except EmbeddingError as exc:
             if not hybrid:
                 return json.dumps({"results": [], "count": 0, "error": f"embed: {_safe_err(exc)}"})
@@ -1374,8 +1430,24 @@ class PgvectorMemoryProvider(MemoryProvider):
             },
             {
                 "key": "embed_model",
-                "description": "Embedding model name (must return 768-dim vectors)",
+                "description": "Embedding model name (must return embed_dim-length vectors; 768 by default)",
                 "default": DEFAULTS["embed_model"],
+            },
+            {
+                "key": "embed_dim",
+                "description": "v0.5.3: vector length the embed model returns. Must also match the database's vector(N) columns (768 as created by migration 001). Changing it on an existing database requires migrating those columns and re-embedding every row -- see README, 'Changing the embedding dimension'.",
+                "default": str(DEFAULTS["embed_dim"]),
+            },
+            {
+                "key": "embed_api_key_env",
+                "description": "v0.5.3: NAME of an environment variable holding a bearer token for the embed endpoint (e.g. OPENROUTER_API_KEY) -- never the token itself. Read at call time; when the variable is set and non-empty the plugin sends 'Authorization: Bearer <value>'. Empty = no Authorization header.",
+                "default": "",
+            },
+            {
+                "key": "embed_protocol",
+                "description": "v0.5.3: 'auto' tries the OpenAI-compatible /v1/embeddings path, then falls back to Ollama-native /api/embed. 'openai' uses /v1/embeddings only, so auth and unknown-model errors surface as-is (use it for OpenRouter / OpenAI). 'ollama' uses /api/embed only. Unknown values fall back to 'auto' with a warning.",
+                "default": DEFAULTS["embed_protocol"],
+                "choices": ["auto", "openai", "ollama"],
             },
             {
                 "key": "prefetch_limit",
@@ -1508,12 +1580,11 @@ class PgvectorMemoryProvider(MemoryProvider):
         try:
             # This runs ONLY in the background AsyncWriter drain thread, so a
             # bounded retry here is safe (it never blocks the agent loop). The
-            # hot-path callers (prefetch / recall tools / sync_turn) call embed()
-            # with the default retries=0.
-            return embed(
+            # hot-path callers (prefetch / recall tools / sync_turn) call
+            # _embed_with_config() with the default retries=0.
+            return _embed_with_config(
                 content,
-                base_url=self._config["embed_url"],
-                model=self._config["embed_model"],
+                self._config,
                 timeout=_write_timeout,
                 # Bound the WORST case, not just each attempt: retries x the
                 # two protocol paths would otherwise multiply a slow endpoint

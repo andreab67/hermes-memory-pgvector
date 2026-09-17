@@ -581,8 +581,9 @@ class MemoryStore:
         entries. So initial install embeds everything; subsequent inits
         with no MD changes do zero embed calls.
 
-        embed_fn is a callable taking a string and returning a 768-dim
-        list (or raising — we catch and store text-only). Wired by the
+        embed_fn is a callable taking a string and returning a list whose
+        length matches the vector(N) columns (768 unless the deployment set
+        embed_dim), or raising -- we catch and store text-only. Wired by the
         caller so the plugin can pass its `embed()` with the configured
         base_url + model.
 
@@ -935,14 +936,16 @@ class MemoryStore:
         tables=None,
         batch_size: int = 100,
         dry_run: bool = False,
+        expected_dim: int = 768,
     ) -> Dict[str, Dict[str, Any]]:
         """Re-embed rows with embedding IS NULL in plugin-owned tables.
 
         Idempotent + resumable: re-running only touches rows still NULL.
         Fail-soft: a row whose embed fails is left NULL and retried next run
         (no inline retry storm). A dimension guard probes embed_fn first and
-        refuses to run on a model that returns != 768 dims (config drift must
-        fail fast, never write a wrong-dim vector). If the embed endpoint is
+        refuses to run on a model that returns != expected_dim dims (default
+        768; pass the deployment's embed_dim). Config drift must fail fast,
+        never write a wrong-dim vector. If the embed endpoint is
         unreachable, the run aborts cleanly (nothing to backfill right now).
 
         Rows whose content is empty or whitespace are EXCLUDED, not failed.
@@ -966,11 +969,12 @@ class MemoryStore:
                 return {t: {"processed": 0, "succeeded": 0, "failed": 0,
                             "remaining": None, "unembeddable": None,
                             "note": "embed-unavailable"} for t in tables}
-            if not isinstance(probe, list) or len(probe) != 768:
+            if not isinstance(probe, list) or len(probe) != int(expected_dim):
                 got = len(probe) if isinstance(probe, list) else type(probe).__name__
                 raise ValueError(
-                    f"embed_fn returned {got} dims, expected 768 — refusing to "
-                    "backfill (embedding-model drift would corrupt the vector column)"
+                    f"embed_fn returned {got} dims, expected {int(expected_dim)} -- "
+                    "refusing to backfill (embedding-model drift would corrupt "
+                    "the vector column)"
                 )
 
         for t in tables:

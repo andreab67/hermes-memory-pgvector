@@ -97,7 +97,7 @@ def _healthy_provider() -> PgvectorMemoryProvider:
 
 
 def test_recall_memory_coerces_non_string_scope_before_use(monkeypatch):
-    monkeypatch.setattr(pgvector_pkg, "embed", lambda *a, **k: [0.01] * 768)
+    monkeypatch.setattr(pgvector_pkg, "_embed_text", lambda *a, **k: [0.01] * 768)
     provider = _healthy_provider()
 
     # Pre-fix, this line called `(args.get("scope") or ...).strip()` directly
@@ -109,7 +109,7 @@ def test_recall_memory_coerces_non_string_scope_before_use(monkeypatch):
 
 
 def test_recall_memory_coerces_non_string_target_before_use(monkeypatch):
-    monkeypatch.setattr(pgvector_pkg, "embed", lambda *a, **k: [0.01] * 768)
+    monkeypatch.setattr(pgvector_pkg, "_embed_text", lambda *a, **k: [0.01] * 768)
     provider = _healthy_provider()
 
     result = provider.handle_tool_call("recall_memory", {"query": "x", "target": 42})
@@ -119,7 +119,7 @@ def test_recall_memory_coerces_non_string_target_before_use(monkeypatch):
 
 
 def test_recall_conversation_coerces_non_string_scope_before_use(monkeypatch):
-    monkeypatch.setattr(pgvector_pkg, "embed", lambda *a, **k: [0.01] * 768)
+    monkeypatch.setattr(pgvector_pkg, "_embed_text", lambda *a, **k: [0.01] * 768)
     provider = _healthy_provider()
 
     result = provider.handle_tool_call("recall_conversation", {"query": "x", "scope": 42})

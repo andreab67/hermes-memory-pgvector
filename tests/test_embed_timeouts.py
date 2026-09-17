@@ -47,7 +47,7 @@ class _Recorder:
 
 def _provider(monkeypatch, **config):
     rec = _Recorder()
-    monkeypatch.setattr(pgvector_pkg, "embed", rec)
+    monkeypatch.setattr(pgvector_pkg, "_embed_text", rec)
     p = PgvectorMemoryProvider(config=config or None)
     p._healthy = True
     p._agent_identity = "marketing"
@@ -161,7 +161,7 @@ def test_backfill_cli_uses_the_write_timeout(monkeypatch):
     import hermes_pgvector.__main__ as cli
 
     rec = _Recorder()
-    monkeypatch.setattr(cli, "embed", rec)
+    monkeypatch.setattr(pgvector_pkg, "_embed_text", rec)
 
     class _Args:
         dsn = embed_url = embed_model = None
@@ -175,7 +175,7 @@ def test_backfill_cli_falls_back_to_the_default_timeout(monkeypatch):
     import hermes_pgvector.__main__ as cli
 
     rec = _Recorder()
-    monkeypatch.setattr(cli, "embed", rec)
+    monkeypatch.setattr(pgvector_pkg, "_embed_text", rec)
 
     class _Args:
         dsn = embed_url = embed_model = None
@@ -200,7 +200,7 @@ def test_retries_stop_at_the_total_budget():
 
     attempts = {"n": 0}
 
-    def _slow_fail(text, *, base_url, model, timeout):
+    def _slow_fail(text, *, base_url, model, timeout, **kw):
         attempts["n"] += 1
         _time.sleep(0.05)
         raise embed_mod.EmbeddingError("endpoint is slow and failing")
@@ -232,7 +232,7 @@ def test_no_budget_means_all_retries_still_run():
 
     attempts = {"n": 0}
 
-    def _fail(text, *, base_url, model, timeout):
+    def _fail(text, *, base_url, model, timeout, **kw):
         attempts["n"] += 1
         raise embed_mod.EmbeddingError("nope")
 
