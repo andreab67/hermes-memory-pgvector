@@ -189,6 +189,10 @@ If you are on v0.5.1 you already have every fix in this release. If you are on *
 - **Fixed: embeds broke under hermes-agent's plugin loader.** After it runs the package, `plugins/plugin_loader.py:load_plugin_module` binds every sibling module back onto it, including `setattr(pkg, "embed", <the embed submodule>)`. That replaced the `embed` function the provider called, so every embed raised `TypeError: 'module' object is not callable`. That is not an `EmbeddingError`, so nothing degraded gracefully: prefetch and the recall tools raised out of the hook, and the writer dropped each mirrored write and captured turn outright instead of storing it text-only. Call sites now use a private alias the loader never touches. An external patch that re-binds `embed` inside `register()` is no longer needed, and does no harm if it is still present. `from hermes_pgvector import embed` still works.
 - **Fixed: a read timeout escaped as a bare `TimeoutError`.** urllib wraps errors raised while *sending* a request, but a server that accepts the connection and answers slower than the timeout raises `TimeoutError` from the response read. That slipped past every `except EmbeddingError`: on the agent thread it raised out of prefetch and the recall tools, `auto` never tried its fallback, and on the writer the retries never ran and the write was dropped instead of being stored text-only. It is now an `EmbeddingError`, like every other endpoint failure.
 
+## New in v0.5.4 - psycopg 3.3.6 / psycopg-pool 3.3.2 floor
+
+- **Dependency floor raised**: `psycopg[binary]>=3.3.6`, `psycopg-pool>=3.3.2` (upstream patch releases, 2026-09-18). psycopg 3.3.6: Python 3.15 support; a cancelled query no longer waits forever on an unresponsive server (needs libpq 17+); cancels the running query on `SystemExit`; interval `Column.precision` now reports `None` instead of `65535`; fixes dumping nested list subclasses as arrays; discards prepared statements on `DEALLOCATE ALL`; better guards dumping a large int to binary numeric; faster async waits. psycopg-pool 3.3.2: propagates cancellation and other base exceptions raised during a connection check -- relevant here since this package opens one shared `ConnectionPool` across the agent and async-writer threads. No code changes.
+
 ## Multi-agent / per-minion themes
 
 Each systemd-run minion sets one header on its OpenAI client; everything else flows automatically:
@@ -252,7 +256,7 @@ That:
 
 ```bash
 # Python deps
-pip install 'psycopg[binary]>=3.3.5,<4' 'psycopg-pool>=3.3.1,<4' 'PyYAML>=6.0,<7'
+pip install 'psycopg[binary]>=3.3.6,<4' 'psycopg-pool>=3.3.2,<4' 'PyYAML>=6.0,<7'
 
 # Plugin module
 mkdir -p ~/.hermes/plugins
