@@ -193,6 +193,10 @@ If you are on v0.5.1 you already have every fix in this release. If you are on *
 
 - **Dependency floor raised**: `psycopg[binary]>=3.3.6`, `psycopg-pool>=3.3.2` (upstream patch releases, 2026-09-18). psycopg 3.3.6: Python 3.15 support; a cancelled query no longer waits forever on an unresponsive server (needs libpq 17+); cancels the running query on `SystemExit`; interval `Column.precision` now reports `None` instead of `65535`; fixes dumping nested list subclasses as arrays; discards prepared statements on `DEALLOCATE ALL`; better guards dumping a large int to binary numeric; faster async waits. psycopg-pool 3.3.2: propagates cancellation and other base exceptions raised during a connection check -- relevant here since this package opens one shared `ConnectionPool` across the agent and async-writer threads. No code changes.
 
+## New in v0.5.5 - psycopg-pool 3.3.3 floor
+
+- **Dependency floor raised**: `psycopg-pool>=3.3.3` (upstream patch release, 2026-09-22). psycopg-pool 3.3.3 fixes sync pool workers terminating after 24 hours with no task to run (upstream ticket #1419) -- directly relevant here, since this package opens one long-lived shared `ConnectionPool` that can sit idle between agent turns. `psycopg[binary]>=3.3.6` is unchanged. No code changes.
+
 ## Multi-agent / per-minion themes
 
 Each systemd-run minion sets one header on its OpenAI client; everything else flows automatically:
@@ -256,7 +260,7 @@ That:
 
 ```bash
 # Python deps
-pip install 'psycopg[binary]>=3.3.6,<4' 'psycopg-pool>=3.3.2,<4' 'PyYAML>=6.0,<7'
+pip install 'psycopg[binary]>=3.3.6,<4' 'psycopg-pool>=3.3.3,<4' 'PyYAML>=6.0,<7'
 
 # Plugin module
 mkdir -p ~/.hermes/plugins

@@ -32,7 +32,7 @@ echo "==> Installing Python dependencies..."
 PIP="${PIP:-pip}"
 "$PIP" install \
     'psycopg[binary]>=3.3.6,<4' \
-    'psycopg-pool>=3.3.2,<4' \
+    'psycopg-pool>=3.3.3,<4' \
     'PyYAML>=6.0,<7'
 
 # 2. Copy plugin module
