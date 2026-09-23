@@ -115,6 +115,21 @@ Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolati
 
 ---
 
+### M4.6 - psycopg dependency floors (v0.5.4, v0.5.5) DONE
+
+Two dependency-only releases, no code changes in either. This package opens a single long-lived `ConnectionPool` shared by the agent thread and the async-writer drain thread, so upstream pool fixes land directly on its hot path.
+
+v0.5.4 (2026-09-18) raised the floors to `psycopg[binary]>=3.3.6` and `psycopg-pool>=3.3.2`: psycopg 3.3.6 adds Python 3.15 support, stops a cancelled query waiting forever on an unresponsive server (needs libpq 17+), cancels the running query on `SystemExit`, and discards prepared statements on `DEALLOCATE ALL`; psycopg-pool 3.3.2 propagates cancellation and other base exceptions raised during a connection check, so an interrupted check can no longer swallow a memory write.
+
+v0.5.5 (2026-09-23) raised `psycopg-pool` to `>=3.3.3`, which fixes sync pool workers terminating after 24 hours with no task to run (upstream ticket #1419) - the exact failure mode for a pool that sits idle between agent turns.
+
+| Capability | Version |
+|---|---|
+| Floors raised to `psycopg[binary]>=3.3.6`, `psycopg-pool>=3.3.2` | v0.5.4 |
+| Floor raised to `psycopg-pool>=3.3.3` (24h idle sync-worker fix) | v0.5.5 |
+
+---
+
 ### M4.5 - Configurable embedding model + plugin-loader fix (v0.5.3) DONE
 
 The reference deployment moved its vector columns to `vector(1536)` and re-embedded with an OpenRouter-hosted OpenAI model, and the plugin could not follow through configuration: the 768-dim check was a literal in the response parser and in the backfill guard, and no `Authorization` header was ever sent. The dimension is now configuration. A mismatch still fails fast, because the check moved to config rather than being relaxed. Changing the dimension on an existing database remains a documented column migration plus a re-embed; the shipped migrations are untouched.
