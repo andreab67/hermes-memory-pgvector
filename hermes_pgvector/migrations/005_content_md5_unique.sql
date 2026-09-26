@@ -1,0 +1,63 @@
+-- 005_content_md5_unique.sql -- v0.6.0 unique index on md5(content), replacing
+-- the raw-text UNIQUE constraint that could not hold long entries (M1).
+--
+-- Never edit 001_schema.sql / 003_hybrid_search_fts.sql. Idempotent (IF NOT
+-- EXISTS / IF EXISTS everywhere); safe to re-run. Apply once as DB admin,
+-- AFTER 001-004:
+--   sudo -u postgres psql -d hermes_memory -f 005_content_md5_unique.sql
+--
+-- ===========================================================================
+-- WHY
+-- ===========================================================================
+-- 001's UNIQUE(agent_identity, target, content) is a btree index on the raw
+-- TEXT column. A Postgres btree index tuple is capped at roughly 2704 bytes
+-- (one-third of an 8KB page, minus overhead); a memory entry whose
+-- (agent_identity, target, content) tuple exceeds that could not be inserted
+-- at all -- "index row size ... exceeds btree version 4 maximum 2704 for
+-- index ..." -- and in bulk import the raised exception aborted the rest of
+-- that file too (M1). Indexing md5(content) instead produces a fixed 32-byte
+-- value, so the index tuple size no longer depends on entry length.
+-- Duplicate-detection semantics are unchanged: two rows with the same
+-- (agent_identity, target) and IDENTICAL content still collide -- an md5
+-- collision between distinct real-world memory entries is not a practical
+-- concern for a dedupe key (as opposed to a security boundary).
+--
+-- ===========================================================================
+-- UPGRADE ORDERING -- READ BEFORE APPLYING
+-- ===========================================================================
+-- A pre-0.6.0 plugin's store.add() runs
+--   ON CONFLICT (agent_identity, target, content) DO NOTHING
+-- which names memory_entries_unique as its conflict target. Once this
+-- migration drops that constraint, any host still running a pre-0.6.0
+-- package version gets "there is no unique or exclusion constraint matching
+-- the ON CONFLICT specification" on every add(). Upgrade the
+-- hermes-memory-pgvector package on EVERY host that writes to this database
+-- BEFORE running this migration. (0.6.0's store.add() uses a bare
+-- ON CONFLICT DO NOTHING with no conflict target, so it works unchanged
+-- before and after 005 is applied.)
+--
+-- ===========================================================================
+-- LIVE-APPLY SAFETY  (no fleet downtime)
+-- ===========================================================================
+-- CREATE UNIQUE INDEX takes a SHARE lock (blocks writes, not reads) for the
+-- duration of the build; on current table sizes that is sub-second, so it is
+-- applied plain here -- this file runs in one shot by
+-- apply_migration_as_admin(), and CREATE INDEX CONCURRENTLY cannot run
+-- inside the implicit multi-statement transaction that path uses (it would
+-- raise "CREATE INDEX CONCURRENTLY cannot run inside a transaction block").
+-- The following DROP CONSTRAINT takes a brief ACCESS EXCLUSIVE lock but only
+-- rewrites catalog metadata, not the heap.
+--
+-- For a large, hot table where even the brief SHARE-lock build is
+-- unacceptable, build the replacement index CONCURRENTLY by hand first, on
+-- its own connection, outside any transaction, then re-run
+-- `hermes-pgvector migrate` (or psql -f this file): the IF NOT EXISTS guard
+-- makes the CREATE UNIQUE INDEX statement below a no-op and the migration
+-- proceeds straight to dropping the old constraint:
+--   CREATE UNIQUE INDEX CONCURRENTLY memory_entries_unique_md5
+--     ON memory_entries (agent_identity, target, md5(content));
+
+CREATE UNIQUE INDEX IF NOT EXISTS memory_entries_unique_md5
+  ON memory_entries (agent_identity, target, md5(content));
+
+ALTER TABLE memory_entries DROP CONSTRAINT IF EXISTS memory_entries_unique;

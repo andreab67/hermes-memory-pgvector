@@ -499,6 +499,10 @@ class _FakeStore:
     def __init__(self):
         self.backfill_kwargs = None
 
+    def close(self):
+        # v0.6.0 (L4): every CLI command now closes its store in `finally`.
+        pass
+
     def health(self):
         return {"ok": True}
 

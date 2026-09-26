@@ -163,32 +163,71 @@ class MemoryStore:
                         "installed package's hermes_pgvector/migrations/ directory, in order)"
                     )
 
-    def apply_migration_as_admin(self, *, admin_dsn: str, migration: str = "001_schema.sql") -> None:
+    def apply_migration_as_admin(
+        self,
+        *,
+        admin_dsn: str,
+        migration: str = "001_schema.sql",
+        runtime_role: Optional[str] = None,
+    ) -> None:
         """One-shot admin path: run a single migration with privileged creds.
 
-        Bypasses the runtime pool — opens a fresh autocommit connection
+        Bypasses the runtime pool -- opens a fresh autocommit connection
         with admin_dsn (typically `user=postgres host=/var/run/postgresql`)
         so CREATE EXTENSION + CREATE TABLE + CREATE INDEX + GRANT all succeed.
         Idempotent: every migration uses IF NOT EXISTS, so re-running on an
         already-migrated DB is a no-op. `migration` selects the file under
         migrations/ (default 001_schema.sql; v0.4.0 adds 002_agent_attribution.sql).
+
+        runtime_role (H1): when given, set on THIS connection with
+        `SELECT set_config('hermes_pgvector.runtime_role', runtime_role, false)`
+        before executing the migration file, so 002/004/005's `DO $$ ... $$`
+        GRANT blocks resolve the role to grant via `current_setting(...)`
+        instead of falling back to 'hermes'. Applied per-connection because
+        each call to this method opens its own connection (and GUCs set with
+        is_local=false are session-scoped, not persisted across connections).
+        None/omitted leaves the GUC unset, so those blocks fall back to
+        'hermes' as before.
+
+        Migration files are read and executed as raw UTF-8 BYTES, not str
+        (L10): psycopg/libpq negotiate a client_encoding matching the
+        server's encoding, and a database created with `ENCODING
+        'SQL_ASCII'` would otherwise route the text through Python's
+        'ascii' codec on send -- which fails on any non-ASCII comment
+        character (001 and 003, which this migration set can never edit,
+        still contain some). SQL_ASCII performs no server-side encoding
+        validation, so hosting the same UTF-8 bytes through it is a no-op;
+        this makes `migrate` work unmodified against such a database
+        without weakening encoding handling on a normal UTF8 one.
         """
         sql_path = Path(__file__).parent / "migrations" / migration
-        sql = sql_path.read_text(encoding="utf-8")
+        sql_bytes = sql_path.read_bytes()
         with psycopg.connect(admin_dsn, autocommit=True) as conn:
             with conn.cursor() as cur:
-                cur.execute(sql)
+                if runtime_role:
+                    cur.execute(
+                        "SELECT set_config('hermes_pgvector.runtime_role', %s, false)",
+                        (runtime_role,),
+                    )
+                cur.execute(sql_bytes)
 
-    def apply_all_migrations(self, *, admin_dsn: str) -> List[str]:
+    def apply_all_migrations(
+        self, *, admin_dsn: str, runtime_role: Optional[str] = None
+    ) -> List[str]:
         """Apply every migrations/*.sql in lexical order. Returns the names run.
 
-        Lexical order (001_, 002_, …) is the apply order. All migrations are
-        additive + idempotent, so this is safe to run repeatedly.
+        Lexical order (001_, 002_, ...) is the apply order. All migrations are
+        additive + idempotent, so this is safe to run repeatedly. runtime_role
+        (H1) is forwarded to every apply_migration_as_admin() call -- see its
+        docstring; each migration file gets its own connection, so the GUC is
+        set fresh before each one.
         """
         mig_dir = Path(__file__).parent / "migrations"
         applied: List[str] = []
         for p in sorted(mig_dir.glob("*.sql")):
-            self.apply_migration_as_admin(admin_dsn=admin_dsn, migration=p.name)
+            self.apply_migration_as_admin(
+                admin_dsn=admin_dsn, migration=p.name, runtime_role=runtime_role
+            )
             applied.append(p.name)
         return applied
 
