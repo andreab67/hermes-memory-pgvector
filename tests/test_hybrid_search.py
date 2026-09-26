@@ -67,11 +67,12 @@ def test_hybrid_fts_only_recovers_null_embedding_row(store):
     # semantic ranking can't score it — the full-text leg is what recovers it.
     s.add(agent_identity=agent, target="memory", content="incident xylophonic outage postmortem", embedding=None)
 
-    # Pure-vector search() has no `embedding IS NOT NULL` filter, so the row is
-    # still returned — but only with a NULL score (undefined cosine distance),
-    # never as a real semantic hit. The hybrid vec leg is what excludes it.
+    # Pure-vector search() now filters `embedding IS NOT NULL` (L6, v0.6.0):
+    # a NULL-embedding row has no defined cosine distance, so it is excluded
+    # entirely instead of surfacing with a meaningless NULL score. The
+    # full-text leg below is what recovers it.
     vec_rows = s.search(query_embedding=FLAT, agent_identity=agent, limit=5)
-    assert len(vec_rows) == 1 and vec_rows[0]["score"] is None
+    assert vec_rows == []
 
     # ...full-text-only hybrid (no query embedding) recovers it as a real match...
     fts_only = s.hybrid_search(query_text="xylophonic", query_embedding=None, agent_identity=agent, limit=5)
