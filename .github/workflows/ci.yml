@@ -46,7 +46,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        pg: ["16", "17"]
+        pg: ["16", "17", "18"]
     services:
       # Main cluster: has role `hermes`, hosts the migrated test database that
       # the suite and the H3/M1 repros run against.

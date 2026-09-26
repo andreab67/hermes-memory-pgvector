@@ -136,7 +136,7 @@ Tested in CI on every push/PR:
 | Component | Versions |
 |---|---|
 | Python | 3.11, 3.12, 3.13 |
-| PostgreSQL | 16, 17 |
+| PostgreSQL | 16, 17, 18 |
 | pgvector extension | `>= 0.5.0` required; CI uses the version bundled in the `pgvector/pgvector:pg1x` images |
 | hermes-agent | Conformance-tested against the pinned ref in [`conformance/HERMES_AGENT_REF`](conformance/HERMES_AGENT_REF), plus a non-blocking weekly drift check against upstream `main` |
 

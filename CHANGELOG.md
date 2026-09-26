@@ -112,7 +112,7 @@ Read all of these before upgrading. Full step-by-step procedure:
   `get_config_schema()` + `DEFAULTS` by `scripts/gen_config_doc.py`
   (`--check` verifies it is current; wired into CI).
 - **CI** (`.github/workflows/ci.yml`) — lint, unit tests on Python
-  3.11/3.12/3.13, live tests against Postgres 16/17 (with a
+  3.11/3.12/3.13, live tests against Postgres 16/17/18 (with a
   no-`hermes`-role cluster for the H1 regression test), sdist/wheel build +
   `twine check` + wheel-contents assertion, the version-consistency check,
   and the upstream conformance suite below.
