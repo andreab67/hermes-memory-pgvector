@@ -171,11 +171,14 @@ def embed(
             last_exc = exc
             if i + 1 >= attempts:
                 break
-            # Deadline, not just a per-attempt timeout. Each attempt can cost up
-            # to 2 x `timeout` (the OpenAI-compat path then the Ollama-native
-            # fallback), so retries multiply a SLOW endpoint into minutes of
-            # blocking on the caller's thread -- for the writer drain that means
-            # the bounded queue fills and starts dropping writes. Transient
+            # Deadline, not just a per-attempt timeout. Each attempt (one
+            # _embed_once() call) is itself capped at `timeout` total now
+            # (H4, v0.6.0: `auto`'s OpenAI-compat and Ollama-native paths
+            # SHARE that one deadline instead of each getting a fresh
+            # `timeout`) -- but retries still multiply it: N attempts x
+            # `timeout` is still minutes of blocking on the caller's thread
+            # for a slow endpoint, and for the writer drain that means the
+            # bounded queue fills and starts dropping writes. Transient
             # failures, which is what retries are actually for, fail fast and
             # are unaffected by this.
             if max_total is not None and (time.monotonic() - started) >= max_total:
@@ -204,8 +207,16 @@ def _embed_once(
     that path only -- no fallback, so an auth or unknown-model error from a
     hosted endpoint is reported as-is instead of being replaced by the 404 the
     other protocol's path would return.
+
+    H4 (v0.6.0): `timeout` is ONE overall deadline for this call, covering
+    BOTH HTTP attempts `auto` can make -- not a fresh full timeout for each.
+    Before this, `auto` could cost up to 2x `timeout` for a single call (the
+    OpenAI-compat path, then the Ollama-native fallback each getting the full
+    budget), which is exactly what pushed a hot-path prefetch() past the
+    host's 8s external-prefetch timeout on a slow endpoint.
     """
     protocol = normalize_protocol(protocol)
+    started = time.monotonic()
 
     # Path A: OpenAI-compatible
     if protocol in ("auto", "openai"):
@@ -227,6 +238,14 @@ def _embed_once(
             if protocol == "openai":
                 raise
             logger.debug("OpenAI-compat embed failed (%s); trying native", exc)
+            # Path B gets what's LEFT of the shared deadline, not a fresh
+            # `timeout` -- if path A already spent the whole budget, don't
+            # start path B at all (raise path A's error instead of masking it
+            # with a second attempt that has no time left to succeed).
+            remaining = timeout - (time.monotonic() - started)
+            if remaining <= 0:
+                raise
+            timeout = remaining
 
     # Path B: Ollama native
     return _post(

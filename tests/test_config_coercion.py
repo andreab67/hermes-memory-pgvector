@@ -20,7 +20,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from hermes_pgvector import _as_bool, _as_theme_list  # noqa: E402
+from hermes_pgvector import _as_alias_map, _as_bool, _as_theme_list  # noqa: E402
 from hermes_pgvector.identity import normalize_identity  # noqa: E402
 
 
@@ -110,3 +110,75 @@ def test_theme_list_from_config_string_rejects_unknown_theme():
     assert canon == "default"
     assert normalized is True
     assert reason == "not-in-allowlist"
+
+
+# ---------------------------------------------------------------------------
+# _as_alias_map (v0.6.0, config schema)
+#
+# identity_aliases is a MAPPING at runtime (DEFAULTS ships {}; a hand-edited
+# config.yaml uses a YAML mapping), but get_config_schema() types are
+# text|integer|number|boolean -- there is no mapping type -- so the schema
+# declares it as `text` in a documented "raw=canonical,raw2=canonical2"
+# form. Exactly the same string-vs-container hazard _as_theme_list guards
+# against: normalize_identity()'s `aliases` argument calls `.items()` on it,
+# so a bare string reaching it as-is would blow up (or, depending on the
+# call shape, silently fail to alias anything) instead of aliasing anything.
+# ---------------------------------------------------------------------------
+
+def test_as_alias_map_parses_comma_separated_pairs():
+    assert _as_alias_map("mkt=marketing,sales-bot=sales") == {
+        "mkt": "marketing",
+        "sales-bot": "sales",
+    }
+
+
+def test_as_alias_map_single_pair_string():
+    assert _as_alias_map("mkt=marketing") == {"mkt": "marketing"}
+
+
+def test_as_alias_map_trims_whitespace_around_pairs_and_sides():
+    assert _as_alias_map(" mkt = marketing , sales-bot = sales ") == {
+        "mkt": "marketing",
+        "sales-bot": "sales",
+    }
+
+
+def test_as_alias_map_skips_malformed_pairs():
+    # No "=" at all -> skipped, not raised; an empty side after strip -> skipped.
+    assert _as_alias_map("mkt=marketing,justatoken,=nocanonical,noraw=") == {
+        "mkt": "marketing",
+    }
+
+
+def test_as_alias_map_passes_real_dict_through():
+    assert _as_alias_map({"mkt": "marketing"}) == {"mkt": "marketing"}
+
+
+def test_as_alias_map_dict_values_are_stringified():
+    assert _as_alias_map({"mkt": "marketing", 1: 2}) == {"mkt": "marketing", "1": "2"}
+
+
+def test_as_alias_map_empty_forms_map_to_empty_dict():
+    assert _as_alias_map(None) == {}
+    assert _as_alias_map("") == {}
+    assert _as_alias_map({}) == {}
+
+
+# --- end to end: _as_alias_map feeding normalize_identity() ---------------
+
+def test_alias_map_from_config_string_remaps_identity():
+    # The exact bug end to end: a config-file `identity_aliases:
+    # "mkt=marketing"` scalar must resolve through normalize_identity() as a
+    # real alias, not blow up (or no-op) because the raw string was handed
+    # to it as-is.
+    aliases = _as_alias_map("mkt=marketing")
+    canon, normalized, reason = normalize_identity("mkt", aliases=aliases)
+    assert canon == "marketing"
+    assert normalized is True
+
+
+def test_alias_map_from_config_string_leaves_unmapped_identity_alone():
+    aliases = _as_alias_map("mkt=marketing")
+    canon, normalized, reason = normalize_identity("sales", aliases=aliases)
+    assert canon == "sales"
+    assert normalized is False

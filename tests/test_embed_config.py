@@ -460,7 +460,11 @@ def test_garbage_embed_dim_falls_back_to_the_default(bad):
 
 def test_new_keys_are_in_the_config_schema():
     schema = {e["key"]: e for e in PgvectorMemoryProvider().get_config_schema()}
-    assert schema["embed_dim"]["default"] == "768"
+    # v0.6.0 (config schema, WP-D2): every entry's `default` is now the REAL
+    # type (`type: "integer"` -> a Python int), not the string every entry
+    # used before this WP declared a `type` field at all.
+    assert schema["embed_dim"]["default"] == 768
+    assert schema["embed_dim"]["type"] == "integer"
     assert schema["embed_api_key_env"]["default"] == ""
     assert schema["embed_protocol"]["default"] == "auto"
     assert set(schema["embed_protocol"]["choices"]) == {"auto", "openai", "ollama"}
