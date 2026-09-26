@@ -189,10 +189,15 @@ cmd_up() {
     fi
     echo "$port" >"$port_file"
 
+    # PostgreSQL 18+ images keep PGDATA in a versioned subdirectory and refuse
+    # to start with a mount at the old /var/lib/postgresql/data path.
+    local data_mount="/var/lib/postgresql/data"
+    [ "$tag" = "pg18" ] && data_mount="/var/lib/postgresql"
+
     docker run -d --name "$container" \
       -e POSTGRES_PASSWORD=postgres \
       -p "127.0.0.1:${port}:5432" \
-      --tmpfs /var/lib/postgresql/data \
+      --tmpfs "$data_mount" \
       "pgvector/pgvector:${tag}" >/dev/null
 
     wait_for_postgres "$container"
