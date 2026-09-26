@@ -579,14 +579,21 @@ class PgvectorMemoryProvider(MemoryProvider):
         #   3. agent_workspace — shared workspace name from some platforms.
         #   4. agent_identity == 'default' — accept it now (no other source).
         #   5. 'default'        — last-resort bucket for unscoped traffic.
-        explicit_identity = kwargs.get("agent_identity")
+        # Only strings count as an identity source: a non-string value (a
+        # misbehaving host) is treated as absent rather than raising out of
+        # normalize_identity() (invariant #4).
+        def _ident(key: str) -> Optional[str]:
+            value = kwargs.get(key)
+            return value if isinstance(value, str) else None
+
+        explicit_identity = _ident("agent_identity")
         if explicit_identity == "default":
             explicit_identity = None  # sentinel — let header take over
         self._agent_identity = (
-            kwargs.get("gateway_session_key")
+            _ident("gateway_session_key")
             or explicit_identity
-            or kwargs.get("agent_workspace")
-            or kwargs.get("agent_identity")  # accept 'default' if nothing else set
+            or _ident("agent_workspace")
+            or _ident("agent_identity")  # accept 'default' if nothing else set
             or "default"
         )
 
@@ -1154,8 +1161,10 @@ class PgvectorMemoryProvider(MemoryProvider):
         """Parent-side capture of a subagent delegation (task -> result).
 
         Records a provenance edge (memory_agent_edges) and stores the
-        delegation as a recallable conversation turn under the parent's theme,
-        linked to the child session via parent_session_id. STRICTLY non-blocking
+        delegation as a recallable conversation turn under the parent's theme.
+        That turn's parent_session_id is the session that delegated to THIS
+        agent (or NULL); the child session id lives in
+        metadata.child_session_id and in the edge. STRICTLY non-blocking
         and fail-soft (invariants #2/#4): enqueue-only, never an inline DB/embed
         call, never raises into the agent loop. No-op until migration 002 is
         applied (self._delegation_enabled)."""
@@ -1344,7 +1353,8 @@ class PgvectorMemoryProvider(MemoryProvider):
             )
             return
 
-        meta = dict(metadata or {})
+        # A non-dict metadata (misbehaving host) is dropped, not raised (invariant #4).
+        meta = dict(metadata) if isinstance(metadata, dict) else {}
         meta.setdefault("session_id", self._session_id)
         if self._delegation_enabled and self._parent_session_id:
             meta.setdefault("parent_session_id", self._parent_session_id)
@@ -2061,8 +2071,8 @@ class PgvectorMemoryProvider(MemoryProvider):
             existing.setdefault("plugins", {})
             # Merge, don't replace: `values` only carries keys declared by
             # get_config_schema(), so a wholesale assignment silently deletes
-            # live hand-edited keys that are read at runtime but not declared
-            # (identity_aliases, embed_write_backoff).
+            # hand-edited keys the setup flow did not send (e.g. a YAML-mapping
+            # identity_aliases, or any key added by a newer version).
             current = existing["plugins"].get("pgvector") or {}
             existing["plugins"]["pgvector"] = {**current, **values}
             with open(config_path, "w", encoding="utf-8") as fh:
