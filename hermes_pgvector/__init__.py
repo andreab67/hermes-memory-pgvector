@@ -258,6 +258,19 @@ DEFAULTS = {
     # Writer drain only. Nothing is waiting on it, and the cost of giving up is
     # a permanently unsearchable row, so it gets real headroom.
     "embed_write_timeout": 30.0,
+    # v0.6.0 (M4) -- which agent_context values from initialize()'s kwargs are
+    # allowed to WRITE. Recall (prefetch, recall tools, system_prompt_block) is
+    # never gated by this -- only mutation paths. "primary" is normal
+    # interactive/API traffic; "cron" is real scheduled work; "subagent" output
+    # reaches the parent via on_delegation, not by writing directly under its
+    # own context; "flush" is a background teardown pass. Accepts a comma
+    # string (save_config()) or a YAML list; compared lowercased/stripped.
+    "write_contexts": "primary,cron",
+    # v0.6.0 (M3) -- timeout passed to the writer's shutdown() drain. Kept
+    # short: while draining, _maybe_embed() short-circuits to None (no embed
+    # endpoint call), so the drain is DB-only and fast -- rows land text-only
+    # and the nightly backfill sweep heals them later.
+    "shutdown_drain_timeout": 10.0,
 }
 
 
@@ -315,6 +328,28 @@ def _as_theme_list(value: Any) -> Optional[List[str]]:
         return list(value) or None
     except TypeError:
         return None
+
+
+def _as_write_contexts(value: Any) -> List[str]:
+    """Coerce write_contexts into a lowercased/stripped list of context names.
+
+    Same string-vs-list hazard as _as_theme_list (config arrives as a
+    save_config() comma string OR a hand-edited config.yaml YAML list), but
+    unlike allowed_themes an empty/missing/malformed value is never "off" --
+    write_contexts must always resolve to a concrete list, so this falls back
+    to DEFAULTS["write_contexts"] instead of returning None.
+    """
+    default = DEFAULTS["write_contexts"]
+    if value is None or (isinstance(value, str) and not value.strip()):
+        value = default
+    if isinstance(value, str):
+        items = [x.strip().lower() for x in value.split(",") if x.strip()]
+    else:
+        try:
+            items = [str(x).strip().lower() for x in value if str(x).strip()]
+        except TypeError:
+            items = []
+    return items or [x.strip().lower() for x in default.split(",") if x.strip()]
 
 
 def _embed_dim(config: Dict[str, Any]) -> int:
@@ -403,6 +438,15 @@ class PgvectorMemoryProvider(MemoryProvider):
         self._delegation_enabled: bool = False        # set in initialize() iff migration 002 applied
         self._embed_warned: bool = False
         self._db_warned: bool = False
+        # v0.6.0 (M4) -- agent_context gate. True until the first initialize()
+        # decides otherwise, so a provider used without initialize() (unit
+        # tests instantiate it directly) keeps writing.
+        self._agent_context: str = "primary"
+        self._writes_enabled: bool = True
+        # v0.6.0 (M3) -- set by shutdown() before draining the writer, cleared
+        # again once a fresh writer is built for a new session. While set,
+        # _maybe_embed() skips the embed endpoint so the drain is DB-only.
+        self._draining: bool = False
         # Fingerprints of turns already enqueued by sync_turn this session, so
         # on_session_end can act as a backstop without double-writing rows the
         # per-turn path already captured (conversations has no unique key).
@@ -478,6 +522,21 @@ class PgvectorMemoryProvider(MemoryProvider):
         # Parent-session linkage for delegation traceback (subagents only).
         self._parent_session_id = kwargs.get("parent_session_id") or None
 
+        # v0.6.0 (M4) -- agent_context write gate. Upstream values: primary |
+        # subagent | cron | flush (agent/agent_init.py). Recall (prefetch,
+        # recall tools, system_prompt_block) is never gated by this -- only
+        # mutation paths (on_memory_write, sync_turn, on_session_end,
+        # on_delegation, plus the bulk import + register_agent enqueue below).
+        raw_context = kwargs.get("agent_context")
+        self._agent_context = str(raw_context).strip().lower() if raw_context else "primary"
+        write_contexts = _as_write_contexts(self._config.get("write_contexts"))
+        self._writes_enabled = self._agent_context in write_contexts
+        logger.info(
+            "pgvector: agent_context=%r write_contexts=%r -> writes %s",
+            self._agent_context, write_contexts,
+            "enabled" if self._writes_enabled else "disabled",
+        )
+
         # Re-initialization guard (v0.3.1): one registered provider instance
         # can have initialize() called again for a new session — the gateway
         # reuses the registered provider rather than constructing a fresh one
@@ -515,6 +574,11 @@ class PgvectorMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             _queue_max = int(DEFAULTS["write_queue_maxsize"])
         self._writer = AsyncWriter(self._worker, maxsize=_queue_max)
+        # v0.6.0 (M3): a fresh writer means a fresh drain -- clear the flag a
+        # prior shutdown() (e.g. the re-initialization guard above, on a
+        # reused provider instance) may have left set, or every write this
+        # session would silently skip embedding.
+        self._draining = False
 
         # v0.4: agent attribution + delegation require migration 002. Probe it
         # SEPARATELY from ensure_schema() (which stays 001-only) so a v0.4 binary
@@ -531,7 +595,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     "pgvector: migration 002 not applied — agent attribution/"
                     "delegation disabled (apply 002_agent_attribution.sql to enable)"
                 )
-            else:
+            elif self._writes_enabled:
                 # Register this agent in the provenance registry (best-effort, async).
                 self._writer.enqueue(
                     action="register_agent",
@@ -550,13 +614,29 @@ class PgvectorMemoryProvider(MemoryProvider):
         # row in place alongside the new one, and recall (cosine / RRF, no
         # recency tiebreak) can surface both. `hermes-pgvector cleanup` is
         # the only remedy.
-        if self._healthy and _as_bool(self._config.get("bulk_sync_on_init"), True):
+        if (
+            self._healthy
+            and self._writes_enabled
+            and _as_bool(self._config.get("bulk_sync_on_init"), True)
+        ):
             self._bulk_sync_from_disk(kwargs.get("hermes_home"))
 
     def shutdown(self) -> None:
         # Drain the in-flight writes first so we don't drop work...
         if self._writer:
-            self._writer.shutdown(timeout=5.0)
+            # v0.6.0 (M3): set BEFORE draining. _maybe_embed() checks this and
+            # returns None without calling the embed endpoint, so the drain is
+            # DB-only and fast -- rows land text-only; the nightly backfill
+            # sweep heals them. Without this, one write mid-drain can spend up
+            # to embed_write_timeout * 2 blocking the drain thread, and
+            # shutdown_drain_timeout below abandons every write still queued
+            # behind it.
+            self._draining = True
+            timeout = _as_float(
+                self._config.get("shutdown_drain_timeout"),
+                DEFAULTS["shutdown_drain_timeout"],
+            )
+            self._writer.shutdown(timeout=timeout)
             self._writer = None
         # ...then close the pool the writer was draining into.
         if self._store:
@@ -676,6 +756,8 @@ class PgvectorMemoryProvider(MemoryProvider):
         the recall table stays high-signal.
         """
         if not self._healthy or not self._writer:
+            return
+        if not self._writes_enabled:  # v0.6.0 (M4)
             return
         if not _as_bool(self._config.get("sync_turns"), True):
             return
@@ -818,6 +900,8 @@ class PgvectorMemoryProvider(MemoryProvider):
         applied (self._delegation_enabled)."""
         if not self._healthy or not self._writer or not self._delegation_enabled:
             return
+        if not self._writes_enabled:  # v0.6.0 (M4)
+            return
         try:
             child_identity = kwargs.get("child_identity") or kwargs.get("agent_identity")
             child_session_id = kwargs.get("child_session_id") or kwargs.get("session_id")
@@ -849,7 +933,13 @@ class PgvectorMemoryProvider(MemoryProvider):
                         "role": "assistant",
                         "session_id": self._session_id or "default",
                         "embed": self._should_embed_turn("assistant", combined, policy),
-                        "parent_session_id": child_session_id,
+                        # v0.6.0 (M5): conversations.parent_session_id is the
+                        # session that DELEGATED this row (migration 002's
+                        # definition), not the child's -- the child session id
+                        # stays in metadata.child_session_id (below) and in
+                        # memory_agent_edges (the "edge" enqueue above). This
+                        # used to write child_session_id here, the reverse.
+                        "parent_session_id": self._parent_session_id,
                     },
                     metadata={"kind": "delegation", "child_session_id": child_session_id},
                 )
@@ -858,18 +948,31 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Best-effort: capture session turns + bump last_seen. Fail-soft,
-        non-blocking. No LLM summary (invariant #2). No-op until 002 applied."""
-        if not self._healthy or not self._writer or not self._delegation_enabled:
+        non-blocking. No LLM summary (invariant #2).
+
+        v0.6.0 (L9): the turn backstop below runs whenever sync_turns is on
+        and the provider is healthy with a writer -- it no longer needs
+        migration 002. Only the register_agent enqueue stays gated on
+        self._delegation_enabled (memory_agents/last_seen tracking is a 002
+        object). parent_session_id on the backstop's own writes is gated the
+        same way sync_turn() gates it: self._parent_session_id only when 002
+        is applied, else None -- writing it unconditionally would try to
+        INSERT into a column that does not exist on a pre-002 schema.
+        """
+        if not self._healthy or not self._writer:
+            return
+        if not self._writes_enabled:  # v0.6.0 (M4)
             return
         try:
-            self._writer.enqueue(
-                action="register_agent",
-                agent_identity=self._agent_identity,
-                target="memory_agents",
-                content="",
-                extra={"kind": classify_kind(self._agent_identity)},
-                metadata={},
-            )
+            if self._delegation_enabled:
+                self._writer.enqueue(
+                    action="register_agent",
+                    agent_identity=self._agent_identity,
+                    target="memory_agents",
+                    content="",
+                    extra={"kind": classify_kind(self._agent_identity)},
+                    metadata={},
+                )
             # Capture substantive user/assistant turns for conversation recall.
             # Backstop only: sync_turn() already captured this session's turns
             # per-exchange, and the host calls BOTH hooks (and calls this one
@@ -879,6 +982,7 @@ class PgvectorMemoryProvider(MemoryProvider):
             # an operator who disabled turn capture still got turns persisted.
             if messages and _as_bool(self._config.get("sync_turns"), True):
                 policy = self._config.get("conversation_embed_policy", "all")
+                psid = self._parent_session_id if self._delegation_enabled else None
                 try:
                     min_chars = int(self._config.get("turn_min_chars", 40))
                 except (TypeError, ValueError):
@@ -915,7 +1019,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                             "role": role,
                             "session_id": self._session_id or "default",
                             "embed": self._should_embed_turn(role, content, policy),
-                            "parent_session_id": self._parent_session_id,
+                            "parent_session_id": psid,
                         },
                         metadata={},
                     )
@@ -948,6 +1052,8 @@ class PgvectorMemoryProvider(MemoryProvider):
         endpoint or the DB.
         """
         if not self._healthy or not self._writer:
+            return
+        if not self._writes_enabled:  # v0.6.0 (M4)
             return
         if target not in ("memory", "user"):
             logger.debug("pgvector ignoring unsupported target: %r", target)
@@ -984,13 +1090,30 @@ class PgvectorMemoryProvider(MemoryProvider):
         if self._raw_identity != self._agent_identity:
             meta.setdefault("raw_identity", self._raw_identity)
         old_text = meta.get("old_text") or meta.get("replaces")
+        # H2 (v0.6.0): metadata["previous_content"] is the EXACT prior entry
+        # the built-in store edited under its own lock
+        # (memory_manager.notify_memory_tool_write / MemoryProvider.on_memory_write's
+        # docstring) -- not a caller hint like old_text, which "is not
+        # authoritative identity" per that same docstring. It has to reach the
+        # worker so replace()/remove() can match content = %s exactly instead
+        # of old_text's substring LIKE (which picks the lowest-id match and
+        # can hit an unrelated stale row). It must never be PERSISTED: it is
+        # the full text of a row about to be overwritten/deleted, not
+        # provenance for the new row -- so it is popped here regardless of
+        # whether it turns out to be usable below.
+        previous_content = meta.pop("previous_content", None)
+        extra: Dict[str, Any] = {}
+        if old_text:
+            extra["old_text"] = str(old_text)
+        if isinstance(previous_content, str) and previous_content.strip():
+            extra["previous_content"] = previous_content
 
         self._writer.enqueue(
             action=action,
             agent_identity=self._agent_identity,
             target=target,
             content=content,
-            extra={"old_text": str(old_text)} if old_text else {},
+            extra=extra,
             metadata=meta,
         )
 
@@ -1015,8 +1138,34 @@ class PgvectorMemoryProvider(MemoryProvider):
                 )
             elif item.action == "replace":
                 old_text = item.extra.get("old_text")
+                # H2 (v0.6.0): previous_content, when present, is the exact
+                # prior entry (from upstream's notify_memory_tool_write) --
+                # match it precisely instead of old_text's substring LIKE,
+                # which can hit a stale lower-id row that merely CONTAINS the
+                # pattern rather than the row the built-in store actually
+                # edited.
+                previous_content = item.extra.get("previous_content")
                 vec = self._maybe_embed(item.content)
-                if old_text:
+                if previous_content:
+                    n = self._store.replace(
+                        agent_identity=item.agent_identity,
+                        target=item.target,
+                        new_content=item.content,
+                        new_embedding=vec,
+                        exact_content=previous_content,
+                    )
+                    if n == 0:
+                        # Nothing matched exactly — degrade to add, same as
+                        # the old_text path below (built-in wrote the new
+                        # entry to disk; mirror it so we don't lose it).
+                        self._store.add(
+                            agent_identity=item.agent_identity,
+                            target=item.target,
+                            content=item.content,
+                            embedding=vec,
+                            metadata=item.metadata,
+                        )
+                elif old_text:
                     n = self._store.replace(
                         agent_identity=item.agent_identity,
                         target=item.target,
@@ -1035,8 +1184,8 @@ class PgvectorMemoryProvider(MemoryProvider):
                             metadata=item.metadata,
                         )
                 else:
-                    # No old_text in metadata → can't locate prior row;
-                    # add the new content so we don't lose it.
+                    # No old_text/previous_content in metadata → can't locate
+                    # prior row; add the new content so we don't lose it.
                     self._store.add(
                         agent_identity=item.agent_identity,
                         target=item.target,
@@ -1045,27 +1194,47 @@ class PgvectorMemoryProvider(MemoryProvider):
                         metadata=item.metadata,
                     )
             elif item.action == "remove":
-                # The removal target lives in extra["old_text"], NOT in content.
-                # The built-in tool's remove op takes old_text and leaves content
-                # empty (tools/memory_tool.py: remove -> store.remove(target,
-                # old_text)), and the host forwards old_text via METADATA
-                # (memory_manager.notify_memory_tool_write). Reading item.content
-                # here meant remove() was called with "", which becomes
-                # `content LIKE '%%'` -- matching every row and deleting the
-                # entire mirror for that (agent_identity, target).
-                old_text = item.extra.get("old_text") or item.content
-                if not (old_text or "").strip():
-                    logger.warning(
-                        "pgvector refusing remove with no old_text for %s/%s "
-                        "(would match every row)",
-                        item.agent_identity, item.target,
-                    )
-                else:
-                    self._store.remove(
+                # H2 (v0.6.0): previous_content, when present, is the exact
+                # prior entry -- match it precisely and never fall back to
+                # old_text/LIKE if it matches nothing (a caller that has the
+                # exact text and still gets no match has the wrong row
+                # identity, not an ambiguous pattern to widen).
+                previous_content = item.extra.get("previous_content")
+                if previous_content:
+                    n = self._store.remove(
                         agent_identity=item.agent_identity,
                         target=item.target,
-                        old_text=old_text,
+                        exact_content=previous_content,
                     )
+                    if n == 0:
+                        logger.debug(
+                            "pgvector remove: previous_content matched no row "
+                            "for %s/%s (not falling back to old_text/LIKE)",
+                            item.agent_identity, item.target,
+                        )
+                else:
+                    # The removal target lives in extra["old_text"], NOT in
+                    # content. The built-in tool's remove op takes old_text and
+                    # leaves content empty (tools/memory_tool.py: remove ->
+                    # store.remove(target, old_text)), and the host forwards
+                    # old_text via METADATA (memory_manager.notify_memory_tool_write).
+                    # Reading item.content here meant remove() was called with
+                    # "", which becomes `content LIKE '%%'` -- matching every
+                    # row and deleting the entire mirror for that
+                    # (agent_identity, target).
+                    old_text = item.extra.get("old_text") or item.content
+                    if not (old_text or "").strip():
+                        logger.warning(
+                            "pgvector refusing remove with no old_text for %s/%s "
+                            "(would match every row)",
+                            item.agent_identity, item.target,
+                        )
+                    else:
+                        self._store.remove(
+                            agent_identity=item.agent_identity,
+                            target=item.target,
+                            old_text=old_text,
+                        )
             elif item.action == "turn":
                 role = item.extra.get("role") or "user"
                 sid = item.extra.get("session_id") or "default"
@@ -1574,6 +1743,14 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     def _maybe_embed(self, content: str) -> Optional[List[float]]:
         if not _as_bool(self._config.get("embed_on_write"), True):
+            return None
+        if self._draining:
+            # v0.6.0 (M3): shutdown() is draining the writer queue -- skip the
+            # embed endpoint entirely so the drain is DB-only and fast. Rows
+            # land text-only (embedding=NULL); `hermes-pgvector backfill`
+            # heals them later. Deliberately checked here (not just in
+            # shutdown()) so every _worker call site that embeds is covered
+            # by one guard.
             return None
         _write_timeout = _as_float(self._config.get("embed_write_timeout"),
                                    DEFAULTS["embed_write_timeout"])
