@@ -119,7 +119,8 @@ Convention: lowercase, dash-separated, stable (identities are case-folded automa
 
 ## Compatibility policy
 
-This plugin follows semantic versioning on its **public surface**:
+This plugin follows semantic versioning on its **public surface**, stable as
+of `1.0.0`:
 
 - `plugins.pgvector.*` config keys (see [docs/configuration.md](docs/configuration.md))
 - Tool names and parameters (`recall_memory`, `recall_conversation`)
@@ -127,7 +128,11 @@ This plugin follows semantic versioning on its **public surface**:
 - Database table/column names
 - The `pgvector` provider name and the package's pip entry point
 
-`MemoryStore` and every other Python class/module are **internal** — not covered by semver, safe to change between minor releases. A migration file, once released, is never edited in place; schema changes land as a new numbered migration.
+Within the `1.x` series this surface is guaranteed stable: it may grow (new
+config keys, new optional params), but nothing already listed is renamed or
+removed, and no default changes behaviour, without a `2.0` release.
+
+`MemoryStore` and every other Python class/module are **internal** — not covered by semver, safe to change between minor releases, and excluded from the `1.x` guarantee above. A migration file, once released, is never edited in place; schema changes land as a new numbered migration.
 
 ## Support matrix
 
