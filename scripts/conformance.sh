@@ -41,7 +41,7 @@ if [ $# -gt 0 ] && [[ "$1" != -* ]]; then
     shift
 fi
 if [ -z "$REF" ]; then
-    REF="$(cat "$CONFORMANCE_DIR/HERMES_AGENT_REF")"
+    REF="$(tr -d "[:space:]" < "$CONFORMANCE_DIR/HERMES_AGENT_REF")"  # CRLF-safe
 fi
 
 echo "==> hermes-memory-pgvector conformance harness"

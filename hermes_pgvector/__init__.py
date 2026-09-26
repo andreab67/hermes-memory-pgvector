@@ -1002,8 +1002,15 @@ class PgvectorMemoryProvider(MemoryProvider):
         assistant_content: str,
         *,
         session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+        turn_author: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> None:
         """Persist a (user, assistant) turn pair to the conversations table.
+
+        Accepts the upstream signature's `messages` / `turn_author` (and any
+        later keyword) so the host never has to strip them; they are unused
+        here -- the turn pair itself is what gets captured.
 
         Non-blocking — enqueues writes; the async writer drains, embeds,
         and INSERTs. Boilerplate / very short turns are filtered out so
