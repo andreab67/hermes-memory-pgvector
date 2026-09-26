@@ -18,7 +18,6 @@ from __future__ import annotations
 
 import os
 import secrets
-import subprocess
 import sys
 from pathlib import Path
 
@@ -297,30 +296,14 @@ def test_upgrade_from_v055_is_a_noop_except_005(scratch_db):
 
 
 def _v055_migration_texts():
-    try:
-        listing = subprocess.run(
-            ["git", "show", "v0.5.5:hermes_pgvector/migrations"],
-            cwd=REPO_ROOT, capture_output=True, text=True, timeout=30,
-        )
-    except (OSError, subprocess.SubprocessError):
+    """The v0.5.5 migration set, vendored verbatim under tests/fixtures/
+    (from `git show v0.5.5:hermes_pgvector/migrations/...`) so this test does
+    not depend on tags being present in the checkout (CI clones shallow)."""
+    fixture_dir = Path(__file__).resolve().parent / "fixtures" / "migrations_v055"
+    files = sorted(fixture_dir.glob("*.sql"))
+    if not files:
         return None
-    if listing.returncode != 0:
-        return None
-    names = sorted(
-        line.strip() for line in listing.stdout.splitlines() if line.strip().endswith(".sql")
-    )
-    if not names:
-        return None
-    out = []
-    for name in names:
-        proc = subprocess.run(
-            ["git", "show", f"v0.5.5:hermes_pgvector/migrations/{name}"],
-            cwd=REPO_ROOT, capture_output=True, text=True, timeout=30,
-        )
-        if proc.returncode != 0:
-            return None
-        out.append((name, proc.stdout))
-    return out
+    return [(f.name, f.read_text(encoding="utf-8")) for f in files]
 
 
 # --- L4: backfill exit codes + every command closes its store -------------
