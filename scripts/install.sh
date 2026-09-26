@@ -10,11 +10,14 @@
 #   ./scripts/install.sh                # uses $HERMES_HOME or ~/.hermes
 #   HERMES_HOME=/opt/hermes/.hermes ./scripts/install.sh
 #
-# After install, apply the schema migration as DB superuser and activate:
-#   sudo -u postgres psql -d <db> -f $HERMES_HOME/plugins/pgvector/migrations/001_schema.sql
+# After install, apply ALL migrations as DB superuser and activate:
+#   python -m hermes_pgvector migrate --admin-dsn "dbname=<db> user=postgres host=/var/run/postgresql"
 #   hermes config set memory.provider pgvector
 #   sudo systemctl restart hermes.service
 #   hermes memory status   # expect: Provider: pgvector; Status: available
+#
+# See docs/operations.md for the full migrate/backfill/prune/cleanup/remap
+# reference and docs/upgrading.md for version-to-version upgrade steps.
 
 set -euo pipefail
 
@@ -60,12 +63,15 @@ This script remains the from-clone alternative.
 
 Next steps (admin once):
   1. Apply ALL migrations (schema + attribution + FTS indexes + runtime
-     grants) in one shot — from the repo root:
+     grants + md5 unique index) in one shot — from the repo root:
        python -m hermes_pgvector migrate --admin-dsn \\
            "dbname=<your-memory-db> user=postgres host=/var/run/postgresql"
-     (or apply migrations/00*.sql in lexical order with psql -f; migration
-      004 grants the runtime 'hermes' role DML on the 001 tables — no manual
-      OWNER transfer needed anymore)
+     Add --runtime-role NAME if your runtime role is not 'hermes' (default
+     migrations 002/004/005 grant DML to 'hermes'; a role that does not
+     exist yet gets a NOTICE, never a failed migration — grant manually in
+     that case). Or apply migrations/00*.sql in lexical order with psql -f;
+     migration 004 grants the runtime role DML on the 001 tables — no
+     manual OWNER transfer needed anymore.
 
   2. Activate the provider:
        hermes config set memory.provider pgvector
@@ -75,6 +81,7 @@ Next steps (admin once):
        hermes memory status
        # expect: Provider: pgvector; Status: available
 
-See $REPO_ROOT/README.md for the full operator docs, config knobs, and
-multi-agent setup (per-minion X-Hermes-Session-Key themes).
+See $REPO_ROOT/README.md for config knobs and multi-agent setup (per-minion
+X-Hermes-Session-Key themes), and $REPO_ROOT/docs/ for the full operator
+docs (operations.md, scaling.md, troubleshooting.md, upgrading.md).
 EOF

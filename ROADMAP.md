@@ -8,11 +8,13 @@ The plugin is built around a clear separation of concerns:
 - The **storage backbone** moves from per-host markdown files to a centralized Postgres table that every minion can read from and write to.
 - The **scoping mechanism** (`agent_identity`) keeps each minion's working memory clean while still allowing explicit cross-theme recall when an agent needs the bigger picture.
 
+See [CHANGELOG.md](CHANGELOG.md) for the version-by-version detail behind every milestone below.
+
 ---
 
 ## Milestones
 
-### M1 — Shared storage with per-agent themes (v0.1 → v0.1.1) ✅ DONE
+### M1 — Shared storage with per-agent themes (v0.1 → v0.1.1) — DONE
 
 **Goal:** every minion's `memory(action='add', …)` write lands in a single Postgres table with semantic search on top, scoped so marketing's notes don't pollute trading's recall.
 
@@ -32,7 +34,7 @@ The plugin is built around a clear separation of concerns:
 
 ---
 
-### M2 — Conversation-history substrate (v0.2) ✅ DONE
+### M2 — Conversation-history substrate (v0.2) — DONE
 
 **Goal:** every substantive chat turn across every minion becomes semantically searchable. Filter the boilerplate (`"ok"`, `"thanks"`, sub-40-char turns) so recall stays high-signal.
 
@@ -49,48 +51,45 @@ The plugin is built around a clear separation of concerns:
 
 ---
 
-### M3 — Identity propagation for stateless API minions (v0.3) ✅ DONE
+### M3 — Identity propagation for stateless API minions (v0.3) — DONE
 
-**Problem solved:** before v0.3, every systemd-run minion (`marketing-daily.py`, `sales-daily.py`, intraday workers, morning-report enrich) hit the gateway via `POST /v1/chat/completions` and the gateway forwarded a `gateway_session_key` kwarg (from the built-in `X-Hermes-Session-Key` header), but the pgvector plugin didn't consume it — every API-routed write collapsed to `agent_identity='default'`. The per-theme isolation promised in M1 was theoretical for fleet-style use.
+**Problem solved:** before v0.3, every systemd-run minion hit the gateway via `POST /v1/chat/completions` and the gateway forwarded a `gateway_session_key` kwarg (from the built-in `X-Hermes-Session-Key` header), but the pgvector plugin didn't consume it — every API-routed write collapsed to `agent_identity='default'`. The per-theme isolation promised in M1 was theoretical for fleet-style use.
 
 | Capability | Version |
 |---|---|
-| Plugin reads `kwargs.get('gateway_session_key')` in the `agent_identity` fallback chain | v0.3.0 ✅ |
-| Each minion sets `default_headers={'X-Hermes-Session-Key': '<theme>'}` on its OpenAI client | v0.3.0 ✅ |
-| `intraday_loop._get_client_for(agent_name)` per-agent client cache so `intraday-trading`, `intraday-sre`, `intraday-marketing`, etc. are each scoped | v0.3.0 ✅ |
-| Optional: per-theme allow-list in plugin config so a typo'd header can't silently create a new theme | v0.3.1 ⏳ |
+| Plugin reads `kwargs.get('gateway_session_key')` in the `agent_identity` fallback chain | v0.3.0 |
+| Each minion sets `default_headers={'X-Hermes-Session-Key': '<theme>'}` on its OpenAI client | v0.3.0 |
+| Per-theme allow-list in plugin config (`allowed_themes`) so a typo'd header can't silently create a new theme | v0.4.0 |
 
-**Theme naming convention:** lowercase, dash-separated, stable. Established themes:
+**Theme naming convention:** lowercase, dash-separated, stable (case-folded automatically since v0.6.0 — see M7 below). Established themes:
 
-- `marketing` — `scripts/marketing-daily.py`, `scripts/marketing/content-factory.py`
-- `sales` — `scripts/sales-daily.py`
-- `morning-report` — `scripts/morning-report/enrich.py`
-- `intraday-{agent_name}` — every `scripts/agents/agent-*-worker.py` via `intraday_loop.run(agent_name=…)`. Concretely: `intraday-trading`, `intraday-sre`, `intraday-marketing`, `intraday-gitlab`, `intraday-cloud`, `intraday-hermes`.
-- `incident` — reserved for incident-responder (Phase 1 observe-only today, will activate when its Phase 2 ships LLM hypothesis-forming)
-- `default` — last-resort bucket for interactive `hermes chat` without `--profile` or any caller that doesn't set the header
+- product/report themes: `marketing`, `sales`, `morning-report`
+- per-worker minions: `agent-trading`, `agent-sre`, `agent-marketing`, `agent-gitlab`, `agent-cloud`, `agent-hermes`
+- `incident` — reserved for incident-responder use
+- governed sinks (v0.4): `whatsapp-dm` (collapsed DM/session keys), `external-group` (collapsed group/channel/thread keys, v0.5.0), `_bench` (benchmark traffic), `default` (last resort)
 
 **Why this matters for multi-agent deployments:** v0.3 is the smallest change that makes the M1 design true in practice. Without it, a marketing-daily run could surface a trading-agent's notes in its recall, defeating the isolation. With it, each minion has its own memory pool by default while still being able to ask cross-theme questions through `recall_memory(scope='all')`.
 
 ---
 
-### M4 — Identity governance + agent-of-agents observability (v0.4.0) ✅ DONE
+### M4 — Identity governance + agent-of-agents observability (v0.4.0) — DONE
 
-Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolation, allow-list), an embedding backfill sweep + writer retry, conversation TTL/embed-policy, and the `python -m pgvector` maintenance CLI. `on_delegation` + `on_session_end` capture parent→child delegations into `memory_agents` / `memory_agent_edges` (provenance only). A dedicated `recall_delegation` tool was **deferred** — delegations are stored as conversation turns and surface through the existing `recall_conversation` tool, so a separate tool wasn't needed to ship the capability.
+Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolation, allow-list — the M3 allow-list row above shipped here, not in a separate v0.3.1), an embedding backfill sweep + writer retry, conversation TTL/embed-policy, and the `hermes-pgvector` maintenance CLI (`python -m pgvector` at the time; the CLI/import were renamed in v0.5.0 — see M4.3). `on_delegation` + `on_session_end` capture parent→child delegations into `memory_agents` / `memory_agent_edges` (provenance only).
 
 **Goal:** when one minion delegates to another (subagent pattern), capture the task/result pair so the parent can recall "what did I ask my research subagent last week and what did it find."
 
 | Capability | Version |
 |---|---|
-| `on_delegation(task, result, child_session_id)` hook → row in `conversations` (or a separate `delegations` table) | v0.4.0 |
-| `on_session_end(messages)` hook → optional session summary row, agent-decided | v0.4.0 |
-| `recall_delegation(query, scope, limit)` tool — surfaces past delegation transcripts | v0.4.0 |
-| Parent ↔ child session linkage in metadata for traceback | v0.4.0 |
+| `on_delegation(task, result, child_session_id)` hook → row in `conversations` | v0.4.0 |
+| `on_session_end(messages)` hook → turn-capture backstop | v0.4.0 |
+| Parent ↔ child session linkage (`memory_agent_edges`, `conversations.parent_session_id`) for traceback | v0.4.0 |
+| `recall_delegation` tool — **deferred, not shipped.** Delegations are stored as ordinary conversation turns (`[delegation] task: … result: …`) and surface through the existing `recall_conversation` tool, so a dedicated tool was not needed to ship the capability. Not on the roadmap going forward. | — |
 
 **Why this matters for multi-agent deployments:** orchestrator patterns (one supervisor minion fanning out to N specialists) become much more reviewable when delegations are first-class durable records. Without this, the only place the supervisor remembers a delegation is the immediate conversation context, which compresses away.
 
 ---
 
-### M4.1 — Hybrid recall: vector + full-text (v0.4.1) ✅ DONE
+### M4.1 — Hybrid recall: vector + full-text (v0.4.1) — DONE
 
 `recall_memory` / `recall_conversation` fuse the HNSW cosine ranking with a Postgres full-text ranking via **Reciprocal Rank Fusion** (`k=60`). Recovers exact-lexical hits that pure cosine smooths away (error codes, hostnames, flags, rare identifiers) and text-only rows with a `NULL` embedding that the vector index can't see. Migration `003` adds a GIN index over the existing `content` column — **no new tables, columns, or LLM** (stays inside invariant #1: a second index over the same text, not a parallel ontology). Fail-soft: degrades to pure vector on a hybrid error, and to full-text-only when the query itself fails to embed. Toggle via `plugins.pgvector.hybrid_search` (default on); ambient `prefetch()` stays pure-vector.
 
@@ -103,9 +102,9 @@ Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolati
 
 ---
 
-### M4.2 — Pip-native install + review hardening (v0.4.2) ✅ DONE
+### M4.2 — Pip-native install + review hardening (v0.4.2) — DONE
 
-`pip install hermes-memory-pgvector` + `hermes-pgvector install` is now a complete deployment on any hermes-agent host: the new `install` subcommand generates a `$HERMES_HOME/plugins/pgvector/` discovery shim (hermes-agent scans plugin directories only — never site-packages — so pip alone was invisible to it), and migration `004` grants the runtime role DML on the core tables so `migrate` alone yields a working install. Plus a full-codebase review's fixes: LIKE-literal `replace`/`remove` matching, drain-on-shutdown writer, unmasked dimension-mismatch errors, tightened DM-key regex, bulk-import circuit breaker, remap guard under lock, credential-redacted tool errors, preserved `score: null` + `rrf_score` for hybrid hits.
+`pip install hermes-memory-pgvector` + `hermes-pgvector install` is now a complete deployment on any hermes-agent host: the `install` subcommand generates a `$HERMES_HOME/plugins/pgvector/` discovery shim (hermes-agent scans plugin directories only — never site-packages — so pip alone was invisible to it), and migration `004` grants the runtime role DML on the core tables so `migrate` alone yields a working install. Plus a full-codebase review's fixes: LIKE-literal `replace`/`remove` matching, drain-on-shutdown writer, unmasked dimension-mismatch errors, tightened DM-key regex, bulk-import circuit breaker, remap guard under lock, credential-redacted tool errors, preserved `score: null` + `rrf_score` for hybrid hits.
 
 | Capability | Version |
 |---|---|
@@ -115,26 +114,44 @@ Shipped in v0.4.0 alongside identity governance (DM/PII bucketing, bench isolati
 
 ---
 
-### M4.6 - psycopg dependency floors (v0.5.4, v0.5.5) DONE
+### M4.3 — Import rename + read-side identity gate (v0.5.0) — DONE
 
-Two dependency-only releases, no code changes in either. This package opens a single long-lived `ConnectionPool` shared by the agent thread and the async-writer drain thread, so upstream pool fixes land directly on its hot path.
+Two findings from an earlier full-codebase review that could not be fixed without a breaking change or a public-behaviour change, so they were split out of the v0.4.x line.
 
-v0.5.4 (2026-09-18) raised the floors to `psycopg[binary]>=3.3.6` and `psycopg-pool>=3.3.2`: psycopg 3.3.6 adds Python 3.15 support, stops a cancelled query waiting forever on an unresponsive server (needs libpq 17+), cancels the running query on `SystemExit`, and discards prepared statements on `DEALLOCATE ALL`; psycopg-pool 3.3.2 propagates cancellation and other base exceptions raised during a connection check, so an interrupted check can no longer swallow a memory write.
+The import package moved `pgvector` → `hermes_pgvector` (the CLI is unaffected: it was already `hermes-pgvector`, replacing the earlier `python -m pgvector` form). The old top-level import name is owned by [pgvector-python](https://pypi.org/project/pgvector/); sharing a venv meant whichever installed last won, and the discovery shim's import could resolve to the wrong module — the loader then falls back to built-in memory on a single log line, taking the fleet's shared memory offline silently. The distribution name and the `pgvector` provider name are unchanged; only the import moved.
 
-v0.5.5 (2026-09-23) raised `psycopg-pool` to `>=3.3.3`, which fixes sync pool workers terminating after 24 hours with no task to run (upstream ticket #1419) - the exact failure mode for a pool that sits idle between agent turns.
+The PII/bench buckets also gained the read-side half they never had. `whatsapp-dm` and `_bench` isolation was write-side only, so `scope='all'` (or naming a bucket directly) surfaced DM bodies in any theme — and turn capture then rewrote them under the reading theme. Cross-theme recall stays opt-in and broad; it just no longer reaches the sinks.
 
 | Capability | Version |
 |---|---|
-| Floors raised to `psycopg[binary]>=3.3.6`, `psycopg-pool>=3.3.2` | v0.5.4 |
-| Floor raised to `psycopg-pool>=3.3.3` (24h idle sync-worker fix) | v0.5.5 |
+| Import package `pgvector` → `hermes_pgvector`; shim import verified in a clean subprocess at install time | v0.5.0 |
+| `hermes_agent.memory_providers` entry point declared — `pip install` alone is sufficient on a host that reads it, no shim to go stale | v0.5.0 |
+| Read-side exclusion of `whatsapp-dm` / `_bench` from `scope='all'` + explicit-scope rejection | v0.5.0 |
+| Group/channel/thread keys bucketed into `external-group` (same PII/cardinality fix as the DM bucket, different `chat_type`) | v0.5.0 |
+| Config type-contract fixes (`allowed_themes` string/list, boolean toggles declared as strings) | v0.5.0 |
+| Turn double-write guard; `replace()` single-row UPDATE; fail-soft hardening | v0.5.0 |
 
 ---
 
-### M4.5 - Configurable embedding model + plugin-loader fix (v0.5.3) DONE
+### M4.4 — Remove-path data-loss fix + backfill signal repair (v0.5.1) — DONE
 
-The reference deployment moved its vector columns to `vector(1536)` and re-embedded with an OpenRouter-hosted OpenAI model, and the plugin could not follow through configuration: the 768-dim check was a literal in the response parser and in the backfill guard, and no `Authorization` header was ever sent. The dimension is now configuration. A mismatch still fails fast, because the check moved to config rather than being relaxed. Changing the dimension on an existing database remains a documented column migration plus a re-embed; the shipped migrations are untouched.
+Two defects found by reviewing the v0.5.1 candidate, one of them data-loss. `_worker` passed `old_text=item.content` for a remove, but the built-in tool's remove op carries its target in `old_text` and leaves `content` empty — so the pattern was always `LIKE '%%'`, which matches every row. A single `memory remove` deleted the entire mirror for that `(agent_identity, target)`. Fixed at two layers: the worker reads `extra["old_text"]`, and `store.remove()` refuses an empty pattern so the destructive delete is unreachable by omission. No production loss occurred — every theme's history is continuous.
 
-The same release fixes embeds under hermes-agent's directory loader, which binds each sibling module back onto the package after running it. That replaced the `embed` function with the `embed` submodule, so every embed raised `TypeError`. It also fixes a read timeout escaping as a bare `TimeoutError` instead of an `EmbeddingError`.
+Separately, an empty-content row (created because nothing rejected empty `add`/`replace`) was retried by every nightly backfill forever, pinning `failed` above zero and making `remaining == 0` unreachable — destroying the signal operators watch. Un-embeddable rows are now skipped *and* reported as `unembeddable`.
+
+| Capability | Version |
+|---|---|
+| `remove` targets `extra["old_text"]`; `store.remove()` rejects an empty pattern | v0.5.1 |
+| Empty `add`/`replace` no longer mirrored; `remove` exempt (target is in metadata) | v0.5.1 |
+| Backfill skips + reports un-embeddable rows so `remaining` can reach zero | v0.5.1 |
+
+---
+
+### M4.5 — Configurable embedding model + plugin-loader fix (v0.5.3) — DONE
+
+The reference deployment moved its vector columns to `vector(1536)` and re-embedded with an OpenRouter-hosted OpenAI model, and the plugin could not follow through configuration: the 768-dim check was a literal in the response parser and in the backfill guard, and no `Authorization` header was ever sent. The dimension is now configuration. A mismatch still fails fast, because the check moved to config rather than being relaxed.
+
+The same release fixes embeds under hermes-agent's directory loader, which binds each sibling module back onto the package after running it (that replaced the `embed` function with the `embed` submodule, so every embed raised `TypeError`), and fixes a read timeout escaping as a bare `TimeoutError` instead of an `EmbeddingError`.
 
 | Capability | Version |
 |---|---|
@@ -146,70 +163,63 @@ The same release fixes embeds under hermes-agent's directory loader, which binds
 
 ---
 
-### M4.4 — Remove-path data-loss fix + backfill signal repair (v0.5.1) ✅ DONE
+### M4.6 — psycopg dependency floors (v0.5.4, v0.5.5) — DONE
 
-Two defects found by reviewing the v0.5.1 candidate, one of them data-loss.
-
-`_worker` passed `old_text=item.content` for a remove, but the built-in tool's remove op carries its target in `old_text` and leaves `content` empty — so the pattern was always `LIKE '%%'`, which matches every row. A single `memory remove` deleted the entire mirror for that `(agent_identity, target)`. Fixed at two layers: the worker reads `extra["old_text"]`, and `store.remove()` refuses an empty pattern so the destructive delete is unreachable by omission. No production loss occurred — every theme's history is continuous.
-
-Separately, an empty-content row (created because nothing rejected empty `add`/`replace`) was retried by every nightly backfill forever, pinning `failed` above zero and making `remaining == 0` unreachable — destroying the signal operators watch. Un-embeddable rows are now skipped *and* reported as `unembeddable`.
+Two dependency-only releases, no code changes in either. This package opens a single long-lived `ConnectionPool` shared by the agent thread and the async-writer drain thread, so upstream pool fixes land directly on its hot path.
 
 | Capability | Version |
 |---|---|
-| `remove` targets `extra["old_text"]`; `store.remove()` rejects an empty pattern | v0.5.1 |
-| Empty `add`/`replace` no longer mirrored; `remove` exempt (target is in metadata) | v0.5.1 |
-| Backfill skips + reports un-embeddable rows so `remaining` can reach zero | v0.5.1 |
-| Whitespace predicate matches Python `str.strip()` (`content ~ '\S'`, not `trim()`) | v0.5.1 |
+| Floors raised to `psycopg[binary]>=3.3.6`, `psycopg-pool>=3.3.2` | v0.5.4 |
+| Floor raised to `psycopg-pool>=3.3.3` (24h idle sync-worker fix, upstream #1419) | v0.5.5 |
 
 ---
 
-### M4.3 — Import rename + read-side identity gate (v0.5.0) ✅ DONE
+### M6 — Public release (v0.6.0 → v1.0) — v0.6.0 DONE, "released" pending
 
-Two findings from the 2026-09-07 full-codebase review that could not be fixed without a breaking change or a public-behaviour change, so they were split out of the v0.4.x line.
+**Goal:** documentation, contract guarantees, and a CHANGELOG good enough that someone landing on this plugin from the hermes-agent docs can deploy it cleanly without reading the source.
 
-The import package moved `pgvector` → `hermes_pgvector`. The old top-level name is owned by [pgvector-python](https://pypi.org/project/pgvector/); sharing a venv meant whichever installed last won, and the discovery shim's import could resolve to the wrong module — the loader then falls back to built-in memory on a single log line, taking the fleet's shared memory offline silently. The distribution name, the `hermes-pgvector` CLI and the `pgvector` provider name are unchanged; only the import moved. Upgrading requires re-running `hermes-pgvector install --force` once.
+| Capability | Status |
+|---|---|
+| Stable, typed config schema (`get_config_schema()`: real `type`/`default`/`minimum`/`maximum` per key) | DONE (v0.6.0) |
+| CI: unit + live-DB matrix (Python 3.11–3.13 × Postgres 16/17), build/wheel checks, version consistency | DONE (v0.6.0) |
+| Conformance test: validate `MemoryProvider` ABC + `MemoryManager` call-shape contract against upstream (pinned ref in `conformance/HERMES_AGENT_REF`) | DONE (v0.6.0) |
+| CHANGELOG.md (Keep a Changelog format) | DONE (v0.6.0) |
+| Full docs set: config reference, operations, scaling, troubleshooting, upgrading, release checklist, security policy | DONE (v0.6.0) |
+| **Released as 1.0.0** | NOT YET — v0.6.0 is the release candidate; a soak period and `release/1.0.0rc1` (version/metadata only, no behaviour change) precede the actual 1.0.0 tag |
 
-The PII/bench buckets also gained the read-side half they never had. `whatsapp-dm` and `_bench` isolation was write-side only, so `scope='all'` (or naming a bucket directly) surfaced DM bodies in any theme — and turn capture then rewrote them under the reading theme. Cross-theme recall stays opt-in and broad; it just no longer reaches the sinks.
+A prior 1.0-readiness review found four High-severity defects and thirteen Medium/Low ones; every one of them (H1–H4, M1–M7 except roadmap-M5, L1–L6, L8–L10) is fixed in v0.6.0 — see [CHANGELOG.md](CHANGELOG.md#060---unreleased). L7 (theme-filtered ANN recall at very large table sizes) did not reproduce at the tested scale and is documented as a scaling consideration instead of a fix — see [docs/scaling.md](docs/scaling.md).
+
+---
+
+### M7 — Identity case-folding (v0.6.0) — DONE
+
+Identities are now case-folded: `Marketing` and `marketing` resolve to the same theme, closing a gap where the allow-list check and the raw priority chain were both case-sensitive while the README's naming convention was already "lowercase, dash-separated." Existing mixed-case themes need one `hermes-pgvector remap --execute` per theme when upgrading — see [docs/upgrading.md](docs/upgrading.md).
 
 | Capability | Version |
 |---|---|
-| Import package `pgvector` → `hermes_pgvector`; shim import verified in a clean subprocess at install time | v0.5.0 |
-| `hermes_agent.memory_providers` entry point declared — `pip install` alone is sufficient on a host that reads it, no shim to go stale | v0.5.0 |
-| Read-side exclusion of `whatsapp-dm` / `_bench` from `scope='all'` + explicit-scope rejection | v0.5.0 |
-| Config type-contract fixes (`allowed_themes` string/list, boolean toggles declared as strings) | v0.5.0 |
-| Turn double-write guard; `replace()` single-row UPDATE; fail-soft hardening | v0.5.0 |
+| `normalize_identity()` lowercases after strip; alias keys and allow-list entries compared lowercased | v0.6.0 |
+| Raw (pre-normalization) value still recorded as `raw_identity` metadata when it differs | v0.6.0 |
 
 ---
 
-### M5 — Production hardening at scale (v0.6 → v0.7) ⏳ PROPOSED
+### M5 — Production hardening at scale (v1.1 → v1.2) — PROPOSED
 
-> Version targets shifted from v0.5/v0.6: v0.5.0 was taken by the M4.3 breaking rename above.
+> Retargeted from v0.6–v0.7 (the earlier plan for this milestone) to after 1.0: a 1.0-readiness review concluded a contract release should not carry new features, and none of these items were in progress. TTL pruning (the one M5 item that had actually shipped) is called out separately below rather than re-listed here.
 
 **Goal:** survive a fleet of dozens of minions, hundreds of writes per minute, multi-million-row tables.
 
 | Capability | Version |
 |---|---|
-| TTL / decay policy on `memory_entries.updated_at` and `conversations.ts` so stale entries surface less | v0.6.0 |
-| Optional partial HNSW indexes per high-volume `agent_identity` when cross-theme search becomes the slow query | v0.6.0 |
-| Periodic re-sync of `MEMORY.md` / `USER.md` (not just on init) for callers that edit the markdown directly | v0.6.0 |
-| Bulk-import CLI for migrating from Holographic / Honcho / Mem0 / Hindsight installations | v0.6.0 |
-| Metrics: queue depth, drop count, embed latency p50/p95, recall hit rate (Prometheus-friendly) | v0.7.0 |
-| Per-platform metadata facets (CLI vs cron vs telegram vs API) for richer recall filtering | v0.7.0 |
+| Recency decay in ranking — bias `recall_memory` / `recall_conversation` toward more recently updated rows (TTL pruning on age already shipped in v0.4.0 — see below; this is decay *within* the ranking function, not deletion) | v1.1 (proposed) |
+| Optional partial HNSW indexes per high-volume `agent_identity` when cross-theme search becomes the slow query | v1.1 (proposed) |
+| Periodic re-sync of `MEMORY.md` / `USER.md` (not just on init) for callers that edit the markdown directly | v1.1 (proposed) |
+| Bulk-import CLI for migrating from Holographic / Honcho / Mem0 / Hindsight installations | v1.2 (proposed) |
+| Metrics: queue depth, drop count, embed latency p50/p95, recall hit rate (Prometheus-friendly) | v1.2 (proposed) |
+| Per-platform metadata facets (CLI vs cron vs telegram vs API) for richer recall filtering | v1.2 (proposed) |
+
+**TTL prune (v0.4.0, done):** `hermes-pgvector prune --days N` deletes conversation turns older than N days, operator-triggered only (never automatic); `memory_entries` are never pruned by any code path. This is age-based deletion, already shipped — it is a different mechanism from the recency-decay-in-ranking row above, which keeps every row but ranks stale ones lower.
 
 **Why this matters for multi-agent deployments:** a memory store that's fast for one user often falls over under fleet load. M5 is the slow + boring work that turns "works on my hermes" into "works for ten agents writing concurrently."
-
----
-
-### M6 — Public release (v1.0) ⏳ PROPOSED
-
-**Goal:** documentation, contract guarantees, and a CHANGELOG good enough that someone landing on this plugin from the hermes-agent docs can deploy it cleanly without reading the source.
-
-| Capability | Version |
-|---|---|
-| Stable config schema (semver guarantees on `plugins.pgvector.*` keys) | v1.0.0 |
-| Full hermes-agent docs page with config reference, scaling guide, troubleshooting | v1.0.0 |
-| Coverage: store tests in upstream CI against a Postgres service container | v1.0.0 |
-| Conformance test: validate `MemoryProvider` ABC contract against current upstream | v1.0.0 |
 
 ---
 
@@ -221,6 +231,7 @@ These were considered and rejected. Keeping the list visible so it's clear the o
 - **LLM-mediated dialectic recall** (à la Honcho). The synchronous LLM call in the memory hot path is exactly the failure mode that motivated this plugin. We embed text; we don't reason about it. The agent reasons.
 - **Background deriver / fact-extraction pipelines.** Same reason: any background LLM loop becomes a retry-storm liability. Fact extraction stays explicit (the agent decides to call `memory.add`) instead of implicit (a daemon thread scrapes turns).
 - **Multi-tenant authentication / RBAC at the plugin layer.** Postgres roles + `agent_identity` scoping are sufficient. Anything fancier belongs in a separate access layer, not in a memory provider.
+- **A dedicated `recall_delegation` tool** (considered for M4, dropped — see M4 above). Delegations already surface through `recall_conversation`; a second search tool over the same rows would be a distinction without a difference.
 
 ---
 
