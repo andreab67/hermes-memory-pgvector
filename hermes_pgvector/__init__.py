@@ -906,6 +906,10 @@ class PgvectorMemoryProvider(MemoryProvider):
             logger.debug("pgvector queue_prefetch failed to schedule (ignored): %s", exc)
 
     def _prefetch_worker_loop(self) -> None:
+        # Reads self._agent_identity / self._store live. If initialize() moves
+        # this instance to another theme mid-flight, the block computed here
+        # is discarded by _cache_prefetch()'s generation check -- wasted work,
+        # never a cross-session or cross-theme leak.
         """Background worker (daemon thread): drain `_prefetch_pending` until
         empty, one request at a time. Never raises -- a broken embed/search
         call must not kill this thread (it would silently stop refreshing
@@ -1655,7 +1659,10 @@ class PgvectorMemoryProvider(MemoryProvider):
 
         # Scope resolution: 'current' → my agent_identity; 'all' → no filter;
         # anything else → treat as explicit theme name.
-        scope = str(args.get("scope") or self._config.get("scope_default") or "current").strip()
+        # Case-folded like stored identities (M7): 'Marketing' must find the
+        # 'marketing' theme, and 'WhatsApp-DM' must hit the restricted-sink
+        # rejection below rather than silently returning nothing.
+        scope = str(args.get("scope") or self._config.get("scope_default") or "current").strip().lower()
         restricted = self._restricted_identities()
         exclude: Optional[List[str]] = None
         if scope == "current":
@@ -1766,7 +1773,8 @@ class PgvectorMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             limit = 5
 
-        scope = str(args.get("scope") or "current").strip()
+        # Case-folded like stored identities (M7) -- see handle_tool_call().
+        scope = str(args.get("scope") or "current").strip().lower()
         agent_filter: Optional[str] = None
         session_filter: Optional[str] = None
         restricted = self._restricted_identities()
@@ -1977,7 +1985,7 @@ class PgvectorMemoryProvider(MemoryProvider):
             },
             {
                 "key": "allowed_themes",
-                "description": "Identity governance: optional allow-list of theme names, as a comma-separated string (e.g. 'marketing,sales'). Empty/unset = allow any. When set, an unknown X-Hermes-Session-Key falls back to 'default' with a one-time warning (the whatsapp-dm / _bench / default sinks are always permitted).",
+                "description": "Identity governance: optional allow-list of theme names, as a comma-separated string (e.g. 'marketing,sales'). Empty/unset = allow any. When set, an unknown X-Hermes-Session-Key falls back to 'default' with a one-time warning (the whatsapp-dm / external-group / _bench / default sinks are always permitted).",
                 "type": "text",
                 "default": "",
             },

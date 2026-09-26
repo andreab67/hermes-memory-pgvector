@@ -8,6 +8,7 @@ must degrade instead. No DB: MemoryStore is replaced with an unhealthy fake.
 
 from __future__ import annotations
 
+import json
 import sys
 from pathlib import Path
 
@@ -69,3 +70,67 @@ def test_on_memory_write_tolerates_non_dict_metadata(bad):
     p.on_memory_write("add", "memory", "a durable note worth keeping", metadata=bad)
     assert len(writer.items) == 1
     assert isinstance(writer.items[0]["metadata"], dict)
+
+
+# ---------------------------------------------------------------------------
+# Red-team (G1.7): explicit `scope` names are case-folded like stored
+# identities (M7), so a mixed-case theme name still finds the theme and a
+# mixed-case sink name still hits the restricted-sink rejection.
+# ---------------------------------------------------------------------------
+
+
+class _RecordingStore:
+    def __init__(self):
+        self.calls = []
+
+    def _record(self, **kwargs):
+        self.calls.append(kwargs)
+        return []
+
+    def hybrid_search(self, **kwargs):
+        return self._record(**kwargs)
+
+    def hybrid_search_turns(self, **kwargs):
+        return self._record(**kwargs)
+
+    def search(self, **kwargs):
+        return self._record(**kwargs)
+
+    def search_turns(self, **kwargs):
+        return self._record(**kwargs)
+
+
+def _recall_provider(monkeypatch, identity="sales"):
+    monkeypatch.setattr(pkg, "_embed_with_config", lambda *a, **k: [0.0] * 768)
+    p = PgvectorMemoryProvider(config={})
+    p._healthy = True
+    p._agent_identity = identity
+    p._store = _RecordingStore()
+    return p
+
+
+@pytest.mark.parametrize("tool", ["recall_memory", "recall_conversation"])
+@pytest.mark.parametrize("scope", ["Marketing", "MARKETING", " marketing "])
+def test_explicit_theme_scope_is_case_folded(monkeypatch, tool, scope):
+    p = _recall_provider(monkeypatch)
+    out = json.loads(p.handle_tool_call(tool, {"query": "campaign budget", "scope": scope}))
+    assert "error" not in out
+    assert p._store.calls[-1]["agent_identity"] == "marketing"
+
+
+@pytest.mark.parametrize("tool", ["recall_memory", "recall_conversation"])
+@pytest.mark.parametrize("scope", ["WhatsApp-DM", "WHATSAPP-DM", "External-Group", "_BENCH"])
+def test_mixed_case_restricted_sink_is_rejected(monkeypatch, tool, scope):
+    p = _recall_provider(monkeypatch)
+    out = json.loads(p.handle_tool_call(tool, {"query": "anything", "scope": scope}))
+    assert "restricted sink" in out.get("error", "")
+    assert p._store.calls == []
+
+
+@pytest.mark.parametrize("tool", ["recall_memory", "recall_conversation"])
+def test_mixed_case_all_scope_still_excludes_sinks(monkeypatch, tool):
+    p = _recall_provider(monkeypatch)
+    p.handle_tool_call(tool, {"query": "anything", "scope": "ALL"})
+    call = p._store.calls[-1]
+    assert call["agent_identity"] is None
+    assert set(call["exclude_identities"]) == {"whatsapp-dm", "external-group", "_bench"}

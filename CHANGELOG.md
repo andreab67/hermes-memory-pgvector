@@ -33,7 +33,9 @@ Read all of these before upgrading. Full step-by-step procedure:
   so a slow embed endpoint degrades to full-text-only recall instead of
   blocking the agent turn.
 - **Identities are lowercased.** `Marketing` and `marketing` now resolve to
-  the same theme. Find existing mixed-case themes before upgrading:
+  the same theme. The `scope` argument of `recall_memory` /
+  `recall_conversation` is case-folded the same way, so `scope='Marketing'`
+  reads the `marketing` theme. Find existing mixed-case themes before upgrading:
 
   ```sql
   SELECT DISTINCT agent_identity FROM memory_entries
