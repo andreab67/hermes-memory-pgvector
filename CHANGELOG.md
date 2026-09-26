@@ -74,7 +74,7 @@ Read all of these before upgrading. Full step-by-step procedure:
 ### Added
 
 - **`hermes-pgvector migrate --runtime-role NAME`** (H1) — resolves the
-  runtime role migrations `002`/`004`/`005` grant DML to from a session GUC
+  runtime role migrations `002`/`004` grant DML to from a session GUC
   (`hermes_pgvector.runtime_role`) instead of hard-coding `hermes`. A `psql
   -f` run gets the same effect with `PGOPTIONS='-c
   hermes_pgvector.runtime_role=NAME'`. A role that does not exist yet gets
@@ -204,21 +204,27 @@ Read all of these before upgrading. Full step-by-step procedure:
   off the agent thread entirely.
 - **L1** — the real-looking Colorado Springs phone number in docstrings and
   tests is replaced with the fictional `555-01xx` range (e.g.
-  `15550100123`). Git history was not rewritten — see "Manual steps" in
-  the 1.0 readiness review for that decision.
+  `15550100123`). Git history was not rewritten; whether to purge the old
+  number from history is left to the maintainer.
 - **L2** — `embed_url`'s default is no longer a private LAN address.
 - **L5** — the unused, never-set `AsyncWriter._stop` event is removed (see
   `draining` above).
-- **L10** — every non-ASCII character (em dashes, arrows) in migration
-  file comments is replaced with ASCII (`--`, `->`); `migrate` no longer
-  fails against a `SQL_ASCII`-encoded database with `'ascii' codec can't
-  encode character`. Migration files are now read and executed as raw
-  UTF-8 bytes so this cannot regress silently.
+- **L10** — `migrate` no longer fails against a `SQL_ASCII`-encoded
+  database with `'ascii' codec can't encode character`: migration files are
+  now read and executed as raw UTF-8 bytes. The comments in `002`/`004`
+  (and the new `005`) are pure ASCII, enforced by a test; `001` and `003`
+  are never edited once shipped, so their comments keep their original
+  characters and rely on the byte-level execution.
 - `sync_turn()` now accepts upstream's keyword-only `messages` /
   `turn_author` (and any later keyword via `**kwargs`), found by the
   conformance suite's signature-compatibility test. The host introspects
   the signature, so this was not a live crash, but the plugin could not
   receive them if upstream tightened the contract further.
+- `initialize()` treats a non-string `agent_identity` /
+  `gateway_session_key` / `agent_workspace` as absent instead of raising
+  `AttributeError`, and `on_memory_write()` drops a non-dict `metadata`
+  instead of raising — both found by fuzzing every hook for invariant #4
+  (nothing may raise into the agent loop).
 - `scripts/conformance.sh` strips whitespace when reading
   `conformance/HERMES_AGENT_REF`, so a CRLF checkout (`core.autocrlf=true`)
   no longer produces an invalid ref.
