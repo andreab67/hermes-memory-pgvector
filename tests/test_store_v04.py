@@ -94,7 +94,7 @@ def test_delete_by_identity_whitelist_guard(store):
 
 def test_scan_pii_finds_phone_in_content(store):
     s, agent = store
-    s.append_turn(session_id="s", agent_identity=agent, role="user", content="call me at 17192714834 tomorrow")
+    s.append_turn(session_id="s", agent_identity=agent, role="user", content="call me at 15550100123 tomorrow")
     counts = s.scan_pii(tables=("conversations",))
     assert counts["conversations"] >= 1
 

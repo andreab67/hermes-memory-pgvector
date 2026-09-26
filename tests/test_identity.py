@@ -51,15 +51,15 @@ def test_whitespace_trimmed_counts_as_unchanged_value():
 # --- the PII fix: whatsapp / DM session keys ------------------------------
 
 def test_whatsapp_dm_key_is_bucketed_and_strips_phone():
-    canon, normalized, reason = normalize_identity("agent:main:whatsapp:dm:17192714834")
+    canon, normalized, reason = normalize_identity("agent:main:whatsapp:dm:15550100123")
     assert canon == DM_BUCKET
-    assert "17192714834" not in canon  # phone number is gone
+    assert "15550100123" not in canon  # phone number is gone
     assert normalized is True
     assert reason == "dm-bucket"
 
 
 def test_other_dm_platforms_bucket_too():
-    for raw in ("agent:x:telegram:dm:55512345", "signal:dm:+1-719-555-0000"):
+    for raw in ("agent:x:telegram:dm:55512345", "signal:dm:+1-555-0100-123"):
         canon, _, reason = normalize_identity(raw)
         assert canon == DM_BUCKET
         assert reason == "dm-bucket"
@@ -80,7 +80,7 @@ def test_platform_token_alone_is_not_a_dm_key():
 
 
 def test_platform_followed_by_id_is_a_dm_key():
-    for raw in ("whatsapp:17195550000", "agent:x:signal:12345", "telegram:+15551234"):
+    for raw in ("whatsapp:15550100124", "agent:x:signal:12345", "telegram:+15551234"):
         canon, _, reason = normalize_identity(raw)
         assert canon == DM_BUCKET
         assert reason == "dm-bucket"
@@ -163,8 +163,8 @@ def test_classify_kind():
 # ---------------------------------------------------------------------------
 
 GROUP_KEYS = [
-    "agent:main:whatsapp:group:120363@g.us:17192714834",
-    "agent:main:whatsapp:channel:120363@g.us:17192714834",
+    "agent:main:whatsapp:group:120363@g.us:15550100123",
+    "agent:main:whatsapp:channel:120363@g.us:15550100123",
     "agent:main:telegram:group:-1001234567890:55512345",
     "agent:main:slack:thread:C0123:1699999999.123:U0456",
     "agent:main:discord:channel:987654321:112233",
@@ -182,8 +182,8 @@ def test_group_keys_collapse_to_the_group_bucket():
 
 def test_group_bucketing_removes_the_participant_id():
     """The whole point: no phone number may survive into the identity."""
-    canonical, _, _ = normalize_identity("agent:main:whatsapp:group:120363@g.us:17192714834")
-    assert "17192714834" not in canonical
+    canonical, _, _ = normalize_identity("agent:main:whatsapp:group:120363@g.us:15550100123")
+    assert "15550100123" not in canonical
     assert "120363" not in canonical
 
 
@@ -192,7 +192,7 @@ def test_group_bucket_survives_a_strict_allow_list():
     allow-list would route group traffic to `default`, where every theme can
     read it, which is worse than bucketing it."""
     canonical, _, reason = normalize_identity(
-        "agent:main:whatsapp:group:120363@g.us:17192714834",
+        "agent:main:whatsapp:group:120363@g.us:15550100123",
         allowed_themes=["marketing", "sales"],
     )
     assert canonical == GROUP_BUCKET
@@ -200,7 +200,7 @@ def test_group_bucket_survives_a_strict_allow_list():
 
 
 def test_dm_keys_still_win_over_group_matching():
-    canonical, _, reason = normalize_identity("agent:main:whatsapp:dm:17192714834")
+    canonical, _, reason = normalize_identity("agent:main:whatsapp:dm:15550100123")
     assert canonical == DM_BUCKET
     assert reason == "dm-bucket"
 
@@ -235,7 +235,7 @@ def test_group_pattern_is_platform_agnostic():
         "api_server", "plugin", "some_future_platform",
     ]
     for plat in platforms:
-        key = f"agent:main:{plat}:group:120363@g.us:17192714834"
+        key = f"agent:main:{plat}:group:120363@g.us:15550100123"
         canonical, _, reason = normalize_identity(key)
         assert canonical == GROUP_BUCKET, f"{plat} not bucketed"
         assert reason == "group-bucket"
@@ -259,13 +259,13 @@ def test_group_bucket_has_its_own_registry_kind():
 #     'whatsapp:group:<chat>:<phone>' stored the phone number verbatim
 #
 # Unprefixed keys are not hypothetical: _DM_RE deliberately matches
-# 'signal:dm:+1-719-555-0000' / 'whatsapp:17195550000' / 'telegram:+15551234',
+# 'signal:dm:+1-555-0100-123' / 'whatsapp:15550100124' / 'telegram:+15551234',
 # pinned by the DM tests above.
 # ---------------------------------------------------------------------------
 
 UNPREFIXED_GROUP_KEYS = [
-    "whatsapp:group:120363@g.us:17192714834",
-    "whatsapp_cloud:group:120363@g.us:17192714834",
+    "whatsapp:group:120363@g.us:15550100123",
+    "whatsapp_cloud:group:120363@g.us:15550100123",
     "signal:group:abcd==:+15551234567",
     "telegram:channel:-1001234567890:55512345",
     "slack:thread:C0123:1699999999.123:U0456",
@@ -284,8 +284,8 @@ def test_unprefixed_group_keys_are_bucketed():
 
 
 def test_unprefixed_group_keys_leave_no_participant_id_behind():
-    canonical, _, _ = normalize_identity("whatsapp:group:120363@g.us:17192714834")
-    assert "17192714834" not in canonical
+    canonical, _, _ = normalize_identity("whatsapp:group:120363@g.us:15550100123")
+    assert "15550100123" not in canonical
 
 
 def test_prefixed_form_still_covers_platforms_outside_the_enumeration():
