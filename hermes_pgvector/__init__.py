@@ -214,7 +214,7 @@ RECALL_MEMORY_SCHEMA = {
 
 DEFAULTS = {
     "dsn": "dbname=hermes_memory user=hermes host=/var/run/postgresql connect_timeout=5",
-    # L2 (v0.6.0): was a private LAN address (192.168.100.50) -- wrong default
+    # L2 (v0.6.0): was a private LAN address -- wrong default
     # for anyone outside that one deployment, and it leaked that deployment's
     # topology into every fresh install. Upgrade note: set this explicitly
     # before upgrading if you relied on the old default.
