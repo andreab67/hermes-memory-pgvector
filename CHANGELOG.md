@@ -11,7 +11,7 @@ commands/flags/exit codes, table/column names, the `pgvector` provider name,
 and the package entry point — `MemoryStore` and every internal module are
 not).
 
-## [0.6.0] - Unreleased
+## [0.6.0] - 2026-09-26
 
 Correctness release from a 1.0-readiness review
 ([`docs/code-review/1.0-readiness-review-2026-09-26.md`](docs/code-review/1.0-readiness-review-2026-09-26.md)):
