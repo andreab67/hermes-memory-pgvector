@@ -222,6 +222,112 @@ def test_retries_stop_at_the_total_budget():
     assert attempts["n"] >= 2, "it must still retry at least once before the budget"
 
 
+def test_embed_timeout_default_is_5_seconds():
+    """H4 (v0.6.0): lowered from 10.0. The host's external-provider prefetch
+    budget is a hard 8s (agent.memory_manager._EXTERNAL_PREFETCH_TIMEOUT_S);
+    under embed_protocol='auto' a single embed() call can try BOTH the
+    OpenAI-compat and Ollama-native paths, and the old 10.0 default left no
+    room for that -- let alone the DB search after it -- inside the host's
+    budget."""
+    assert DEFAULTS["embed_timeout"] == 5.0
+
+
+# ---------------------------------------------------------------------------
+# H4 -- `auto` protocol: ONE shared deadline across both HTTP attempts.
+#
+# Before this fix, `_embed_once()` gave EACH of the OpenAI-compat and
+# Ollama-native paths the full `timeout` -- so one call to embed() under
+# `auto` could cost up to 2x `timeout`. That is exactly what let a hot-path
+# prefetch() (embed_timeout capped the whole call, or so it looked) blow
+# past the host's 8s external-prefetch budget on a slow endpoint.
+# ---------------------------------------------------------------------------
+
+def test_auto_protocol_second_path_gets_the_remaining_budget_not_a_fresh_one(monkeypatch):
+    from importlib import import_module
+    import time as _time
+    embed_mod = import_module("hermes_pgvector.embed")
+
+    seen_timeouts = []
+
+    def _fake_post(url, body, *, timeout, extract, dim=768, api_key_env=None):
+        seen_timeouts.append(timeout)
+        _time.sleep(0.1)  # a fixed cost, regardless of the budget it was given
+        raise embed_mod.EmbeddingError("down")
+
+    monkeypatch.setattr(embed_mod, "_post", _fake_post)
+    started = _time.monotonic()
+    try:
+        embed_mod.embed(
+            "hello", base_url="http://example.invalid", model="m",
+            timeout=1.0, protocol="auto",
+        )
+    except embed_mod.EmbeddingError:
+        pass
+    elapsed = _time.monotonic() - started
+
+    assert len(seen_timeouts) == 2, "auto tries both the OpenAI-compat and the Ollama-native path"
+    assert seen_timeouts[0] == 1.0, "the first (OpenAI-compat) attempt gets the full budget"
+    # The second (Ollama-native) attempt must get what's LEFT of the shared
+    # 1.0s budget (~0.9s, since the first attempt burned ~0.1s), not a fresh 1.0s.
+    assert 0.0 < seen_timeouts[1] < 1.0, f"expected a reduced budget, got {seen_timeouts[1]}"
+    # Total wall clock stays close to the ORIGINAL single budget, not 2x it.
+    assert elapsed < 1.0 + 0.3, f"auto protocol spent more than its shared 1.0s budget: {elapsed:.2f}s"
+
+
+def test_auto_protocol_skips_the_second_path_when_the_budget_is_exhausted(monkeypatch):
+    """If the first attempt eats the whole deadline, the second must not
+    start with a fresh timeout -- it must not start at all."""
+    from importlib import import_module
+    import time as _time
+    embed_mod = import_module("hermes_pgvector.embed")
+
+    seen_timeouts = []
+
+    def _fake_post(url, body, *, timeout, extract, dim=768, api_key_env=None):
+        seen_timeouts.append(timeout)
+        _time.sleep(timeout)  # eats the ENTIRE budget it was handed
+        raise embed_mod.EmbeddingError("down")
+
+    monkeypatch.setattr(embed_mod, "_post", _fake_post)
+    started = _time.monotonic()
+    try:
+        embed_mod.embed(
+            "hello", base_url="http://example.invalid", model="m",
+            timeout=0.2, protocol="auto",
+        )
+    except embed_mod.EmbeddingError:
+        pass
+    elapsed = _time.monotonic() - started
+
+    assert len(seen_timeouts) == 1, (
+        "no budget left for the Ollama-native fallback; it must not run with a fresh timeout"
+    )
+    assert elapsed < 0.2 + 0.25, f"exceeded the single-attempt budget: {elapsed:.2f}s"
+
+
+def test_openai_only_protocol_is_unaffected_by_the_shared_deadline(monkeypatch):
+    """The deadline-sharing logic only applies to `auto`'s fallback. `openai`
+    (no fallback) must keep getting the full `timeout` for its one attempt."""
+    from importlib import import_module
+    embed_mod = import_module("hermes_pgvector.embed")
+
+    seen_timeouts = []
+
+    def _fake_post(url, body, *, timeout, extract, dim=768, api_key_env=None):
+        seen_timeouts.append(timeout)
+        raise embed_mod.EmbeddingError("down")
+
+    monkeypatch.setattr(embed_mod, "_post", _fake_post)
+    try:
+        embed_mod.embed(
+            "hello", base_url="http://example.invalid", model="m",
+            timeout=2.5, protocol="openai",
+        )
+    except embed_mod.EmbeddingError:
+        pass
+    assert seen_timeouts == [2.5]
+
+
 def test_no_budget_means_all_retries_still_run():
     """max_total=None preserves the old behaviour for callers that want it."""
     # NB: hermes_pgvector/__init__.py does `from .embed import embed`, which
