@@ -161,6 +161,13 @@ jobs:
         with:
           python-version: "3.12"
       - run: python scripts/check_versions.py
+      # WP-E: docs/configuration.md is generated from get_config_schema() +
+      # DEFAULTS (hermes_pgvector/__init__.py) by scripts/gen_config_doc.py.
+      # Needs the package installed -- it imports psycopg/PyYAML at module
+      # import time.
+      - name: Install package (for gen_config_doc.py's import)
+        run: pip install -e .
+      - run: python scripts/gen_config_doc.py --check
 
   # WP-F: upstream conformance suite (conformance/), pinned to
   # conformance/HERMES_AGENT_REF. Blocking on push/PR -- this is what protects
