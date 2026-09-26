@@ -28,7 +28,9 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-STATE_DIR="$REPO_ROOT/.cache/test-env"
+# TEST_ENV_STATE_DIR lets several git worktrees share one running instance
+# (the `db` command of a second checkout must find the port `up` chose).
+STATE_DIR="${TEST_ENV_STATE_DIR:-$REPO_ROOT/.cache/test-env}"
 PYTHON="${PYTHON:-python3}"
 
 EMBED_HOST="127.0.0.1"
