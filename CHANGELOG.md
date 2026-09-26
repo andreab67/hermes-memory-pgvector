@@ -11,6 +11,15 @@ commands/flags/exit codes, table/column names, the `pgvector` provider name,
 and the package entry point — `MemoryStore` and every internal module are
 not).
 
+## [1.0.0rc1] - Unreleased
+
+No behaviour changes relative to 0.6.0. Declares the compatibility policy
+stable: the public surface listed in the "Compatibility policy" section of
+[README.md](README.md) is now guaranteed stable across the 1.x series,
+with breaking changes to that surface reserved for a future 2.0. `1.0.0`
+will be this same release candidate re-tagged, unchanged, after a soak
+period.
+
 ## [0.6.0] - 2026-09-26
 
 Correctness release from a 1.0-readiness review

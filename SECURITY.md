@@ -4,13 +4,14 @@
 
 | Version | Supported |
 |---|---|
-| 0.6.x (latest) | Yes |
-| 0.5.x | Best-effort — upgrade recommended, especially past 0.5.1 (fixes a data-loss bug — see [CHANGELOG.md](CHANGELOG.md)) |
+| 1.x (latest) | Yes |
+| 0.6.x | Best-effort until 1.0.0 is released — 1.0.0 has no behaviour change from 0.6.0, so upgrading is a drop-in |
+| 0.5.x | No — upgrade to 0.6.x or later (0.5.0 and earlier also carry the pre-0.5.1 data-loss bug — see [CHANGELOG.md](CHANGELOG.md)) |
 | < 0.5.0 | No — please upgrade |
 
-This is a pre-1.0 project under active development; security fixes are
-generally released as a patch on the current minor line, not backported
-further than the row above.
+From 1.0 on, the public surface listed under "Compatibility policy" in
+[README.md](README.md) is stable across 1.x. Security fixes ship as a patch
+release on the latest 1.x minor line.
 
 ## Reporting a vulnerability
 
