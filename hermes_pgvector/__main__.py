@@ -8,7 +8,7 @@ Runs standalone (no hermes-agent runtime needed), so it is safe in cron:
     hermes-pgvector backfill [--dsn ...] [--embed-url ...] [--embed-dim 768] [--embed-protocol auto]
                              [--embed-api-key-env NAME] [--batch-size 100] [--dry-run]
     hermes-pgvector prune    --days 90 [--dsn ...] [--execute]
-    hermes-pgvector cleanup  --identities "agent:main:whatsapp:dm:17192714834,skill-bench,skill-bench-ws" [--execute]
+    hermes-pgvector cleanup  --identities "agent:main:whatsapp:dm:15550100123,skill-bench,skill-bench-ws" [--execute]
     hermes-pgvector remap    --old hermes --new agent-hermes [--execute] [--force]
 
 `install` (v0.4.2) makes a pip-installed package discoverable by hermes-agent:

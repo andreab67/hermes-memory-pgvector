@@ -63,7 +63,6 @@ class AsyncWriter:
         self._worker_fn = worker_fn
         self._queue: "queue.Queue[Optional[_PendingWrite]]" = queue.Queue(maxsize=maxsize)
         self._thread: Optional[threading.Thread] = None
-        self._stop = threading.Event()      # hard stop: exit ASAP, abandon queue
         self._draining = threading.Event()  # graceful stop: exit once queue is empty
         self._dropped = 0
         self._dropped_warned = False
@@ -144,13 +143,22 @@ class AsyncWriter:
             "thread_alive": bool(self._thread and self._thread.is_alive()),
         }
 
+    @property
+    def draining(self) -> bool:
+        """True while a graceful shutdown drain (`shutdown()`) is in progress.
+
+        Read-only reflection of the internal drain flag; a provider can poll
+        this to skip slow, non-essential work (e.g. embedding) while the
+        writer is winding down, without needing its own shutdown signalling.
+        """
+        return self._draining.is_set()
+
     # -- Internals -----------------------------------------------------------
 
     def _ensure_thread(self) -> None:
         with self._lock:
             if self._thread and self._thread.is_alive():
                 return
-            self._stop.clear()
             self._draining.clear()
             self._thread = threading.Thread(
                 target=self._run,
@@ -160,7 +168,13 @@ class AsyncWriter:
             self._thread.start()
 
     def _run(self) -> None:
-        while not self._stop.is_set():
+        # No separate hard-stop flag: the loop exits only via the two `break`s
+        # below (queue drained while `_draining` is set, or the shutdown
+        # sentinel while not draining) -- both already at the exact point a
+        # hypothetical hard stop would be checked, so a dedicated Event added
+        # nothing (v0.6.0 -- L5: `_stop` was constructed and cleared but never
+        # set by anything).
+        while True:
             try:
                 item = self._queue.get(timeout=0.5)
             except queue.Empty:
