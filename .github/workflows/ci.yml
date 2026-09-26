@@ -112,17 +112,13 @@ jobs:
       - name: pytest -q (live DB + embed endpoint, expect 0 skipped)
         run: pytest -q
       # Every docs/code-review/repro-2026-09-26/repro_*.py that applies to
-      # this cluster. Until the matching fix lands these are EXPECTED to fail
-      # (exit 1, bug present) -- continue-on-error keeps them informational;
-      # Gate G1 flips them to required once the fixes are in.
-      - name: repro H3 (backfill stall) -- expected to fail until WP-A lands
-        continue-on-error: true
+      # this cluster. Each exits 0 once its finding is fixed and 1 if the bug
+      # comes back, so they are required regression checks (flipped at Gate G1).
+      - name: repro H3 (backfill stall)
         run: python docs/code-review/repro-2026-09-26/repro_h3_backfill.py
-      - name: repro M1 (unique-index row-size limit) -- expected to fail until WP-A/WP-B land
-        continue-on-error: true
+      - name: repro M1 (unique-index row-size limit)
         run: python docs/code-review/repro-2026-09-26/repro_m1_unique_limit.py
-      - name: repro H1 (migrate on a non-hermes role) -- expected to fail until WP-B lands
-        continue-on-error: true
+      - name: repro H1 (migrate on a non-hermes role)
         run: python docs/code-review/repro-2026-09-26/repro_h1_migrate_role.py
 
   build:
