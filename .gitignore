@@ -49,3 +49,7 @@ AGENTS.md
 
 # VarAlign local store (machine-local variable-tracking data)
 .varmem/*
+
+# WP-0 test harness state (scripts/test-env.sh) and conformance clones/venvs
+.cache/
+.venv-conformance/

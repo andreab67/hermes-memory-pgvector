@@ -49,6 +49,15 @@ test = [
     "pytest>=7.4,<9",
 ]
 
+# Release/CI tooling only (build the sdist/wheel, verify it, lint). Not
+# needed to run the test suite -- keep it out of `test` so `pip install
+# -e ".[test]"` (the `unit` CI job) stays minimal.
+dev = [
+    "build>=1,<2",
+    "twine>=5,<7",
+    "ruff>=0.5,<1",
+]
+
 # Operator maintenance CLI (migrate / backfill / prune / stats / cleanup / remap).
 # Shipped as source — no built artifacts committed (repo convention).
 [project.scripts]

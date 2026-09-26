@@ -1,0 +1,158 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  lint:
+    name: lint (ruff, syntax/undefined-names only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install "ruff>=0.5,<1"
+      - name: ruff check (E9,F63,F7,F82 -- no style churn)
+        run: ruff check --select E9,F63,F7,F82 .
+
+  unit:
+    name: unit (py${{ matrix.python-version }}, no DB)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package + test deps
+        run: pip install -e ".[test]"
+      - name: pytest (DB-gated tests skip; the fake-embed-server tests still run)
+        run: pytest -q
+
+  live:
+    name: live (pg${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17"]
+    services:
+      # Main cluster: has role `hermes`, hosts the migrated test database that
+      # the suite and the H3/M1 repros run against.
+      postgres:
+        image: pgvector/pgvector:pg${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+      # Second cluster, deliberately WITHOUT role `hermes`: H1's repro needs a
+      # cluster where that role has never been created.
+      postgres_no_hermes:
+        image: pgvector/pgvector:pg${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      PG_TEST_DSN: "host=127.0.0.1 port=5432 user=hermes password=hermes dbname=hermes_test"
+      PG_TEST_ADMIN_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=hermes_test"
+      ADMIN_DSN: "host=127.0.0.1 port=5433 user=postgres password=postgres dbname=postgres"
+      PG_TEST_EMBED_URL: "http://127.0.0.1:11999"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package + test deps
+        run: pip install -e ".[test]"
+      - name: Create role hermes + database hermes_test (main cluster)
+        run: |
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 -c "
+            DO \$\$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hermes') THEN
+                CREATE ROLE hermes LOGIN PASSWORD 'hermes';
+              END IF;
+            END
+            \$\$;"
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 -c \
+            "CREATE DATABASE hermes_test OWNER postgres;"
+      - name: Migrate hermes_test (as postgres)
+        run: python -m hermes_pgvector migrate --admin-dsn "$PG_TEST_ADMIN_DSN"
+      - name: Start fake embed server (background)
+        run: |
+          nohup python tests/fake_embed_server.py --host 127.0.0.1 --port 11999 \
+            > "$RUNNER_TEMP/fake-embed-server.log" 2>&1 &
+          for _ in $(seq 1 20); do
+            curl -fsS -o /dev/null "http://127.0.0.1:11999/api/embed" -X POST \
+              -H "Content-Type: application/json" -d '{"model":"x","input":"ping"}' && break
+            sleep 0.5
+          done
+      - name: pytest -q (live DB + embed endpoint, expect 0 skipped)
+        run: pytest -q
+      # Every docs/code-review/repro-2026-09-26/repro_*.py that applies to
+      # this cluster. Until the matching fix lands these are EXPECTED to fail
+      # (exit 1, bug present) -- continue-on-error keeps them informational;
+      # Gate G1 flips them to required once the fixes are in.
+      - name: repro H3 (backfill stall) -- expected to fail until WP-A lands
+        continue-on-error: true
+        run: python docs/code-review/repro-2026-09-26/repro_h3_backfill.py
+      - name: repro M1 (unique-index row-size limit) -- expected to fail until WP-A/WP-B land
+        continue-on-error: true
+        run: python docs/code-review/repro-2026-09-26/repro_m1_unique_limit.py
+      - name: repro H1 (migrate on a non-hermes role) -- expected to fail until WP-B lands
+        continue-on-error: true
+        run: python docs/code-review/repro-2026-09-26/repro_h1_migrate_role.py
+
+  build:
+    name: build (sdist/wheel, twine check, wheel contents)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build + twine
+        run: pip install "build>=1,<2" "twine>=5,<7"
+      - name: python -m build
+        run: python -m build
+      - name: twine check dist/*
+        run: twine check dist/*
+      - name: assert wheel contains migrations + plugin.yaml
+        run: |
+          python -c "
+          import glob, zipfile
+          wheel = glob.glob('dist/*.whl')[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          assert any(n.startswith('hermes_pgvector/migrations/') and n.endswith('.sql') for n in names), \
+              f'no migrations/*.sql in {wheel}: {names}'
+          assert any(n.endswith('hermes_pgvector/plugin.yaml') for n in names), \
+              f'no plugin.yaml in {wheel}: {names}'
+          print('wheel OK:', wheel)
+          "
+
+  versions:
+    name: versions (pyproject.toml == plugin.yaml == README == install.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/check_versions.py
