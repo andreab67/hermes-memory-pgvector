@@ -1,0 +1,290 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  # WP-F: weekly upstream-drift check against hermes-agent's `main` (the
+  # `conformance-drift` job below), independent of the pinned-ref
+  # `conformance` job that runs on every push/PR.
+  schedule:
+    - cron: "0 6 * * 1"  # every Monday 06:00 UTC
+
+jobs:
+  lint:
+    name: lint (ruff, syntax/undefined-names only)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install ruff
+        run: pip install "ruff>=0.5,<1"
+      - name: ruff check (E9,F63,F7,F82 -- no style churn)
+        run: ruff check --select E9,F63,F7,F82 .
+
+  unit:
+    name: unit (py${{ matrix.python-version }}, no DB)
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install package + test deps
+        run: pip install -e ".[test]"
+      - name: pytest (DB-gated tests skip; the fake-embed-server tests still run)
+        run: pytest -q
+
+  live:
+    name: live (pg${{ matrix.pg }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ["16", "17", "18"]
+    services:
+      # Main cluster: has role `hermes`, hosts the migrated test database that
+      # the suite and the H3/M1 repros run against.
+      postgres:
+        image: pgvector/pgvector:pg${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+      # Second cluster, deliberately WITHOUT role `hermes`: H1's repro needs a
+      # cluster where that role has never been created.
+      postgres_no_hermes:
+        image: pgvector/pgvector:pg${{ matrix.pg }}
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5433:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      PG_TEST_DSN: "host=127.0.0.1 port=5432 user=hermes password=hermes dbname=hermes_test"
+      PG_TEST_ADMIN_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=hermes_test"
+      ADMIN_DSN: "host=127.0.0.1 port=5433 user=postgres password=postgres dbname=postgres"
+      PG_TEST_EMBED_URL: "http://127.0.0.1:11999"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package + test deps
+        run: pip install -e ".[test]"
+      - name: Create role hermes + database hermes_test (main cluster)
+        run: |
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 -c "
+            DO \$\$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hermes') THEN
+                CREATE ROLE hermes LOGIN PASSWORD 'hermes';
+              END IF;
+            END
+            \$\$;"
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 -c \
+            "CREATE DATABASE hermes_test OWNER postgres;"
+      - name: Migrate hermes_test (as postgres)
+        run: python -m hermes_pgvector migrate --admin-dsn "$PG_TEST_ADMIN_DSN"
+      - name: Start fake embed server (background)
+        run: |
+          nohup python tests/fake_embed_server.py --host 127.0.0.1 --port 11999 \
+            > "$RUNNER_TEMP/fake-embed-server.log" 2>&1 &
+          for _ in $(seq 1 20); do
+            curl -fsS -o /dev/null "http://127.0.0.1:11999/api/embed" -X POST \
+              -H "Content-Type: application/json" -d '{"model":"x","input":"ping"}' && break
+            sleep 0.5
+          done
+      - name: pytest -q (live DB + embed endpoint, expect 0 skipped)
+        run: pytest -q
+      # Every docs/code-review/repro-2026-09-26/repro_*.py that applies to
+      # this cluster. Each exits 0 once its finding is fixed and 1 if the bug
+      # comes back, so they are required regression checks (flipped at Gate G1).
+      - name: repro H3 (backfill stall)
+        run: python docs/code-review/repro-2026-09-26/repro_h3_backfill.py
+      - name: repro M1 (unique-index row-size limit)
+        run: python docs/code-review/repro-2026-09-26/repro_m1_unique_limit.py
+      - name: repro H1 (migrate on a non-hermes role)
+        run: python docs/code-review/repro-2026-09-26/repro_h1_migrate_role.py
+
+  build:
+    name: build (sdist/wheel, twine check, wheel contents)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install build + twine
+        run: pip install "build>=1,<2" "twine>=5,<7"
+      - name: python -m build
+        run: python -m build
+      - name: twine check dist/*
+        run: twine check dist/*
+      - name: assert wheel contains migrations + plugin.yaml
+        run: |
+          python -c "
+          import glob, zipfile
+          wheel = glob.glob('dist/*.whl')[0]
+          names = zipfile.ZipFile(wheel).namelist()
+          assert any(n.startswith('hermes_pgvector/migrations/') and n.endswith('.sql') for n in names), \
+              f'no migrations/*.sql in {wheel}: {names}'
+          assert any(n.endswith('hermes_pgvector/plugin.yaml') for n in names), \
+              f'no plugin.yaml in {wheel}: {names}'
+          print('wheel OK:', wheel)
+          "
+
+  versions:
+    name: versions (pyproject.toml == plugin.yaml == README == install.sh)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: python scripts/check_versions.py
+      # WP-E: docs/configuration.md is generated from get_config_schema() +
+      # DEFAULTS (hermes_pgvector/__init__.py) by scripts/gen_config_doc.py.
+      # Needs the package installed -- it imports psycopg/PyYAML at module
+      # import time.
+      - name: Install package (for gen_config_doc.py's import)
+        run: pip install -e .
+      - run: python scripts/gen_config_doc.py --check
+
+  # WP-F: upstream conformance suite (conformance/), pinned to
+  # conformance/HERMES_AGENT_REF. Blocking on push/PR -- this is what protects
+  # every later change from silently drifting off hermes-agent's actual
+  # MemoryProvider/MemoryManager contract. Mirrors the `live` job's service +
+  # fake-embed-server setup; scripts/conformance.sh does its own clone of
+  # hermes-agent into .cache/hermes-agent and its own .venv-conformance, so
+  # this package only needs to be installed here to migrate the database.
+  conformance:
+    name: conformance (upstream hermes-agent @ pinned ref)
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      PG_TEST_DSN: "host=127.0.0.1 port=5432 user=hermes password=hermes dbname=hermes_conformance"
+      PG_TEST_ADMIN_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=hermes_conformance"
+      PG_TEST_EMBED_URL: "http://127.0.0.1:11999"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package + test deps
+        run: pip install -e ".[test]"
+      - name: Create role hermes + database hermes_conformance
+        run: |
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 -c "
+            DO \$\$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hermes') THEN
+                CREATE ROLE hermes LOGIN PASSWORD 'hermes';
+              END IF;
+            END
+            \$\$;"
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 -c \
+            "CREATE DATABASE hermes_conformance OWNER postgres;"
+      - name: Migrate hermes_conformance (as postgres)
+        run: python -m hermes_pgvector migrate --admin-dsn "$PG_TEST_ADMIN_DSN"
+      - name: Start fake embed server (background)
+        run: |
+          nohup python tests/fake_embed_server.py --host 127.0.0.1 --port 11999 \
+            > "$RUNNER_TEMP/fake-embed-server.log" 2>&1 &
+          for _ in $(seq 1 20); do
+            curl -fsS -o /dev/null "http://127.0.0.1:11999/api/embed" -X POST \
+              -H "Content-Type: application/json" -d '{"model":"x","input":"ping"}' && break
+            sleep 0.5
+          done
+      - name: Run upstream conformance suite (pinned ref)
+        run: scripts/conformance.sh
+      - name: Show fake embed server log on failure
+        if: failure()
+        run: cat "$RUNNER_TEMP/fake-embed-server.log" || true
+
+  # Weekly drift report against hermes-agent's `main`, never blocking (this is
+  # the one job in this file allowed to fail): a real behaviour change
+  # upstream shows up here first, before it becomes a merge-day surprise on
+  # the next HERMES_AGENT_REF bump.
+  conformance-drift:
+    name: conformance (upstream hermes-agent @ main, drift report)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    continue-on-error: true
+    services:
+      postgres:
+        image: pgvector/pgvector:pg17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U postgres"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=10
+    env:
+      PG_TEST_DSN: "host=127.0.0.1 port=5432 user=hermes password=hermes dbname=hermes_conformance"
+      PG_TEST_ADMIN_DSN: "host=127.0.0.1 port=5432 user=postgres password=postgres dbname=hermes_conformance"
+      PG_TEST_EMBED_URL: "http://127.0.0.1:11999"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install package + test deps
+        run: pip install -e ".[test]"
+      - name: Create role hermes + database hermes_conformance
+        run: |
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 -c "
+            DO \$\$
+            BEGIN
+              IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'hermes') THEN
+                CREATE ROLE hermes LOGIN PASSWORD 'hermes';
+              END IF;
+            END
+            \$\$;"
+          PGPASSWORD=postgres psql -h 127.0.0.1 -p 5432 -U postgres -d postgres -v ON_ERROR_STOP=1 -c \
+            "CREATE DATABASE hermes_conformance OWNER postgres;"
+      - name: Migrate hermes_conformance (as postgres)
+        run: python -m hermes_pgvector migrate --admin-dsn "$PG_TEST_ADMIN_DSN"
+      - name: Start fake embed server (background)
+        run: |
+          nohup python tests/fake_embed_server.py --host 127.0.0.1 --port 11999 \
+            > "$RUNNER_TEMP/fake-embed-server.log" 2>&1 &
+          for _ in $(seq 1 20); do
+            curl -fsS -o /dev/null "http://127.0.0.1:11999/api/embed" -X POST \
+              -H "Content-Type: application/json" -d '{"model":"x","input":"ping"}' && break
+            sleep 0.5
+          done
+      - name: Run upstream conformance suite (hermes-agent main -- drift report)
+        run: scripts/conformance.sh main
+      - name: Show fake embed server log on failure
+        if: failure()
+        run: cat "$RUNNER_TEMP/fake-embed-server.log" || true

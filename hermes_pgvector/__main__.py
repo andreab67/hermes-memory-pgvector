@@ -3,13 +3,14 @@
 Runs standalone (no hermes-agent runtime needed), so it is safe in cron:
 
     hermes-pgvector install  [--hermes-home ~/.hermes] [--remove] [--force]
-    hermes-pgvector migrate  --admin-dsn "dbname=hermes_memory user=postgres host=/var/run/postgresql"
+    hermes-pgvector migrate  --admin-dsn "dbname=hermes_memory user=postgres host=/var/run/postgresql" [--runtime-role NAME]
     hermes-pgvector stats    [--dsn ...]
     hermes-pgvector backfill [--dsn ...] [--embed-url ...] [--embed-dim 768] [--embed-protocol auto]
                              [--embed-api-key-env NAME] [--batch-size 100] [--dry-run]
     hermes-pgvector prune    --days 90 [--dsn ...] [--execute]
-    hermes-pgvector cleanup  --identities "agent:main:whatsapp:dm:17192714834,skill-bench,skill-bench-ws" [--execute]
+    hermes-pgvector cleanup  --identities "agent:main:whatsapp:dm:15550100123,skill-bench,skill-bench-ws" [--execute]
     hermes-pgvector remap    --old hermes --new agent-hermes [--execute] [--force]
+    hermes-pgvector --version
 
 `install` (v0.4.2) makes a pip-installed package discoverable by hermes-agent:
 it writes a tiny shim into $HERMES_HOME/plugins/pgvector/ that resolves to
@@ -101,14 +102,20 @@ def _make_embed_fn(args, file_cfg: dict):
 
 def cmd_migrate(args) -> int:
     # The store is constructed on the ADMIN dsn so the post-migration probe
-    # below checks the database that was actually migrated. (v0.4.2 — it
+    # below checks the database that was actually migrated. (v0.4.2 -- it
     # previously probed a hard-coded 'dbname=postgres', so the "migration 002
     # present" line reported on the wrong database.)
     store = MemoryStore(args.admin_dsn)
-    applied = store.apply_all_migrations(admin_dsn=args.admin_dsn)
-    print(f"applied migrations: {', '.join(applied) if applied else '(none found)'}")
-    print(f"migration 002 present: {store.ensure_migration_002_applied()}")
-    store.close()
+    try:
+        effective_role = args.runtime_role or "hermes"
+        applied = store.apply_all_migrations(
+            admin_dsn=args.admin_dsn, runtime_role=args.runtime_role
+        )
+        print(f"applied migrations: {', '.join(applied) if applied else '(none found)'}")
+        print(f"runtime role: {effective_role}")
+        print(f"migration 002 present: {store.ensure_migration_002_applied()}")
+    finally:
+        store.close()
     return 0
 
 
@@ -282,114 +289,160 @@ def cmd_install(args) -> int:
 def cmd_stats(args) -> int:
     file_cfg = _load_config_file(args.config)
     store = _make_store(args, file_cfg)
-    health = store.health()
-    print(f"health: {json.dumps(health)}")
-    mem = store.count()
-    conv = store.count_turns()
-    print(f"memory_entries: {mem} rows")
-    print(f"conversations:  {conv} rows")
-    # null-embedding counts (dry-run backfill returns remaining-null per table).
-    # `remaining` counts only rows that CAN be embedded; empty/whitespace rows
-    # are reported separately, because they never shrink and would otherwise
-    # make this number look permanently stuck for no actionable reason.
-    dim = _embed_dim(_embed_config(args, file_cfg))
-    nulls = store.backfill_null_embeddings(
-        embed_fn=lambda t: [0.0] * dim, dry_run=True, expected_dim=dim
-    )
-    for table, info in nulls.items():
-        line = f"  {table}: {info['remaining']} null-embedding rows (backfillable)"
-        stuck = info.get("unembeddable")
-        if stuck:
-            line += f", {stuck} un-embeddable (empty content — will never backfill)"
-        print(line)
-    if store.ensure_migration_002_applied():
-        print("migration 002: applied — per-agent attribution:")
-        for row in store.agent_attribution():
-            print(
-                f"  {row['agent_identity']:<36} kind={row.get('kind') or '-':<8} "
-                f"memory={row.get('memory_rows', 0):<5} conv={row.get('conversation_rows', 0)}"
-            )
-    else:
-        print("migration 002: NOT applied (agent attribution unavailable)")
-    return 0
+    try:
+        health = store.health()
+        print(f"health: {json.dumps(health)}")
+        mem = store.count()
+        conv = store.count_turns()
+        print(f"memory_entries: {mem} rows")
+        print(f"conversations:  {conv} rows")
+        # null-embedding counts (dry-run backfill returns remaining-null per table).
+        # `remaining` counts only rows that CAN be embedded; empty/whitespace rows
+        # are reported separately, because they never shrink and would otherwise
+        # make this number look permanently stuck for no actionable reason.
+        dim = _embed_dim(_embed_config(args, file_cfg))
+        nulls = store.backfill_null_embeddings(
+            embed_fn=lambda t: [0.0] * dim, dry_run=True, expected_dim=dim
+        )
+        for table, info in nulls.items():
+            line = f"  {table}: {info['remaining']} null-embedding rows (backfillable)"
+            stuck = info.get("unembeddable")
+            if stuck:
+                line += f", {stuck} un-embeddable (empty content -- will never backfill)"
+            print(line)
+        if store.ensure_migration_002_applied():
+            print("migration 002: applied -- per-agent attribution:")
+            for row in store.agent_attribution():
+                print(
+                    f"  {row['agent_identity']:<36} kind={row.get('kind') or '-':<8} "
+                    f"memory={row.get('memory_rows', 0):<5} conv={row.get('conversation_rows', 0)}"
+                )
+        else:
+            print("migration 002: NOT applied (agent attribution unavailable)")
+        return 0
+    finally:
+        store.close()
 
 
 def cmd_backfill(args) -> int:
+    """Exit codes (L4): 0 = done (remaining == 0 for every table and no
+    table carries a `note`); 2 = embed endpoint unavailable or a table's run
+    was aborted (any table result carries a `note`, e.g. "embed-unavailable"
+    or "aborted-consecutive-failures"); 3 = rows still remaining or failed,
+    with no `note`. --dry-run stays informational and always exits 0."""
     file_cfg = _load_config_file(args.config)
     store = _make_store(args, file_cfg)
-    tables = tuple(args.tables.split(",")) if args.tables else None
-    embed_fn = _make_embed_fn(args, file_cfg)
-    result = store.backfill_null_embeddings(
-        embed_fn=embed_fn, tables=tables, batch_size=args.batch_size, dry_run=args.dry_run,
-        expected_dim=_embed_dim(_embed_config(args, file_cfg)),
-    )
-    print(json.dumps(result, indent=2))
-    if not args.dry_run:
+    try:
+        tables = tuple(args.tables.split(",")) if args.tables else None
+        embed_fn = _make_embed_fn(args, file_cfg)
+        result = store.backfill_null_embeddings(
+            embed_fn=embed_fn, tables=tables, batch_size=args.batch_size, dry_run=args.dry_run,
+            expected_dim=_embed_dim(_embed_config(args, file_cfg)),
+        )
+        print(json.dumps(result, indent=2))
+        if args.dry_run:
+            return 0
         for table, info in result.items():
             store.log_maintenance(
                 operation="backfill", target_table=table,
                 affected_count=info.get("succeeded"), dry_run=False, details=info,
             )
-    return 0
+        if any(info.get("note") for info in result.values()):
+            return 2
+        if any(
+            (info.get("remaining") or 0) > 0 or (info.get("failed") or 0) > 0
+            for info in result.values()
+        ):
+            return 3
+        return 0
+    finally:
+        store.close()
 
 
 def cmd_prune(args) -> int:
     file_cfg = _load_config_file(args.config)
     store = _make_store(args, file_cfg)
-    days = args.days if args.days is not None else int(_resolve(args, file_cfg, "ttl_days") or 0)
-    dry_run = not args.execute  # destructive -> default dry-run, like cleanup/remap
-    n = store.prune_conversations(older_than_days=days, dry_run=dry_run)
-    verb = "would delete" if dry_run else "deleted"
-    print(f"prune (>{days}d, dry_run={dry_run}): {verb} {n} conversation rows")
-    if not dry_run and days > 0:
-        store.log_maintenance(operation="prune", target_table="conversations",
-                              affected_count=n, dry_run=False, details={"days": days})
-    return 0
+    try:
+        days = args.days if args.days is not None else int(_resolve(args, file_cfg, "ttl_days") or 0)
+        dry_run = not args.execute  # destructive -> default dry-run, like cleanup/remap
+        n = store.prune_conversations(older_than_days=days, dry_run=dry_run)
+        verb = "would delete" if dry_run else "deleted"
+        print(f"prune (>{days}d, dry_run={dry_run}): {verb} {n} conversation rows")
+        if not dry_run and days > 0:
+            store.log_maintenance(operation="prune", target_table="conversations",
+                                  affected_count=n, dry_run=False, details={"days": days})
+        return 0
+    finally:
+        store.close()
 
 
 def cmd_cleanup(args) -> int:
     file_cfg = _load_config_file(args.config)
     store = _make_store(args, file_cfg)
-    identities = [s.strip() for s in args.identities.split(",") if s.strip()]
-    tables = tuple(args.tables.split(",")) if args.tables else None
-    dry_run = not args.execute
-    print(f"cleanup identities={identities} dry_run={dry_run}")
-    # PII content scan first (a phone number may live in row CONTENT, not just identity)
-    pii = store.scan_pii()
-    print(f"PII content scan (\\d{{10,11}}): {json.dumps(pii)}")
-    result = store.delete_by_identity(identities=identities, tables=tables, dry_run=dry_run)
-    verb = "would delete" if dry_run else "deleted"
-    print(f"{verb}: {json.dumps(result)}")
-    if not dry_run:
-        for table, cnt in result.items():
-            store.log_maintenance(
-                operation="cleanup_delete", target_table=table,
-                identity_pattern=",".join(identities), affected_count=cnt,
-                dry_run=False, details={"pii_scan": pii},
-            )
-    return 0
+    try:
+        identities = [s.strip() for s in args.identities.split(",") if s.strip()]
+        tables = tuple(args.tables.split(",")) if args.tables else None
+        dry_run = not args.execute
+        print(f"cleanup identities={identities} dry_run={dry_run}")
+        # PII content scan first (a phone number may live in row CONTENT, not
+        # just identity). Scoped to --tables (L8): scanning the whole
+        # whitelist when the operator asked for one table wastes a full
+        # table scan on top of the delete this command already runs.
+        pii = store.scan_pii(tables=tables)
+        print(f"PII content scan (10-11 digit numbers): {json.dumps(pii)}")
+        result = store.delete_by_identity(identities=identities, tables=tables, dry_run=dry_run)
+        verb = "would delete" if dry_run else "deleted"
+        print(f"{verb}: {json.dumps(result)}")
+        if not dry_run:
+            for table, cnt in result.items():
+                store.log_maintenance(
+                    operation="cleanup_delete", target_table=table,
+                    identity_pattern=",".join(identities), affected_count=cnt,
+                    dry_run=False, details={"pii_scan": pii},
+                )
+        return 0
+    finally:
+        store.close()
 
 
 def cmd_remap(args) -> int:
     file_cfg = _load_config_file(args.config)
     store = _make_store(args, file_cfg)
-    dry_run = not args.execute
-    result = store.remap_identity(
-        old_identity=args.old, new_identity=args.new, dry_run=dry_run, force=args.force,
-    )
-    print(json.dumps(result, indent=2))
-    if not dry_run:
-        store.log_maintenance(
-            operation="remap_identity", identity_pattern=f"{args.old}->{args.new}",
-            affected_count=result.get("memory_entries", {}).get("moved"),
-            dropped_dupes=result.get("memory_entries", {}).get("dropped_duplicates"),
-            dry_run=False, details=result,
+    try:
+        dry_run = not args.execute
+        result = store.remap_identity(
+            old_identity=args.old, new_identity=args.new, dry_run=dry_run, force=args.force,
         )
-    return 0
+        print(json.dumps(result, indent=2))
+        if not dry_run:
+            store.log_maintenance(
+                operation="remap_identity", identity_pattern=f"{args.old}->{args.new}",
+                affected_count=result.get("memory_entries", {}).get("moved"),
+                dropped_dupes=result.get("memory_entries", {}).get("dropped_duplicates"),
+                dry_run=False, details=result,
+            )
+        return 0
+    finally:
+        store.close()
+
+
+def _version_string() -> str:
+    """`hermes-pgvector VERSION`, or `hermes-pgvector unknown` if the
+    distribution metadata is not installed (e.g. running from a clone
+    without `pip install .`) -- never crashes the CLI over this."""
+    try:
+        from importlib.metadata import PackageNotFoundError, version
+    except ImportError:  # pragma: no cover -- unsupported Python
+        return "hermes-pgvector unknown"
+    try:
+        return "hermes-pgvector " + version("hermes-memory-pgvector")
+    except PackageNotFoundError:
+        return "hermes-pgvector unknown"
 
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="hermes-pgvector", description="hermes-memory-pgvector maintenance CLI")
+    p.add_argument("--version", action="version", version=_version_string())
     sub = p.add_subparsers(dest="command", required=True)
 
     def add_common(sp):
@@ -413,6 +466,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     m = sub.add_parser("migrate", help="apply all migrations as DB admin")
     m.add_argument("--admin-dsn", required=True, help="superuser/owner DSN (CREATE/GRANT)")
+    m.add_argument(
+        "--runtime-role", default=None,
+        help="runtime role to GRANT DML to in 002/004/005 (default: 'hermes'; "
+             "psql users get the same effect with "
+             "PGOPTIONS='-c hermes_pgvector.runtime_role=NAME')",
+    )
     m.set_defaults(func=cmd_migrate)
 
     s = sub.add_parser("stats", help="row counts, null-embedding counts, per-agent attribution")

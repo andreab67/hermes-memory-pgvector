@@ -1,18 +1,18 @@
--- 002_agent_attribution.sql -- v0.4.0 agent attribution + delegation provenance.
+-- 002_agent_attribution.sql — v0.4.0 agent attribution + delegation provenance.
 --
 -- ADDITIVE ONLY. Never edit 001_schema.sql. Idempotent (IF NOT EXISTS everywhere);
 -- safe to re-run. Apply once as DB admin (superuser/owner), AFTER 001:
 --   sudo -u postgres psql -d hermes_memory -f 002_agent_attribution.sql
 --
 -- ===========================================================================
--- OWNERSHIP BOUNDARY  (hard architectural line -- invariants #1 and #5)
+-- OWNERSHIP BOUNDARY  (hard architectural line — invariants #1 and #5)
 -- ===========================================================================
 -- This migration creates ONLY hermes-owned PROVENANCE tables. It MUST NOT
 -- reference, FK, trigger, or view the postgres-owned events / entities /
 -- relations tables (those are created by hermes-vps/scripts/memory/
 -- memory-synthesize.py; relations FKs to events). Parent->child delegation
--- links use parent_session_id TEXT -- a string reference to
--- conversations.session_id -- NEVER an FK to events(id).
+-- links use parent_session_id TEXT — a string reference to
+-- conversations.session_id — NEVER an FK to events(id).
 --
 -- These tables are PROVENANCE ONLY ("which agent, which memory, who delegated
 -- to whom, when"). Do NOT add confidence_score / derived_insight / entity-link
@@ -26,12 +26,12 @@
 -- On PostgreSQL 18, adding a NULLable column with NO DEFAULT is a catalog-only
 -- change (~10-20ms, SHARE UPDATE EXCLUSIVE). It does NOT rewrite the heap and
 -- does NOT invalidate the HNSW index on the unchanged `embedding` column.
--- DO NOT REINDEX as part of this migration -- a REINDEX takes ACCESS EXCLUSIVE
+-- DO NOT REINDEX as part of this migration — a REINDEX takes ACCESS EXCLUSIVE
 -- and would block the writing fleet. Take a pg_dump before applying.
 
 
 -- ---------------------------------------------------------------------------
--- memory_agents -- canonical registry of agent identities the plugin has seen.
+-- memory_agents — canonical registry of agent identities the plugin has seen.
 -- One row per (normalized) agent_identity, upserted on each session init.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS memory_agents (
@@ -46,9 +46,9 @@ CREATE TABLE IF NOT EXISTS memory_agents (
 
 
 -- ---------------------------------------------------------------------------
--- memory_agent_edges -- parent->child delegation / relationship provenance.
+-- memory_agent_edges — parent->child delegation / relationship provenance.
 -- parent_session_id / child_session_id are STRING refs to conversations.session_id
--- (NOT foreign keys -- and never to events(id), which is owned by another system).
+-- (NOT foreign keys — and never to events(id), which is owned by another system).
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS memory_agent_edges (
   id                BIGSERIAL PRIMARY KEY,
@@ -71,14 +71,14 @@ CREATE INDEX IF NOT EXISTS ix_memory_agent_edges_psession
 
 
 -- ---------------------------------------------------------------------------
--- conversations -- add parent-session linkage for delegation traceback.
+-- conversations — add parent-session linkage for delegation traceback.
 -- NULLable, no default => catalog-only change; HNSW index stays valid. No REINDEX.
 -- ---------------------------------------------------------------------------
 ALTER TABLE conversations ADD COLUMN IF NOT EXISTS parent_session_id TEXT;
 
 
 -- ---------------------------------------------------------------------------
--- memory_maintenance_log -- audit trail for destructive maintenance ops
+-- memory_maintenance_log — audit trail for destructive maintenance ops
 -- (cleanup deletes, identity remaps, TTL prunes, backfills). Hermes-owned.
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS memory_maintenance_log (
@@ -95,7 +95,7 @@ CREATE TABLE IF NOT EXISTS memory_maintenance_log (
 
 
 -- ---------------------------------------------------------------------------
--- v_agent_memory -- per-identity attribution across the TWO plugin-owned tables.
+-- v_agent_memory — per-identity attribution across the TWO plugin-owned tables.
 -- Reads ONLY memory_entries + conversations + memory_agents. Never touches the
 -- postgres-owned events / entities / relations tables.
 -- ---------------------------------------------------------------------------
@@ -118,41 +118,13 @@ ORDER BY i.agent_identity;
 
 
 -- ---------------------------------------------------------------------------
--- GRANTs -- runtime role gets DML on the NEW tables ONLY.
+-- GRANTs — runtime role 'hermes' gets DML on the NEW tables ONLY.
 -- Scoped explicitly to these objects: never GRANT ... ON ALL TABLES/SEQUENCES,
 -- which would leak privileges onto the postgres-owned events/entities/relations.
---
--- The role is read from the session GUC hermes_pgvector.runtime_role (H1):
--- apply_migration_as_admin() sets it with
--- SELECT set_config('hermes_pgvector.runtime_role', '<role>', false) on the
--- admin connection before running this file; a plain `psql -f` run sets the
--- same GUC with PGOPTIONS='-c hermes_pgvector.runtime_role=<role>' -- both
--- paths are read by the same current_setting(..., true) call below. NULL or
--- empty (the GUC was never set -- e.g. an older `migrate` or a bare `psql -f`
--- with no PGOPTIONS) falls back to 'hermes'. If that role does not exist,
--- this block RAISE NOTICEs instead of failing, so 003/004/005 still run
--- (H1) -- the operator must then grant manually.
 -- ---------------------------------------------------------------------------
-DO $$
-DECLARE
-  target_role text := current_setting('hermes_pgvector.runtime_role', true);
-BEGIN
-  IF target_role IS NULL OR target_role = '' THEN
-    target_role := 'hermes';
-  END IF;
-  IF EXISTS (SELECT 1 FROM pg_roles WHERE rolname = target_role) THEN
-    EXECUTE format('GRANT USAGE ON SCHEMA public TO %I', target_role);
-    EXECUTE format(
-      'GRANT SELECT, INSERT, UPDATE, DELETE ON memory_agents, memory_agent_edges, memory_maintenance_log TO %I',
-      target_role
-    );
-    EXECUTE format(
-      'GRANT USAGE, SELECT ON SEQUENCE memory_agents_id_seq, memory_agent_edges_id_seq, memory_maintenance_log_id_seq TO %I',
-      target_role
-    );
-    EXECUTE format('GRANT SELECT ON v_agent_memory TO %I', target_role);
-  ELSE
-    RAISE NOTICE 'runtime role "%" not found -- grant SELECT/INSERT/UPDATE/DELETE on memory_agents, memory_agent_edges, memory_maintenance_log (SELECT on v_agent_memory, USAGE on their id sequences) to your runtime role manually', target_role;
-  END IF;
-END
-$$;
+GRANT USAGE ON SCHEMA public TO hermes;
+GRANT SELECT, INSERT, UPDATE, DELETE
+  ON memory_agents, memory_agent_edges, memory_maintenance_log TO hermes;
+GRANT USAGE, SELECT
+  ON SEQUENCE memory_agents_id_seq, memory_agent_edges_id_seq, memory_maintenance_log_id_seq TO hermes;
+GRANT SELECT ON v_agent_memory TO hermes;

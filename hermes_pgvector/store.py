@@ -45,6 +45,11 @@ def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+def _is_blank(text: Optional[str]) -> bool:
+    """True for None, "", or whitespace-only — matches Python's str.strip()."""
+    return not (text or "").strip()
+
+
 class MemoryStore:
     """Postgres-backed mirror of hermes-agent's built-in memory entries."""
 
@@ -158,32 +163,71 @@ class MemoryStore:
                         "installed package's hermes_pgvector/migrations/ directory, in order)"
                     )
 
-    def apply_migration_as_admin(self, *, admin_dsn: str, migration: str = "001_schema.sql") -> None:
+    def apply_migration_as_admin(
+        self,
+        *,
+        admin_dsn: str,
+        migration: str = "001_schema.sql",
+        runtime_role: Optional[str] = None,
+    ) -> None:
         """One-shot admin path: run a single migration with privileged creds.
 
-        Bypasses the runtime pool — opens a fresh autocommit connection
+        Bypasses the runtime pool -- opens a fresh autocommit connection
         with admin_dsn (typically `user=postgres host=/var/run/postgresql`)
         so CREATE EXTENSION + CREATE TABLE + CREATE INDEX + GRANT all succeed.
         Idempotent: every migration uses IF NOT EXISTS, so re-running on an
         already-migrated DB is a no-op. `migration` selects the file under
         migrations/ (default 001_schema.sql; v0.4.0 adds 002_agent_attribution.sql).
+
+        runtime_role (H1): when given, set on THIS connection with
+        `SELECT set_config('hermes_pgvector.runtime_role', runtime_role, false)`
+        before executing the migration file, so 002/004/005's `DO $$ ... $$`
+        GRANT blocks resolve the role to grant via `current_setting(...)`
+        instead of falling back to 'hermes'. Applied per-connection because
+        each call to this method opens its own connection (and GUCs set with
+        is_local=false are session-scoped, not persisted across connections).
+        None/omitted leaves the GUC unset, so those blocks fall back to
+        'hermes' as before.
+
+        Migration files are read and executed as raw UTF-8 BYTES, not str
+        (L10): psycopg/libpq negotiate a client_encoding matching the
+        server's encoding, and a database created with `ENCODING
+        'SQL_ASCII'` would otherwise route the text through Python's
+        'ascii' codec on send -- which fails on any non-ASCII comment
+        character (001 and 003, which this migration set can never edit,
+        still contain some). SQL_ASCII performs no server-side encoding
+        validation, so hosting the same UTF-8 bytes through it is a no-op;
+        this makes `migrate` work unmodified against such a database
+        without weakening encoding handling on a normal UTF8 one.
         """
         sql_path = Path(__file__).parent / "migrations" / migration
-        sql = sql_path.read_text(encoding="utf-8")
+        sql_bytes = sql_path.read_bytes()
         with psycopg.connect(admin_dsn, autocommit=True) as conn:
             with conn.cursor() as cur:
-                cur.execute(sql)
+                if runtime_role:
+                    cur.execute(
+                        "SELECT set_config('hermes_pgvector.runtime_role', %s, false)",
+                        (runtime_role,),
+                    )
+                cur.execute(sql_bytes)
 
-    def apply_all_migrations(self, *, admin_dsn: str) -> List[str]:
+    def apply_all_migrations(
+        self, *, admin_dsn: str, runtime_role: Optional[str] = None
+    ) -> List[str]:
         """Apply every migrations/*.sql in lexical order. Returns the names run.
 
-        Lexical order (001_, 002_, …) is the apply order. All migrations are
-        additive + idempotent, so this is safe to run repeatedly.
+        Lexical order (001_, 002_, ...) is the apply order. All migrations are
+        additive + idempotent, so this is safe to run repeatedly. runtime_role
+        (H1) is forwarded to every apply_migration_as_admin() call -- see its
+        docstring; each migration file gets its own connection, so the GUC is
+        set fresh before each one.
         """
         mig_dir = Path(__file__).parent / "migrations"
         applied: List[str] = []
         for p in sorted(mig_dir.glob("*.sql")):
-            self.apply_migration_as_admin(admin_dsn=admin_dsn, migration=p.name)
+            self.apply_migration_as_admin(
+                admin_dsn=admin_dsn, migration=p.name, runtime_role=runtime_role
+            )
             applied.append(p.name)
         return applied
 
@@ -227,8 +271,12 @@ class MemoryStore:
     ) -> Optional[int]:
         """Insert a memory entry. Returns row id, or None if duplicate (no-op).
 
-        Matches the built-in tool's "reject exact duplicate" semantics via
-        the (agent_identity, target, content) unique constraint + ON CONFLICT.
+        Matches the built-in tool's "reject exact duplicate" semantics via a
+        unique index on (agent_identity, target, content) — or, once
+        migration 005 lands, on (agent_identity, target, md5(content)), which
+        removes content's btree row-size ceiling (M1). ON CONFLICT DO NOTHING
+        is written with NO conflict target, so it is satisfied by either
+        index — this works before and after 005 without a code change.
         """
         meta_json = json.dumps(metadata or {})
         vec_literal = to_pgvector_literal(embedding) if embedding is not None else None
@@ -240,7 +288,7 @@ class MemoryStore:
                     INSERT INTO memory_entries
                         (agent_identity, target, content, embedding, metadata)
                     VALUES (%s, %s, %s, %s::vector, %s::jsonb)
-                    ON CONFLICT (agent_identity, target, content) DO NOTHING
+                    ON CONFLICT DO NOTHING
                     RETURNING id
                     """,
                     (agent_identity, target, content, vec_literal, meta_json),
@@ -254,36 +302,60 @@ class MemoryStore:
         *,
         agent_identity: str,
         target: str,
-        old_text: str,
+        old_text: str = "",
         new_content: str,
         new_embedding: Optional[List[float]] = None,
+        exact_content: Optional[str] = None,
     ) -> int:
-        """Update the entry in (agent_identity, target) where content contains old_text.
+        """Update the entry in (agent_identity, target) matching old_text or exact_content.
 
-        Matches built-in semantics — old_text is a substring match, and only
-        the FIRST match (lowest id) is updated. This also sidesteps
-        memory_entries_unique (UNIQUE(agent_identity, target, content),
-        001_schema.sql): a bulk UPDATE across every matching row would try to
-        set 2+ rows to the identical new_content and raise UniqueViolation,
-        rolling back the whole statement.
+        Default (exact_content=None): old_text is a substring match (LIKE,
+        metacharacters escaped — v0.4.2), and only the FIRST match (lowest
+        id) is updated. This also sidesteps the content-uniqueness index: a
+        bulk UPDATE across every matching row would try to set 2+ rows to
+        the identical new_content and raise UniqueViolation, rolling back
+        the whole statement.
+
+        exact_content (H2, v0.6.0): when given as a non-empty string,
+        matches content = %s exactly instead — never LIKE. This is for
+        callers that received the upstream tool's `previous_content` (the
+        exact prior entry, e.g. from memory_manager.notify_memory_tool_write):
+        that text can contain LIKE metacharacters or be a substring of an
+        unrelated row, so substring matching on it is simply wrong.
+        old_text is ignored whenever exact_content is given. A blank (empty
+        or whitespace-only) exact_content matches nothing — it never falls
+        back to old_text/LIKE and never updates a row.
         """
         vec_literal = (
             to_pgvector_literal(new_embedding) if new_embedding is not None else None
         )
+        if exact_content is not None:
+            if _is_blank(exact_content):
+                return 0
+            # md5(content) alongside the raw equality lets the post-005
+            # (agent_identity, target, md5(content)) unique index serve this
+            # lookup too, whichever index is actually live on this database.
+            match_sql = (
+                "agent_identity = %s AND target = %s "
+                "AND content = %s AND md5(content) = md5(%s)"
+            )
+            match_params: tuple = (agent_identity, target, exact_content, exact_content)
+        else:
+            match_sql = "agent_identity = %s AND target = %s AND content LIKE %s"
+            match_params = (agent_identity, target, f"%{_escape_like(old_text)}%")
         with self._get_pool().connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     UPDATE memory_entries
                        SET content = %s, embedding = %s::vector, updated_at = now()
                      WHERE id = (
                          SELECT id FROM memory_entries
-                          WHERE agent_identity = %s AND target = %s AND content LIKE %s
+                          WHERE {match_sql}
                           ORDER BY id LIMIT 1
                      )
                     """,
-                    (new_content, vec_literal, agent_identity, target,
-                     f"%{_escape_like(old_text)}%"),
+                    (new_content, vec_literal, *match_params),
                 )
                 updated = cur.rowcount
                 conn.commit()
@@ -294,9 +366,10 @@ class MemoryStore:
         *,
         agent_identity: str,
         target: str,
-        old_text: str,
+        old_text: str = "",
+        exact_content: Optional[str] = None,
     ) -> int:
-        """Delete THE entry in (agent_identity, target) matching old_text.
+        """Delete THE entry in (agent_identity, target) matching old_text or exact_content.
 
         Deletes at most ONE row (lowest id), matching both the built-in tool
         and this class's own replace(). The built-in requires a UNIQUE match
@@ -308,31 +381,50 @@ class MemoryStore:
 
         Returns the number of rows deleted (0 or 1).
 
-        REFUSES an empty or whitespace-only old_text. `%{""}%` is `LIKE '%%'`,
-        which matches every row -- so a caller that lost the removal target
-        would silently delete the entire mirror for that (agent_identity,
-        target) instead of one entry. A delete this destructive must never be
-        reachable by omission; the caller has to say what it means to remove.
+        Default (exact_content=None) REFUSES an empty or whitespace-only
+        old_text: `%{""}%` is `LIKE '%%'`, which matches every row -- so a
+        caller that lost the removal target would silently delete the entire
+        mirror for that (agent_identity, target) instead of one entry. A
+        delete this destructive must never be reachable by omission; the
+        caller has to say what it means to remove.
+
+        exact_content (H2, v0.6.0): when given as a non-empty string,
+        matches content = %s exactly instead of LIKE, and old_text's
+        non-empty requirement does not apply — old_text is ignored entirely
+        in that case. A blank (empty or whitespace-only) exact_content is
+        NOT treated as "not given": it still refuses to delete anything
+        (returns 0) rather than falling back to old_text/LIKE, so a caller
+        that passes an accidentally-empty exact_content can never wipe the
+        scope either.
         """
-        if not (old_text or "").strip():
-            raise ValueError(
-                "remove() requires a non-empty old_text: an empty pattern is "
-                "LIKE '%%', which would delete every entry in this scope"
+        if exact_content is not None:
+            if _is_blank(exact_content):
+                return 0
+            match_sql = (
+                "agent_identity = %s AND target = %s "
+                "AND content = %s AND md5(content) = md5(%s)"
             )
+            match_params: tuple = (agent_identity, target, exact_content, exact_content)
+        else:
+            if _is_blank(old_text):
+                raise ValueError(
+                    "remove() requires a non-empty old_text: an empty pattern is "
+                    "LIKE '%%', which would delete every entry in this scope"
+                )
+            match_sql = "agent_identity = %s AND target = %s AND content LIKE %s"
+            match_params = (agent_identity, target, f"%{_escape_like(old_text)}%")
         with self._get_pool().connection() as conn:
             with conn.cursor() as cur:
                 cur.execute(
-                    """
+                    f"""
                     DELETE FROM memory_entries
                      WHERE id = (
                          SELECT id FROM memory_entries
-                          WHERE agent_identity = %s
-                            AND target = %s
-                            AND content LIKE %s
+                          WHERE {match_sql}
                           ORDER BY id LIMIT 1
                      )
                     """,
-                    (agent_identity, target, f"%{_escape_like(old_text)}%"),
+                    match_params,
                 )
                 deleted = cur.rowcount
                 conn.commit()
@@ -386,10 +478,12 @@ class MemoryStore:
         target=None → search both 'memory' and 'user'.
         exclude_identities → themes omitted even from a cross-theme sweep, so
         the PII/bench sinks stay out of ordinary recall (read-side gate).
+        Rows with a NULL embedding (not yet backfilled) are excluded (L6,
+        v0.6.0) -- use hybrid_search() to also recover those via full-text.
         Returns rows with `score` = 1 - cosine_distance ∈ [0, 1].
         """
         vec_literal = to_pgvector_literal(query_embedding)
-        clauses: List[str] = []
+        clauses: List[str] = ["embedding IS NOT NULL"]
         params: List[Any] = []
         if agent_identity:
             clauses.append("agent_identity = %s")
@@ -400,7 +494,7 @@ class MemoryStore:
         if exclude_identities:
             clauses.append("agent_identity <> ALL(%s)")
             params.append(list(exclude_identities))
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        where = "WHERE " + " AND ".join(clauses)
 
         with self._get_pool().connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -587,17 +681,25 @@ class MemoryStore:
         caller so the plugin can pass its `embed()` with the configured
         base_url + model.
 
-        Returns: {'parsed': N, 'inserted': M, 'skipped': K} where N=M+K.
+        A per-entry INSERT error (M1, v0.6.0) — e.g. on a pre-005 database,
+        an incompressible entry that exceeds the raw-text unique index's
+        btree row-size limit — is caught, counted in `failed`, and logged
+        ONCE per file (not once per entry) with the total count; the loop
+        continues with the next entry instead of aborting the rest of the
+        file.
+
+        Returns: {'parsed': N, 'inserted': M, 'skipped': K, 'failed': F}
+        where N = M + K + F.
         """
         from pathlib import Path as _Path
         p = _Path(file_path)
         if not p.exists():
-            return {"parsed": 0, "inserted": 0, "skipped": 0}
+            return {"parsed": 0, "inserted": 0, "skipped": 0, "failed": 0}
 
         raw = p.read_text(encoding="utf-8", errors="replace")
         entries = [e.strip() for e in raw.split(self.ENTRY_DELIMITER) if e.strip()]
         if not entries:
-            return {"parsed": 0, "inserted": 0, "skipped": 0}
+            return {"parsed": 0, "inserted": 0, "skipped": 0, "failed": 0}
 
         # Single bulk SELECT of existing content for this scope. Beats N+1
         # by a wide margin and keeps re-init nearly free.
@@ -611,6 +713,7 @@ class MemoryStore:
 
         inserted = 0
         skipped = 0
+        failed = 0
         # Circuit breaker (v0.4.2): this loop runs SYNCHRONOUSLY inside
         # initialize(), and a hanging (not refused) embed endpoint costs up to
         # ~20s per entry (two protocol attempts × 10s timeout). Without a
@@ -636,19 +739,31 @@ class MemoryStore:
                             "inserting remaining entries text-only "
                             "(the backfill sweep will re-embed them)"
                         )
-            row_id = self.add(
-                agent_identity=agent_identity,
-                target=target,
-                content=entry,
-                embedding=vec,
-                metadata={"source": "bulk_import", "file": str(p)},
-            )
+            try:
+                row_id = self.add(
+                    agent_identity=agent_identity,
+                    target=target,
+                    content=entry,
+                    embedding=vec,
+                    metadata={"source": "bulk_import", "file": str(p)},
+                )
+            except Exception as exc:  # noqa: BLE001 -- M1: one bad entry must
+                # not abort the rest of the file; count it and move on.
+                failed += 1
+                logger.debug("bulk_upsert_md: entry insert failed: %s", str(exc)[:200])
+                continue
             if row_id is not None:
                 inserted += 1
             else:
                 # Lost a race with another writer that inserted the same row.
                 skipped += 1
-        return {"parsed": len(entries), "inserted": inserted, "skipped": skipped}
+        if failed:
+            logger.warning(
+                "bulk_upsert_md: %d entr%s in %s failed to insert (debug log "
+                "has the per-entry detail)",
+                failed, "y" if failed == 1 else "ies", p,
+            )
+        return {"parsed": len(entries), "inserted": inserted, "skipped": skipped, "failed": failed}
 
     # -- Conversation turns (v0.2) ------------------------------------------
 
@@ -712,9 +827,11 @@ class MemoryStore:
         min_similarity: float = 0.0,
         exclude_identities: Optional[Sequence[str]] = None,
     ) -> List[Dict[str, Any]]:
-        """Semantic recall over conversation turns. Same shape as `search()`."""
+        """Semantic recall over conversation turns. Same shape as `search()`.
+
+        Also excludes NULL-embedding rows (L6, v0.6.0), same as search()."""
         vec_literal = to_pgvector_literal(query_embedding)
-        clauses: List[str] = []
+        clauses: List[str] = ["embedding IS NOT NULL"]
         params: List[Any] = []
         if agent_identity:
             clauses.append("agent_identity = %s")
@@ -725,7 +842,7 @@ class MemoryStore:
         if exclude_identities:
             clauses.append("agent_identity <> ALL(%s)")
             params.append(list(exclude_identities))
-        where = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+        where = "WHERE " + " AND ".join(clauses)
 
         with self._get_pool().connection() as conn:
             with conn.cursor(row_factory=dict_row) as cur:
@@ -837,19 +954,52 @@ class MemoryStore:
                 cur.execute(f"SELECT COUNT(*) FROM memory_entries {where}", params)
                 return int(cur.fetchone()[0])
 
+    def estimate_count(self, table: str) -> Optional[int]:
+        """Fast, approximate row count for a whitelisted table (M6, v0.6.0).
+
+        Reads Postgres's own planner statistic (pg_class.reltuples) instead
+        of running COUNT(*) -- O(1) instead of a full table/index scan, at
+        the cost of being only as fresh as the last autovacuum/ANALYZE.
+        Returns None (never -1 or 0) when the table isn't in
+        CLEANUP_WHITELIST, doesn't exist yet, or has never been analyzed --
+        callers must treat None as "unknown", not "zero". Never raises."""
+        if table not in self.CLEANUP_WHITELIST:
+            return None
+        try:
+            with self._get_pool().connection(timeout=3.0) as conn:
+                with conn.cursor() as cur:
+                    cur.execute(
+                        "SELECT reltuples FROM pg_class WHERE oid = to_regclass(%s)",
+                        (table,),
+                    )
+                    row = cur.fetchone()
+                    if row is None or row[0] is None:
+                        return None
+                    estimate = float(row[0])
+                    return int(estimate) if estimate > 0 else None
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("estimate_count(%s) failed: %s", table, exc)
+            return None
+
     def health(self) -> Dict[str, Any]:
-        """Liveness probe — pool reachable + table exists. Never raises."""
+        """Liveness probe — pool reachable + table exists. Never raises.
+
+        v0.6.0 (M6): no longer runs COUNT(*) on every call (a full-table scan
+        on every session init at scale) -- reports row_count_estimate from
+        pg_class.reltuples via estimate_count() instead. Callers that need an
+        exact SCOPED count should use count()/count_turns(), which stay
+        index-backed and cheap at any table size.
+        """
         try:
             with self._get_pool().connection(timeout=3.0) as conn:
                 with conn.cursor() as cur:
                     cur.execute("SELECT to_regclass('memory_entries') IS NOT NULL")
                     has_table = bool(cur.fetchone()[0])
                     if not has_table:
-                        return {"ok": False, "error": "memory_entries table missing", "row_count": 0}
-                    cur.execute("SELECT COUNT(*) FROM memory_entries")
-                    return {"ok": True, "error": "", "row_count": int(cur.fetchone()[0])}
+                        return {"ok": False, "error": "memory_entries table missing", "row_count_estimate": None}
+            return {"ok": True, "error": "", "row_count_estimate": self.estimate_count("memory_entries")}
         except Exception as exc:  # noqa: BLE001
-            return {"ok": False, "error": str(exc)[:200], "row_count": 0}
+            return {"ok": False, "error": str(exc)[:200], "row_count_estimate": None}
 
     # -- Agent attribution + delegation (v0.4.0; requires migration 002) ------
 
@@ -937,6 +1087,7 @@ class MemoryStore:
         batch_size: int = 100,
         dry_run: bool = False,
         expected_dim: int = 768,
+        max_consecutive_failures: int = 20,
     ) -> Dict[str, Dict[str, Any]]:
         """Re-embed rows with embedding IS NULL in plugin-owned tables.
 
@@ -948,6 +1099,24 @@ class MemoryStore:
         never write a wrong-dim vector. If the embed endpoint is
         unreachable, the run aborts cleanly (nothing to backfill right now).
 
+        v0.6.0 (H3): a single keyset-paginated pass per table (`id > last_id
+        ORDER BY id LIMIT batch_size`) — a failing row is visited exactly
+        once and never re-fetched, so permanently-failing rows at the low
+        end of the id range can no longer stall every later row forever. A
+        consecutive-failure breaker (max_consecutive_failures, default 20)
+        stops the table's pass early if the embed endpoint is flapping
+        badly, marking the result with note="aborted-consecutive-failures";
+        any row that does not raise (a success OR a skipped_changed row,
+        below) resets the counter. This replaces the old "whole batch
+        failed -> stop" heuristic.
+
+        v0.6.0 (M2): the persisting UPDATE is guarded with `WHERE id = %s
+        AND embedding IS NULL AND content = %s` — if a replace()/remove()
+        changed or deleted the row between the SELECT and the UPDATE, the
+        write is skipped (counted as `skipped_changed`, not `failed` or
+        `succeeded`) instead of stamping the row's new content with the old
+        text's embedding.
+
         Rows whose content is empty or whitespace are EXCLUDED, not failed.
         embed() raises EmbeddingError("empty input") on such text, so selecting
         them means retrying a guaranteed failure on every nightly run forever,
@@ -956,7 +1125,8 @@ class MemoryStore:
         are reported separately as `unembeddable` so they are skipped, not
         hidden.
 
-        Returns {table: {processed, succeeded, failed, remaining, unembeddable}}.
+        Returns {table: {processed, succeeded, failed, remaining,
+        unembeddable, skipped_changed, [note]}}.
         """
         tables = self._assert_whitelisted(tables)
         result: Dict[str, Dict[str, Any]] = {}
@@ -968,6 +1138,7 @@ class MemoryStore:
                 logger.warning("backfill aborted — embed endpoint unavailable: %s", str(exc)[:200])
                 return {t: {"processed": 0, "succeeded": 0, "failed": 0,
                             "remaining": None, "unembeddable": None,
+                            "skipped_changed": None,
                             "note": "embed-unavailable"} for t in tables}
             if not isinstance(probe, list) or len(probe) != int(expected_dim):
                 got = len(probe) if isinstance(probe, list) else type(probe).__name__
@@ -1004,10 +1175,14 @@ class MemoryStore:
                 )
             if dry_run:
                 result[t] = {"processed": 0, "succeeded": 0, "failed": 0,
-                             "remaining": remaining, "unembeddable": unembeddable}
+                             "remaining": remaining, "unembeddable": unembeddable,
+                             "skipped_changed": 0}
                 continue
 
-            processed = succeeded = failed = 0
+            processed = succeeded = failed = skipped_changed = 0
+            consecutive_failures = 0
+            aborted = False
+            last_id = 0
             while True:
                 with self._get_pool().connection() as conn:
                     with conn.cursor(row_factory=dict_row) as cur:
@@ -1015,14 +1190,15 @@ class MemoryStore:
                             f"SELECT id, content FROM {t} "
                             f"WHERE embedding IS NULL "
                             rf"  AND content ~ '\S' "
+                            f"  AND id > %s "
                             f"ORDER BY id LIMIT %s",
-                            (batch_size,),
+                            (last_id, batch_size),
                         )
                         rows = list(cur.fetchall())
                 if not rows:
                     break
-                batch_progress = 0
                 for r in rows:
+                    last_id = r["id"]
                     processed += 1
                     # The whole embed → literal → UPDATE pipeline is fail-soft
                     # per row (v0.4.2): a vector that embeds "successfully" but
@@ -1035,18 +1211,30 @@ class MemoryStore:
                         with self._get_pool().connection() as conn:
                             with conn.cursor() as cur:
                                 cur.execute(
-                                    f"UPDATE {t} SET embedding = %s::vector WHERE id = %s",
-                                    (vec_literal, r["id"]),
+                                    f"UPDATE {t} SET embedding = %s::vector "
+                                    f"WHERE id = %s AND embedding IS NULL AND content = %s",
+                                    (vec_literal, r["id"], r["content"]),
                                 )
+                                row_changed = cur.rowcount > 0
                                 conn.commit()
                     except Exception:  # noqa: BLE001 — fail-soft, leave NULL
                         failed += 1
+                        consecutive_failures += 1
+                        if consecutive_failures >= max_consecutive_failures:
+                            aborted = True
+                            break
                         continue
-                    succeeded += 1
-                    batch_progress += 1
-                # If an entire batch failed to embed (endpoint flapping), stop —
-                # the same rows would just be re-fetched forever otherwise.
-                if batch_progress == 0:
+                    consecutive_failures = 0
+                    if row_changed:
+                        succeeded += 1
+                    else:
+                        # Content changed (or the row vanished) between the
+                        # SELECT and the UPDATE -- e.g. a replace()/remove()
+                        # landed mid-backfill. Skipping is correct: writing
+                        # this vector now would attach the OLD text's
+                        # embedding to whatever the row holds today (M2).
+                        skipped_changed += 1
+                if aborted:
                     break
 
             with self._get_pool().connection() as conn:
@@ -1056,9 +1244,20 @@ class MemoryStore:
                         rf"WHERE embedding IS NULL AND content ~ '\S'"
                     )
                     remaining = int(cur.fetchone()[0])
-            result[t] = {"processed": processed, "succeeded": succeeded,
-                         "failed": failed, "remaining": remaining,
-                         "unembeddable": unembeddable}
+            entry: Dict[str, Any] = {
+                "processed": processed, "succeeded": succeeded,
+                "failed": failed, "remaining": remaining,
+                "unembeddable": unembeddable, "skipped_changed": skipped_changed,
+            }
+            if aborted:
+                entry["note"] = "aborted-consecutive-failures"
+                logger.warning(
+                    "backfill %s: aborted after %d consecutive failures "
+                    "(processed=%d succeeded=%d failed=%d) -- endpoint may be "
+                    "down or rejecting these rows; re-run once it recovers",
+                    t, max_consecutive_failures, processed, succeeded, failed,
+                )
+            result[t] = entry
         return result
 
     def prune_conversations(self, *, older_than_days: int, dry_run: bool = False) -> int:
@@ -1085,13 +1284,18 @@ class MemoryStore:
                 conn.commit()
                 return int(n)
 
-    def scan_pii(self, *, pattern: str = r"\d{10,11}", tables=None) -> Dict[str, int]:
+    def scan_pii(self, *, pattern: str = r"(^|[^0-9])[0-9]{10,11}([^0-9]|$)", tables=None) -> Dict[str, int]:
         """Count rows whose content matches a PII regex (default: 10-11 digit
-        phone numbers). For pre-cleanup review — does NOT modify anything.
+        phone numbers, bounded so it does NOT match inside a longer digit run
+        -- v0.6.0, L8; the old \\d{10,11} matched any 10-11 digit window of,
+        say, a 15-digit number too). For pre-cleanup review — does NOT modify
+        anything.
 
         Identity-based deletion only removes rows whose agent_identity is the DM
         key; a phone number embedded in another row's CONTENT survives. Run this
-        to find those before declaring PII cleanup complete."""
+        to find those before declaring PII cleanup complete. `tables` is
+        whitelist-guarded like every other maintenance method (defaults to
+        the whole CLEANUP_WHITELIST when omitted)."""
         tables = self._assert_whitelisted(tables)
         out: Dict[str, int] = {}
         with self._get_pool().connection() as conn:
@@ -1143,10 +1347,13 @@ class MemoryStore:
     ) -> Dict[str, Any]:
         """Merge old_identity into new_identity across plugin-owned tables.
 
-        memory_entries has UNIQUE(agent_identity, target, content): a naive
-        UPDATE would abort on collisions, so we INSERT ... ON CONFLICT DO NOTHING
-        then DELETE the old rows (duplicates are dropped, not errored).
-        conversations has no unique constraint (turns are events) → plain UPDATE.
+        memory_entries has a unique index on (agent_identity, target,
+        content) -- or, once migration 005 lands, on (agent_identity,
+        target, md5(content)), M1: a naive UPDATE would abort on collisions,
+        so we INSERT ... ON CONFLICT DO NOTHING (no conflict target, so it
+        is satisfied by either index) then DELETE the old rows (duplicates
+        are dropped, not errored). conversations has no unique constraint
+        (turns are events) → plain UPDATE.
 
         dry_run=True (default) reports {moved, dropped_duplicates} without
         changing anything. When duplicates would be dropped, force=True is
@@ -1211,7 +1418,7 @@ class MemoryStore:
                         (agent_identity, target, content, embedding, created_at, updated_at, metadata)
                     SELECT %s, target, content, embedding, created_at, updated_at, metadata
                       FROM memory_entries WHERE agent_identity = %s
-                    ON CONFLICT (agent_identity, target, content) DO NOTHING
+                    ON CONFLICT DO NOTHING
                     """,
                     (new_identity, old_identity),
                 )

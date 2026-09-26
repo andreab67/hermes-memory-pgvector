@@ -18,7 +18,7 @@ Config in $HERMES_HOME/config.yaml under plugins.pgvector:
     plugins:
       pgvector:
         dsn:        "dbname=hermes_memory user=hermes host=/var/run/postgresql"
-        embed_url:  "http://192.168.100.50:11434"
+        embed_url:  "http://localhost:11434"
         embed_model: "nomic-embed-text"
         embed_dim: 768             # must match the model AND the vector(N) columns
         embed_api_key_env: ""      # NAME of an env var holding a bearer token
@@ -29,9 +29,9 @@ Config in $HERMES_HOME/config.yaml under plugins.pgvector:
         scope_default: "current"   # 'current' | 'all'
         hybrid_search: true        # fuse vector + full-text (RRF) in recall tools
 
-Tools exposed: `recall_memory` (one explicit search tool). All built-in
-memory writes (add/replace/remove) are mirrored automatically via the
-on_memory_write hook — no agent-facing change.
+Tools exposed: `recall_memory` and `recall_conversation` (two explicit search
+tools). All built-in memory writes (add/replace/remove) are mirrored
+automatically via the on_memory_write hook — no agent-facing change.
 """
 
 from __future__ import annotations
@@ -39,11 +39,14 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
+import time
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 try:
-    from agent.memory_provider import MemoryProvider
+    from agent.memory_provider import MemoryProvider, spawn_context_thread
     from tools.registry import tool_error
     from hermes_cli.config import cfg_get
 except ImportError:  # pragma: no cover
@@ -52,6 +55,14 @@ except ImportError:  # pragma: no cover
     # the provider class is never instantiated outside the agent, only the store/
     # embed/identity helpers + the maintenance CLI are used here.
     MemoryProvider = object  # type: ignore[assignment,misc]
+
+    def spawn_context_thread(  # type: ignore[misc]
+        target, *, name: str, daemon: bool = True, args: tuple = (), kwargs=None,
+    ) -> threading.Thread:
+        # Standalone fallback: no profile-isolation contextvars to bind (that
+        # machinery lives in agent.memory_provider). Same shape as upstream --
+        # an UNSTARTED daemon thread the caller starts itself.
+        return threading.Thread(target=target, args=args, kwargs=kwargs or {}, name=name, daemon=daemon)
 
     def tool_error(msg: str) -> str:  # type: ignore[misc]
         return json.dumps({"error": msg})
@@ -203,7 +214,11 @@ RECALL_MEMORY_SCHEMA = {
 
 DEFAULTS = {
     "dsn": "dbname=hermes_memory user=hermes host=/var/run/postgresql connect_timeout=5",
-    "embed_url": "http://192.168.100.50:11434",
+    # L2 (v0.6.0): was a private LAN address -- wrong default
+    # for anyone outside that one deployment, and it leaked that deployment's
+    # topology into every fresh install. Upgrade note: set this explicitly
+    # before upgrading if you relied on the old default.
+    "embed_url": "http://localhost:11434",
     "embed_model": "nomic-embed-text",
     # v0.5.3 -- the embedding contract is configuration, not code. Defaults
     # reproduce the pre-0.5.3 behaviour exactly: 768 dims, no Authorization
@@ -254,10 +269,40 @@ DEFAULTS = {
     # Hot path stays short on purpose: prefetch and the recall tools run on the
     # agent thread, and a slow query there degrades to full-text-only recall,
     # which is a good outcome. Waiting longer would be the worse one.
-    "embed_timeout": 10.0,
+    #
+    # v0.6.0 (H4): lowered from 10.0. The host's external-provider prefetch
+    # budget is a hard 8s (agent.memory_manager._EXTERNAL_PREFETCH_TIMEOUT_S) --
+    # under embed_protocol='auto' a single embed() call can try BOTH the
+    # OpenAI-compat and Ollama-native paths, and 10s per call already left no
+    # room for that fallback (let alone the DB search after it) inside the
+    # host's budget. See prefetch_budget below, which is what prefetch()'s
+    # synchronous fallback path actually enforces.
+    "embed_timeout": 5.0,
     # Writer drain only. Nothing is waiting on it, and the cost of giving up is
     # a permanently unsearchable row, so it gets real headroom.
     "embed_write_timeout": 30.0,
+    # v0.6.0 (H4) -- hard wall-clock budget for prefetch()'s SYNCHRONOUS
+    # fallback path (embed + search), used only when queue_prefetch() has not
+    # already cached a formatted block for this session. Passed to embed() as
+    # its timeout, which -- under embed_protocol='auto' -- is now ONE shared
+    # deadline across both the OpenAI-compat and Ollama-native attempts (see
+    # embed.py), not a fresh full timeout for each. Must stay below the host's
+    # 8s external-prefetch budget or the host logs a timeout warning and skips
+    # this provider on later turns until the stuck call returns.
+    "prefetch_budget": 5.0,
+    # v0.6.0 (M4) -- which agent_context values from initialize()'s kwargs are
+    # allowed to WRITE. Recall (prefetch, recall tools, system_prompt_block) is
+    # never gated by this -- only mutation paths. "primary" is normal
+    # interactive/API traffic; "cron" is real scheduled work; "subagent" output
+    # reaches the parent via on_delegation, not by writing directly under its
+    # own context; "flush" is a background teardown pass. Accepts a comma
+    # string (save_config()) or a YAML list; compared lowercased/stripped.
+    "write_contexts": "primary,cron",
+    # v0.6.0 (M3) -- timeout passed to the writer's shutdown() drain. Kept
+    # short: while draining, _maybe_embed() short-circuits to None (no embed
+    # endpoint call), so the drain is DB-only and fast -- rows land text-only
+    # and the nightly backfill sweep heals them later.
+    "shutdown_drain_timeout": 10.0,
 }
 
 
@@ -315,6 +360,61 @@ def _as_theme_list(value: Any) -> Optional[List[str]]:
         return list(value) or None
     except TypeError:
         return None
+
+
+def _as_write_contexts(value: Any) -> List[str]:
+    """Coerce write_contexts into a lowercased/stripped list of context names.
+
+    Same string-vs-list hazard as _as_theme_list (config arrives as a
+    save_config() comma string OR a hand-edited config.yaml YAML list), but
+    unlike allowed_themes an empty/missing/malformed value is never "off" --
+    write_contexts must always resolve to a concrete list, so this falls back
+    to DEFAULTS["write_contexts"] instead of returning None.
+    """
+    default = DEFAULTS["write_contexts"]
+    if value is None or (isinstance(value, str) and not value.strip()):
+        value = default
+    if isinstance(value, str):
+        items = [x.strip().lower() for x in value.split(",") if x.strip()]
+    else:
+        try:
+            items = [str(x).strip().lower() for x in value if str(x).strip()]
+        except TypeError:
+            items = []
+    return items or [x.strip().lower() for x in default.split(",") if x.strip()]
+
+
+def _as_alias_map(value: Any) -> Dict[str, str]:
+    """Coerce identity_aliases into a real {raw: canonical} dict.
+
+    Same string-vs-container hazard as _as_theme_list/_as_write_contexts, but
+    for a MAPPING: get_config_schema() types are text|integer|number|boolean
+    -- there is no mapping type -- so identity_aliases is declared as `text`
+    in the documented "raw=canonical,raw2=canonical2" form. DEFAULTS ships a
+    real dict and a hand-edited config.yaml may still use the YAML mapping
+    form the README documents, but a string written back by save_config()
+    must never reach normalize_identity()'s `aliases` argument as-is: it
+    iterates its argument as a container (`raw in aliases`), and a str
+    iterates CHARACTER BY CHARACTER, so every alias would silently stop
+    matching.
+    """
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return {str(k): str(v) for k, v in value.items()}
+    if isinstance(value, str):
+        out: Dict[str, str] = {}
+        for pair in value.split(","):
+            pair = pair.strip()
+            if not pair or "=" not in pair:
+                continue
+            raw, _, canonical = pair.partition("=")
+            raw = raw.strip()
+            canonical = canonical.strip()
+            if raw and canonical:
+                out[raw] = canonical
+        return out
+    return {}
 
 
 def _embed_dim(config: Dict[str, Any]) -> int:
@@ -391,6 +491,12 @@ class PgvectorMemoryProvider(MemoryProvider):
     # session means this holds roughly 150 sessions before a reset.
     _FINGERPRINT_CAP = 10000
 
+    # H4 (v0.6.0) -- upper bound on the queue_prefetch() cache, keyed by
+    # session_id. Bounds a long-lived provider instance the same way
+    # _FINGERPRINT_CAP does; a provider only ever needs a handful of
+    # concurrent sessions cached at once.
+    _PREFETCH_CACHE_CAP = 32
+
     def __init__(self, config: dict | None = None):
         self._config = {**DEFAULTS, **(config or {})}
         self._store: Optional[MemoryStore] = None
@@ -403,10 +509,37 @@ class PgvectorMemoryProvider(MemoryProvider):
         self._delegation_enabled: bool = False        # set in initialize() iff migration 002 applied
         self._embed_warned: bool = False
         self._db_warned: bool = False
+        # v0.6.0 (M4) -- agent_context gate. True until the first initialize()
+        # decides otherwise, so a provider used without initialize() (unit
+        # tests instantiate it directly) keeps writing.
+        self._agent_context: str = "primary"
+        self._writes_enabled: bool = True
+        # v0.6.0 (M3) -- set by shutdown() before draining the writer, cleared
+        # again once a fresh writer is built for a new session. While set,
+        # _maybe_embed() skips the embed endpoint so the drain is DB-only.
+        self._draining: bool = False
         # Fingerprints of turns already enqueued by sync_turn this session, so
         # on_session_end can act as a backstop without double-writing rows the
         # per-turn path already captured (conversations has no unique key).
         self._turn_fingerprints: set = set()
+        # H4 (v0.6.0) -- queue_prefetch()'s background cache. One worker
+        # thread at most, guarded by _prefetch_lock; a newer queue_prefetch()
+        # call while one is in flight replaces _prefetch_pending rather than
+        # starting a second thread. _prefetch_generation is bumped by
+        # initialize()/shutdown() so a worker still running from a PRIOR
+        # session can't write a stale cache entry after the cache has been
+        # dropped for the new one.
+        self._prefetch_cache: "OrderedDict[str, str]" = OrderedDict()
+        self._prefetch_lock = threading.Lock()
+        self._prefetch_pending: Optional[tuple] = None
+        self._prefetch_thread: Optional[threading.Thread] = None
+        self._prefetch_generation: int = 0
+        # M6 (v0.6.0) -- system_prompt_block() is STATIC per the upstream
+        # contract; computed once (initialize(), or lazily on first call for
+        # callers that skip initialize()) and cached here so later calls never
+        # re-query the DB. None = "not computed yet"; a computed value is
+        # never None (an empty string is a valid cached result).
+        self._system_prompt_block_cache: Optional[str] = None
 
     @property
     def name(self) -> str:
@@ -446,14 +579,21 @@ class PgvectorMemoryProvider(MemoryProvider):
         #   3. agent_workspace — shared workspace name from some platforms.
         #   4. agent_identity == 'default' — accept it now (no other source).
         #   5. 'default'        — last-resort bucket for unscoped traffic.
-        explicit_identity = kwargs.get("agent_identity")
+        # Only strings count as an identity source: a non-string value (a
+        # misbehaving host) is treated as absent rather than raising out of
+        # normalize_identity() (invariant #4).
+        def _ident(key: str) -> Optional[str]:
+            value = kwargs.get(key)
+            return value if isinstance(value, str) else None
+
+        explicit_identity = _ident("agent_identity")
         if explicit_identity == "default":
             explicit_identity = None  # sentinel — let header take over
         self._agent_identity = (
-            kwargs.get("gateway_session_key")
+            _ident("gateway_session_key")
             or explicit_identity
-            or kwargs.get("agent_workspace")
-            or kwargs.get("agent_identity")  # accept 'default' if nothing else set
+            or _ident("agent_workspace")
+            or _ident("agent_identity")  # accept 'default' if nothing else set
             or "default"
         )
 
@@ -466,7 +606,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         canonical, normalized, reason = normalize_identity(
             self._agent_identity,
             allowed_themes=_as_theme_list(self._config.get("allowed_themes")),
-            aliases=self._config.get("identity_aliases") or {},
+            aliases=_as_alias_map(self._config.get("identity_aliases")),
             bench_mode=self._config.get("bench_mode", "bucket"),
         )
         if normalized:
@@ -477,6 +617,21 @@ class PgvectorMemoryProvider(MemoryProvider):
         self._agent_identity = canonical
         # Parent-session linkage for delegation traceback (subagents only).
         self._parent_session_id = kwargs.get("parent_session_id") or None
+
+        # v0.6.0 (M4) -- agent_context write gate. Upstream values: primary |
+        # subagent | cron | flush (agent/agent_init.py). Recall (prefetch,
+        # recall tools, system_prompt_block) is never gated by this -- only
+        # mutation paths (on_memory_write, sync_turn, on_session_end,
+        # on_delegation, plus the bulk import + register_agent enqueue below).
+        raw_context = kwargs.get("agent_context")
+        self._agent_context = str(raw_context).strip().lower() if raw_context else "primary"
+        write_contexts = _as_write_contexts(self._config.get("write_contexts"))
+        self._writes_enabled = self._agent_context in write_contexts
+        logger.info(
+            "pgvector: agent_context=%r write_contexts=%r -> writes %s",
+            self._agent_context, write_contexts,
+            "enabled" if self._writes_enabled else "disabled",
+        )
 
         # Re-initialization guard (v0.3.1): one registered provider instance
         # can have initialize() called again for a new session — the gateway
@@ -515,6 +670,11 @@ class PgvectorMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             _queue_max = int(DEFAULTS["write_queue_maxsize"])
         self._writer = AsyncWriter(self._worker, maxsize=_queue_max)
+        # v0.6.0 (M3): a fresh writer means a fresh drain -- clear the flag a
+        # prior shutdown() (e.g. the re-initialization guard above, on a
+        # reused provider instance) may have left set, or every write this
+        # session would silently skip embedding.
+        self._draining = False
 
         # v0.4: agent attribution + delegation require migration 002. Probe it
         # SEPARATELY from ensure_schema() (which stays 001-only) so a v0.4 binary
@@ -531,7 +691,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                     "pgvector: migration 002 not applied — agent attribution/"
                     "delegation disabled (apply 002_agent_attribution.sql to enable)"
                 )
-            else:
+            elif self._writes_enabled:
                 # Register this agent in the provenance registry (best-effort, async).
                 self._writer.enqueue(
                     action="register_agent",
@@ -550,13 +710,44 @@ class PgvectorMemoryProvider(MemoryProvider):
         # row in place alongside the new one, and recall (cosine / RRF, no
         # recency tiebreak) can surface both. `hermes-pgvector cleanup` is
         # the only remedy.
-        if self._healthy and _as_bool(self._config.get("bulk_sync_on_init"), True):
+        if (
+            self._healthy
+            and self._writes_enabled
+            and _as_bool(self._config.get("bulk_sync_on_init"), True)
+        ):
             self._bulk_sync_from_disk(kwargs.get("hermes_home"))
 
+        # M6 (v0.6.0): compute the STATIC system-prompt block ONCE here, after
+        # the bulk import above so a freshly-imported store's counts are
+        # reflected -- system_prompt_block() then just returns this cached
+        # value and never queries the DB again for the rest of the session.
+        self._system_prompt_block_cache = self._compute_system_prompt_block()
+
     def shutdown(self) -> None:
+        # H4 (v0.6.0): drop the queue_prefetch() cache and bump the
+        # generation counter FIRST, so a worker thread from a session that is
+        # ending (still running because it is a daemon thread we never join)
+        # cannot write a stale entry into the NEXT session's cache after this
+        # returns -- see _prefetch_worker_loop's generation check.
+        with self._prefetch_lock:
+            self._prefetch_cache.clear()
+            self._prefetch_pending = None
+            self._prefetch_generation += 1
         # Drain the in-flight writes first so we don't drop work...
         if self._writer:
-            self._writer.shutdown(timeout=5.0)
+            # v0.6.0 (M3): set BEFORE draining. _maybe_embed() checks this and
+            # returns None without calling the embed endpoint, so the drain is
+            # DB-only and fast -- rows land text-only; the nightly backfill
+            # sweep heals them. Without this, one write mid-drain can spend up
+            # to embed_write_timeout * 2 blocking the drain thread, and
+            # shutdown_drain_timeout below abandons every write still queued
+            # behind it.
+            self._draining = True
+            timeout = _as_float(
+                self._config.get("shutdown_drain_timeout"),
+                DEFAULTS["shutdown_drain_timeout"],
+            )
+            self._writer.shutdown(timeout=timeout)
             self._writer = None
         # ...then close the pool the writer was draining into.
         if self._store:
@@ -598,45 +789,177 @@ class PgvectorMemoryProvider(MemoryProvider):
     # -- System prompt + ambient recall --------------------------------------
 
     def system_prompt_block(self) -> str:
+        # M6 (v0.6.0): computed ONCE (initialize() primes this as its last
+        # step); this lazy branch only covers a caller that skips
+        # initialize() entirely (unit tests; a defensive fallback). Either
+        # way, at most one DB round trip per cached value -- never one per
+        # call.
+        if self._system_prompt_block_cache is None:
+            self._system_prompt_block_cache = self._compute_system_prompt_block()
+        return self._system_prompt_block_cache
+
+    def _compute_system_prompt_block(self) -> str:
+        """The actual count()/estimate_count() work behind system_prompt_block().
+
+        M6 (v0.6.0): count_all used to be an UNSCOPED self._store.count() --
+        a full COUNT(*) over memory_entries on every session init. It is now
+        estimate_count("memory_entries"), which reads pg_class.reltuples
+        (O(1)) instead. That helper returns None (never 0) whenever the
+        estimate is unknown -- a genuinely empty table and a stale
+        pre-ANALYZE zero are indistinguishable from reltuples alone -- so
+        None must never be rendered as "0 total" (that would assert
+        something false: XCUT-3b). A failed SCOPED count is likewise not the
+        same fact as "the store has zero rows"; that path returns ""
+        instead of falling through to an "Empty store" claim.
+        """
         if not self._healthy or not self._store:
             return ""
         try:
             count_scoped = self._store.count(agent_identity=self._agent_identity)
-            count_all = self._store.count()
         except Exception as exc:  # noqa: BLE001
-            # A failed count is NOT an empty store. Falling through to the
-            # "Empty store" branch asserts something false to the model about
-            # a store that is merely unreachable; stay silent instead.
             logger.debug("pgvector system_prompt_block count failed: %s", exc)
             return ""
-        if count_all == 0:
+        try:
+            count_all = self._store.estimate_count("memory_entries")
+        except Exception as exc:  # noqa: BLE001 -- best-effort global figure only
+            logger.debug("pgvector system_prompt_block estimate_count failed: %s", exc)
+            count_all = None
+
+        if count_scoped == 0 and count_all is None:
+            # Nothing to report for THIS theme, and no reliable global figure
+            # either -- NOT the same claim as "Empty store" (other themes may
+            # already hold rows; estimate_count() returning None here is
+            # exactly the "can't tell" case, not "zero").
             return (
                 "# pgvector memory\n"
-                "Active. Empty store. Use the built-in `memory` tool to save "
-                "durable notes — entries are mirrored to Postgres with "
-                "embeddings for semantic recall across sessions."
+                "Active. No entries yet for this theme. Use the built-in "
+                "`memory` tool to save durable notes — entries are mirrored "
+                "to Postgres with embeddings for semantic recall across "
+                "sessions."
             )
+        total_desc = (
+            f"{count_all} total across all themes" if count_all is not None
+            else "an unknown number of entries total across all themes"
+        )
         return (
             "# pgvector memory\n"
             f"Active. {count_scoped} entries for '{self._agent_identity}', "
-            f"{count_all} total across all themes. "
+            f"{total_desc}. "
             "Use `recall_memory(query, scope='all'|'<theme>')` for deeper / "
             "cross-theme recall beyond what's in the built-in memory block."
         )
 
     def prefetch(self, query: str, *, session_id: str = "") -> str:
-        if not self._healthy or not self._store or not query:
+        try:
+            return self._prefetch_impl(query, session_id=session_id)
+        except Exception as exc:  # noqa: BLE001 -- invariant #4: never raise into the agent loop
+            logger.debug("pgvector prefetch failed (ignored): %s", exc)
+            return ""
+
+    def _prefetch_impl(self, query: str, *, session_id: str = "") -> str:
+        if not self._healthy or not self._store:
+            return ""
+        # H4 (v0.6.0): a prior queue_prefetch(query, session_id=...) may have
+        # already computed and cached this turn's block. Consume it (once)
+        # instead of paying for a synchronous embed + search here -- that is
+        # the whole point of queue_prefetch existing.
+        cached = self._pop_cached_prefetch(session_id)
+        if cached is not None:
+            return cached
+        if not query:
+            return ""
+        # H4: hard wall-clock budget for the SYNCHRONOUS fallback (used only
+        # when nothing was queued ahead of time). Must stay below the host's
+        # 8s external-prefetch timeout (agent.memory_manager) -- passed to
+        # embed() as its timeout, which is now ONE shared deadline across
+        # embed_protocol='auto''s two HTTP attempts, not a fresh timeout for
+        # each (see embed.py).
+        budget = _as_float(self._config.get("prefetch_budget"), DEFAULTS["prefetch_budget"])
+        deadline = time.monotonic() + budget
+        return self._compute_prefetch_block(query, timeout=budget, deadline=deadline)
+
+    def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        """Queue a background recall for `session_id`; the next prefetch()
+        call for that session consumes the cached block (H4, v0.6.0).
+
+        At most one worker thread runs at a time. A queue_prefetch() call
+        while one is already in flight does not spawn a second thread --
+        it replaces `_prefetch_pending`, so the worker picks up the NEWEST
+        request once it finishes the one it's on. Never raises (invariant
+        #4): scheduling failures are logged and swallowed; the worker loop
+        below has its own independent safety net so a bad embed/search call
+        cannot crash the (daemon) thread either.
+        """
+        try:
+            if not self._healthy or not self._store or not query:
+                return
+            with self._prefetch_lock:
+                self._prefetch_pending = (query, session_id, self._prefetch_generation)
+                if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
+                    return  # a worker is already in flight; it will pick up this request next
+                thread = spawn_context_thread(
+                    target=self._prefetch_worker_loop, name="pgvector-queue-prefetch",
+                )
+                self._prefetch_thread = thread
+                thread.start()
+        except Exception as exc:  # noqa: BLE001 -- invariant #4
+            logger.debug("pgvector queue_prefetch failed to schedule (ignored): %s", exc)
+
+    def _prefetch_worker_loop(self) -> None:
+        # Reads self._agent_identity / self._store live. If initialize() moves
+        # this instance to another theme mid-flight, the block computed here
+        # is discarded by _cache_prefetch()'s generation check -- wasted work,
+        # never a cross-session or cross-theme leak.
+        """Background worker (daemon thread): drain `_prefetch_pending` until
+        empty, one request at a time. Never raises -- a broken embed/search
+        call must not kill this thread (it would silently stop refreshing
+        the cache for the rest of the process) or, worse, escape to the
+        host's executor (which is not this thread, but the discipline is the
+        same as every other fail-soft path in this file)."""
+        while True:
+            with self._prefetch_lock:
+                pending = self._prefetch_pending
+                self._prefetch_pending = None
+            if pending is None:
+                return
+            query, session_id, generation = pending
+            block = ""
+            try:
+                block = self._compute_prefetch_block(query, timeout=self._embed_timeout())
+            except Exception as exc:  # noqa: BLE001 -- must not block shutdown or crash
+                logger.debug("pgvector queue_prefetch worker failed (ignored): %s", exc)
+            self._cache_prefetch(session_id, block, generation=generation)
+
+    def _compute_prefetch_block(
+        self, query: str, *, timeout: float, deadline: Optional[float] = None,
+    ) -> str:
+        """Shared embed + search + format step behind prefetch()'s
+        synchronous fallback and queue_prefetch()'s background worker.
+
+        `deadline` (a time.monotonic() timestamp), when given, enforces
+        prefetch_budget as a hard wall-clock bound on the WHOLE step, not
+        just the embed call: if the embed already ate the budget, the DB
+        search is skipped rather than run past the deadline anyway.
+        queue_prefetch()'s background worker passes no deadline -- it is not
+        blocking anything, so it lets the search run once the embed
+        succeeds.
+        """
+        store = self._store
+        if store is None:
             return ""
         try:
-            vec = _embed_with_config(query, self._config, timeout=self._embed_timeout())
+            vec = _embed_with_config(query, self._config, timeout=timeout)
         except EmbeddingError as exc:
             logger.debug("pgvector prefetch embed failed: %s", exc)
+            return ""
+        if deadline is not None and time.monotonic() >= deadline:
+            logger.debug("pgvector prefetch: embed consumed the budget; skipping search")
             return ""
 
         # Ambient prefetch is scoped to the current agent_identity by
         # default — keeps marketing turns from polluting trading recall.
         try:
-            rows = self._store.search(
+            rows = store.search(
                 query_embedding=vec,
                 agent_identity=self._agent_identity,
                 limit=_as_int(self._config.get("prefetch_limit"),
@@ -660,6 +983,28 @@ class PgvectorMemoryProvider(MemoryProvider):
             lines.append(f"- [{score:.2f}] ({tgt}) {content}")
         return "\n".join(lines)
 
+    def _cache_prefetch(self, session_id: str, block: str, *, generation: int) -> None:
+        """Store `block` for `session_id`, unless a newer initialize()/
+        shutdown() has since bumped the generation counter (H4) -- a worker
+        still finishing up from a session that has already ended must not
+        write into the NEXT session's cache."""
+        key = session_id or ""
+        with self._prefetch_lock:
+            if generation != self._prefetch_generation:
+                return
+            self._prefetch_cache[key] = block
+            self._prefetch_cache.move_to_end(key)
+            while len(self._prefetch_cache) > self._PREFETCH_CACHE_CAP:
+                self._prefetch_cache.popitem(last=False)
+
+    def _pop_cached_prefetch(self, session_id: str) -> Optional[str]:
+        """Consume (pop) the cached block for `session_id`, or None if
+        nothing is cached. Popping means each queued result is used at most
+        once, matching upstream's "prefetch() consumes it next turn"."""
+        key = session_id or ""
+        with self._prefetch_lock:
+            return self._prefetch_cache.pop(key, None)
+
     # -- Turn capture (v0.2) -------------------------------------------------
 
     def sync_turn(
@@ -668,14 +1013,23 @@ class PgvectorMemoryProvider(MemoryProvider):
         assistant_content: str,
         *,
         session_id: str = "",
+        messages: Optional[List[Dict[str, Any]]] = None,
+        turn_author: Optional[Dict[str, Any]] = None,
+        **kwargs: Any,
     ) -> None:
         """Persist a (user, assistant) turn pair to the conversations table.
+
+        Accepts the upstream signature's `messages` / `turn_author` (and any
+        later keyword) so the host never has to strip them; they are unused
+        here -- the turn pair itself is what gets captured.
 
         Non-blocking — enqueues writes; the async writer drains, embeds,
         and INSERTs. Boilerplate / very short turns are filtered out so
         the recall table stays high-signal.
         """
         if not self._healthy or not self._writer:
+            return
+        if not self._writes_enabled:  # v0.6.0 (M4)
             return
         if not _as_bool(self._config.get("sync_turns"), True):
             return
@@ -811,12 +1165,16 @@ class PgvectorMemoryProvider(MemoryProvider):
         """Parent-side capture of a subagent delegation (task -> result).
 
         Records a provenance edge (memory_agent_edges) and stores the
-        delegation as a recallable conversation turn under the parent's theme,
-        linked to the child session via parent_session_id. STRICTLY non-blocking
+        delegation as a recallable conversation turn under the parent's theme.
+        That turn's parent_session_id is the session that delegated to THIS
+        agent (or NULL); the child session id lives in
+        metadata.child_session_id and in the edge. STRICTLY non-blocking
         and fail-soft (invariants #2/#4): enqueue-only, never an inline DB/embed
         call, never raises into the agent loop. No-op until migration 002 is
         applied (self._delegation_enabled)."""
         if not self._healthy or not self._writer or not self._delegation_enabled:
+            return
+        if not self._writes_enabled:  # v0.6.0 (M4)
             return
         try:
             child_identity = kwargs.get("child_identity") or kwargs.get("agent_identity")
@@ -849,7 +1207,13 @@ class PgvectorMemoryProvider(MemoryProvider):
                         "role": "assistant",
                         "session_id": self._session_id or "default",
                         "embed": self._should_embed_turn("assistant", combined, policy),
-                        "parent_session_id": child_session_id,
+                        # v0.6.0 (M5): conversations.parent_session_id is the
+                        # session that DELEGATED this row (migration 002's
+                        # definition), not the child's -- the child session id
+                        # stays in metadata.child_session_id (below) and in
+                        # memory_agent_edges (the "edge" enqueue above). This
+                        # used to write child_session_id here, the reverse.
+                        "parent_session_id": self._parent_session_id,
                     },
                     metadata={"kind": "delegation", "child_session_id": child_session_id},
                 )
@@ -858,18 +1222,31 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     def on_session_end(self, messages: List[Dict[str, Any]]) -> None:
         """Best-effort: capture session turns + bump last_seen. Fail-soft,
-        non-blocking. No LLM summary (invariant #2). No-op until 002 applied."""
-        if not self._healthy or not self._writer or not self._delegation_enabled:
+        non-blocking. No LLM summary (invariant #2).
+
+        v0.6.0 (L9): the turn backstop below runs whenever sync_turns is on
+        and the provider is healthy with a writer -- it no longer needs
+        migration 002. Only the register_agent enqueue stays gated on
+        self._delegation_enabled (memory_agents/last_seen tracking is a 002
+        object). parent_session_id on the backstop's own writes is gated the
+        same way sync_turn() gates it: self._parent_session_id only when 002
+        is applied, else None -- writing it unconditionally would try to
+        INSERT into a column that does not exist on a pre-002 schema.
+        """
+        if not self._healthy or not self._writer:
+            return
+        if not self._writes_enabled:  # v0.6.0 (M4)
             return
         try:
-            self._writer.enqueue(
-                action="register_agent",
-                agent_identity=self._agent_identity,
-                target="memory_agents",
-                content="",
-                extra={"kind": classify_kind(self._agent_identity)},
-                metadata={},
-            )
+            if self._delegation_enabled:
+                self._writer.enqueue(
+                    action="register_agent",
+                    agent_identity=self._agent_identity,
+                    target="memory_agents",
+                    content="",
+                    extra={"kind": classify_kind(self._agent_identity)},
+                    metadata={},
+                )
             # Capture substantive user/assistant turns for conversation recall.
             # Backstop only: sync_turn() already captured this session's turns
             # per-exchange, and the host calls BOTH hooks (and calls this one
@@ -879,6 +1256,7 @@ class PgvectorMemoryProvider(MemoryProvider):
             # an operator who disabled turn capture still got turns persisted.
             if messages and _as_bool(self._config.get("sync_turns"), True):
                 policy = self._config.get("conversation_embed_policy", "all")
+                psid = self._parent_session_id if self._delegation_enabled else None
                 try:
                     min_chars = int(self._config.get("turn_min_chars", 40))
                 except (TypeError, ValueError):
@@ -915,7 +1293,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                             "role": role,
                             "session_id": self._session_id or "default",
                             "embed": self._should_embed_turn(role, content, policy),
-                            "parent_session_id": self._parent_session_id,
+                            "parent_session_id": psid,
                         },
                         metadata={},
                     )
@@ -949,6 +1327,8 @@ class PgvectorMemoryProvider(MemoryProvider):
         """
         if not self._healthy or not self._writer:
             return
+        if not self._writes_enabled:  # v0.6.0 (M4)
+            return
         if target not in ("memory", "user"):
             logger.debug("pgvector ignoring unsupported target: %r", target)
             return
@@ -977,20 +1357,38 @@ class PgvectorMemoryProvider(MemoryProvider):
             )
             return
 
-        meta = dict(metadata or {})
+        # A non-dict metadata (misbehaving host) is dropped, not raised (invariant #4).
+        meta = dict(metadata) if isinstance(metadata, dict) else {}
         meta.setdefault("session_id", self._session_id)
         if self._delegation_enabled and self._parent_session_id:
             meta.setdefault("parent_session_id", self._parent_session_id)
         if self._raw_identity != self._agent_identity:
             meta.setdefault("raw_identity", self._raw_identity)
         old_text = meta.get("old_text") or meta.get("replaces")
+        # H2 (v0.6.0): metadata["previous_content"] is the EXACT prior entry
+        # the built-in store edited under its own lock
+        # (memory_manager.notify_memory_tool_write / MemoryProvider.on_memory_write's
+        # docstring) -- not a caller hint like old_text, which "is not
+        # authoritative identity" per that same docstring. It has to reach the
+        # worker so replace()/remove() can match content = %s exactly instead
+        # of old_text's substring LIKE (which picks the lowest-id match and
+        # can hit an unrelated stale row). It must never be PERSISTED: it is
+        # the full text of a row about to be overwritten/deleted, not
+        # provenance for the new row -- so it is popped here regardless of
+        # whether it turns out to be usable below.
+        previous_content = meta.pop("previous_content", None)
+        extra: Dict[str, Any] = {}
+        if old_text:
+            extra["old_text"] = str(old_text)
+        if isinstance(previous_content, str) and previous_content.strip():
+            extra["previous_content"] = previous_content
 
         self._writer.enqueue(
             action=action,
             agent_identity=self._agent_identity,
             target=target,
             content=content,
-            extra={"old_text": str(old_text)} if old_text else {},
+            extra=extra,
             metadata=meta,
         )
 
@@ -1015,8 +1413,34 @@ class PgvectorMemoryProvider(MemoryProvider):
                 )
             elif item.action == "replace":
                 old_text = item.extra.get("old_text")
+                # H2 (v0.6.0): previous_content, when present, is the exact
+                # prior entry (from upstream's notify_memory_tool_write) --
+                # match it precisely instead of old_text's substring LIKE,
+                # which can hit a stale lower-id row that merely CONTAINS the
+                # pattern rather than the row the built-in store actually
+                # edited.
+                previous_content = item.extra.get("previous_content")
                 vec = self._maybe_embed(item.content)
-                if old_text:
+                if previous_content:
+                    n = self._store.replace(
+                        agent_identity=item.agent_identity,
+                        target=item.target,
+                        new_content=item.content,
+                        new_embedding=vec,
+                        exact_content=previous_content,
+                    )
+                    if n == 0:
+                        # Nothing matched exactly — degrade to add, same as
+                        # the old_text path below (built-in wrote the new
+                        # entry to disk; mirror it so we don't lose it).
+                        self._store.add(
+                            agent_identity=item.agent_identity,
+                            target=item.target,
+                            content=item.content,
+                            embedding=vec,
+                            metadata=item.metadata,
+                        )
+                elif old_text:
                     n = self._store.replace(
                         agent_identity=item.agent_identity,
                         target=item.target,
@@ -1035,8 +1459,8 @@ class PgvectorMemoryProvider(MemoryProvider):
                             metadata=item.metadata,
                         )
                 else:
-                    # No old_text in metadata → can't locate prior row;
-                    # add the new content so we don't lose it.
+                    # No old_text/previous_content in metadata → can't locate
+                    # prior row; add the new content so we don't lose it.
                     self._store.add(
                         agent_identity=item.agent_identity,
                         target=item.target,
@@ -1045,27 +1469,47 @@ class PgvectorMemoryProvider(MemoryProvider):
                         metadata=item.metadata,
                     )
             elif item.action == "remove":
-                # The removal target lives in extra["old_text"], NOT in content.
-                # The built-in tool's remove op takes old_text and leaves content
-                # empty (tools/memory_tool.py: remove -> store.remove(target,
-                # old_text)), and the host forwards old_text via METADATA
-                # (memory_manager.notify_memory_tool_write). Reading item.content
-                # here meant remove() was called with "", which becomes
-                # `content LIKE '%%'` -- matching every row and deleting the
-                # entire mirror for that (agent_identity, target).
-                old_text = item.extra.get("old_text") or item.content
-                if not (old_text or "").strip():
-                    logger.warning(
-                        "pgvector refusing remove with no old_text for %s/%s "
-                        "(would match every row)",
-                        item.agent_identity, item.target,
-                    )
-                else:
-                    self._store.remove(
+                # H2 (v0.6.0): previous_content, when present, is the exact
+                # prior entry -- match it precisely and never fall back to
+                # old_text/LIKE if it matches nothing (a caller that has the
+                # exact text and still gets no match has the wrong row
+                # identity, not an ambiguous pattern to widen).
+                previous_content = item.extra.get("previous_content")
+                if previous_content:
+                    n = self._store.remove(
                         agent_identity=item.agent_identity,
                         target=item.target,
-                        old_text=old_text,
+                        exact_content=previous_content,
                     )
+                    if n == 0:
+                        logger.debug(
+                            "pgvector remove: previous_content matched no row "
+                            "for %s/%s (not falling back to old_text/LIKE)",
+                            item.agent_identity, item.target,
+                        )
+                else:
+                    # The removal target lives in extra["old_text"], NOT in
+                    # content. The built-in tool's remove op takes old_text and
+                    # leaves content empty (tools/memory_tool.py: remove ->
+                    # store.remove(target, old_text)), and the host forwards
+                    # old_text via METADATA (memory_manager.notify_memory_tool_write).
+                    # Reading item.content here meant remove() was called with
+                    # "", which becomes `content LIKE '%%'` -- matching every
+                    # row and deleting the entire mirror for that
+                    # (agent_identity, target).
+                    old_text = item.extra.get("old_text") or item.content
+                    if not (old_text or "").strip():
+                        logger.warning(
+                            "pgvector refusing remove with no old_text for %s/%s "
+                            "(would match every row)",
+                            item.agent_identity, item.target,
+                        )
+                    else:
+                        self._store.remove(
+                            agent_identity=item.agent_identity,
+                            target=item.target,
+                            old_text=old_text,
+                        )
             elif item.action == "turn":
                 role = item.extra.get("role") or "user"
                 sid = item.extra.get("session_id") or "default"
@@ -1215,7 +1659,10 @@ class PgvectorMemoryProvider(MemoryProvider):
 
         # Scope resolution: 'current' → my agent_identity; 'all' → no filter;
         # anything else → treat as explicit theme name.
-        scope = str(args.get("scope") or self._config.get("scope_default") or "current").strip()
+        # Case-folded like stored identities (M7): 'Marketing' must find the
+        # 'marketing' theme, and 'WhatsApp-DM' must hit the restricted-sink
+        # rejection below rather than silently returning nothing.
+        scope = str(args.get("scope") or self._config.get("scope_default") or "current").strip().lower()
         restricted = self._restricted_identities()
         exclude: Optional[List[str]] = None
         if scope == "current":
@@ -1326,7 +1773,8 @@ class PgvectorMemoryProvider(MemoryProvider):
         except (TypeError, ValueError):
             limit = 5
 
-        scope = str(args.get("scope") or "current").strip()
+        # Case-folded like stored identities (M7) -- see handle_tool_call().
+        scope = str(args.get("scope") or "current").strip().lower()
         agent_filter: Optional[str] = None
         session_filter: Optional[str] = None
         restricted = self._restricted_identities()
@@ -1414,127 +1862,208 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     # -- Setup hooks ---------------------------------------------------------
 
+    def identity_signature(self) -> Dict[str, Any]:
+        """Governance config that must bust a cached gateway agent when it
+        changes. Upstream calls this on an UNINITIALIZED instance on every
+        inbound message (agent.memory_provider.MemoryProvider.identity_signature),
+        so it reads self._config only -- no I/O, no self._store, cheap and
+        read-only. allowed_themes/identity_aliases/bench_mode decide which
+        theme a raw identity normalizes to (identity.normalize_identity);
+        write_contexts decides whether a context writes at all -- a cached
+        agent built under the OLD values would keep routing/writing wrong
+        until the process restarts, without this.
+        """
+        return {
+            "pgvector.allowed_themes": _as_theme_list(self._config.get("allowed_themes")),
+            "pgvector.identity_aliases": _as_alias_map(self._config.get("identity_aliases")),
+            "pgvector.bench_mode": self._config.get("bench_mode", DEFAULTS["bench_mode"]),
+            "pgvector.write_contexts": _as_write_contexts(self._config.get("write_contexts")),
+        }
+
     def get_config_schema(self) -> List[Dict[str, Any]]:
         return [
             {
                 "key": "dsn",
                 "description": "Postgres DSN (psycopg connection string)",
+                "type": "text",
                 "default": DEFAULTS["dsn"],
                 "required": True,
             },
             {
                 "key": "embed_url",
                 "description": "Embedding endpoint base URL (OpenAI-compatible or Ollama native)",
+                "type": "text",
                 "default": DEFAULTS["embed_url"],
                 "required": True,
             },
             {
                 "key": "embed_model",
                 "description": "Embedding model name (must return embed_dim-length vectors; 768 by default)",
+                "type": "text",
                 "default": DEFAULTS["embed_model"],
             },
             {
                 "key": "embed_dim",
-                "description": "v0.5.3: vector length the embed model returns. Must also match the database's vector(N) columns (768 as created by migration 001). Changing it on an existing database requires migrating those columns and re-embedding every row -- see README, 'Changing the embedding dimension'.",
-                "default": str(DEFAULTS["embed_dim"]),
+                "description": "Vector length the embed model returns. Must also match the database's vector(N) columns (768 as created by migration 001). Changing it on an existing database requires migrating those columns and re-embedding every row -- see README, 'Changing the embedding dimension'.",
+                "type": "integer",
+                "default": DEFAULTS["embed_dim"],
+                "minimum": 1,
             },
             {
                 "key": "embed_api_key_env",
-                "description": "v0.5.3: NAME of an environment variable holding a bearer token for the embed endpoint (e.g. OPENROUTER_API_KEY) -- never the token itself. Read at call time; when the variable is set and non-empty the plugin sends 'Authorization: Bearer <value>'. Empty = no Authorization header.",
+                "description": "NAME of an environment variable holding a bearer token for the embed endpoint (e.g. OPENROUTER_API_KEY) -- never the token itself. Read at call time; when the variable is set and non-empty the plugin sends 'Authorization: Bearer <value>'. Empty = no Authorization header.",
+                "type": "text",
                 "default": "",
             },
             {
                 "key": "embed_protocol",
-                "description": "v0.5.3: 'auto' tries the OpenAI-compatible /v1/embeddings path, then falls back to Ollama-native /api/embed. 'openai' uses /v1/embeddings only, so auth and unknown-model errors surface as-is (use it for OpenRouter / OpenAI). 'ollama' uses /api/embed only. Unknown values fall back to 'auto' with a warning.",
+                "description": "'auto' tries the OpenAI-compatible /v1/embeddings path, then falls back to Ollama-native /api/embed. 'openai' uses /v1/embeddings only, so auth and unknown-model errors surface as-is (use it for OpenRouter / OpenAI). 'ollama' uses /api/embed only. Unknown values fall back to 'auto' with a warning.",
+                "type": "text",
                 "default": DEFAULTS["embed_protocol"],
                 "choices": ["auto", "openai", "ollama"],
             },
             {
                 "key": "prefetch_limit",
                 "description": "Max ambient recall results injected per turn",
-                "default": str(DEFAULTS["prefetch_limit"]),
+                "type": "integer",
+                "default": DEFAULTS["prefetch_limit"],
+                "minimum": 1,
+                "maximum": 50,
             },
             {
                 "key": "min_similarity",
-                "description": "Cosine similarity cutoff for ambient prefetch (0.0–1.0)",
-                "default": str(DEFAULTS["min_similarity"]),
+                "description": "Cosine similarity cutoff for ambient prefetch",
+                "type": "number",
+                "default": DEFAULTS["min_similarity"],
+                "minimum": 0.0,
+                "maximum": 1.0,
             },
             {
                 "key": "embed_on_write",
                 "description": "Compute embedding on each write; turn off for text-only mode",
-                "default": "true",
-                "choices": ["true", "false"],
+                "type": "boolean",
+                "default": True,
             },
             {
                 "key": "scope_default",
                 "description": "Default scope for recall_memory when caller omits it",
+                "type": "text",
                 "default": DEFAULTS["scope_default"],
                 "choices": ["current", "all"],
             },
             {
                 "key": "hybrid_search",
-                "description": "v0.4.1: fuse the HNSW vector ranking with a Postgres full-text ranking (Reciprocal Rank Fusion) in recall_memory / recall_conversation. Recovers exact-lexical hits cosine smooths away and text-only rows with NULL embeddings; degrades to pure vector on error and to full-text-only when the query fails to embed. Apply migration 003 for the GIN index (works without it, just slower).",
-                "default": "true",
-                "choices": ["true", "false"],
+                "description": "Fuse the HNSW vector ranking with a Postgres full-text ranking (Reciprocal Rank Fusion) in recall_memory / recall_conversation. Recovers exact-lexical hits cosine smooths away and text-only rows with NULL embeddings; degrades to pure vector on error and to full-text-only when the query fails to embed. Apply migration 003 for the GIN index (works without it, just slower).",
+                "type": "boolean",
+                "default": True,
             },
             {
                 "key": "write_queue_maxsize",
-                "description": "Bounded async-writer queue size; full = oldest writes drop with a warning",
-                "default": str(DEFAULTS["write_queue_maxsize"]),
+                "description": "Bounded async-writer queue size; full = newest writes drop with a warning",
+                "type": "integer",
+                "default": DEFAULTS["write_queue_maxsize"],
+                "minimum": 1,
             },
             {
                 "key": "bulk_sync_on_init",
-                "description": "Import MEMORY.md / USER.md content from disk on agent init (v0.1.1)",
-                "default": "true",
-                "choices": ["true", "false"],
+                "description": "Import MEMORY.md / USER.md content from disk on agent init",
+                "type": "boolean",
+                "default": True,
             },
             {
                 "key": "sync_turns",
                 "description": "Capture every substantive (user, assistant) turn pair into the conversations table",
-                "default": "true",
-                "choices": ["true", "false"],
+                "type": "boolean",
+                "default": True,
             },
             {
                 "key": "turn_min_chars",
                 "description": "Turns shorter than this (after strip) are treated as boilerplate and skipped",
-                "default": str(DEFAULTS["turn_min_chars"]),
+                "type": "integer",
+                "default": DEFAULTS["turn_min_chars"],
+                "minimum": 0,
             },
             {
                 "key": "allowed_themes",
-                "description": "v0.4 identity governance: optional allow-list of theme names. Empty/unset = allow any. When set, an unknown X-Hermes-Session-Key falls back to 'default' with a one-time warning (the whatsapp-dm / _bench / default sinks are always permitted).",
+                "description": "Identity governance: optional allow-list of theme names, as a comma-separated string (e.g. 'marketing,sales'). Empty/unset = allow any. When set, an unknown X-Hermes-Session-Key falls back to 'default' with a one-time warning (the whatsapp-dm / external-group / _bench / default sinks are always permitted).",
+                "type": "text",
+                "default": "",
+            },
+            {
+                "key": "identity_aliases",
+                "description": "Raw-identity remaps applied before normalization, as a comma-separated 'raw=canonical' string (e.g. 'mkt=marketing,sales-bot=sales'). A hand-edited config.yaml may instead use a YAML mapping -- both forms are accepted.",
+                "type": "text",
                 "default": "",
             },
             {
                 "key": "bench_mode",
-                "description": "v0.4: how to handle benchmark identities (skill-bench, *-bench): 'bucket' isolates them to the '_bench' theme; 'reject' drops them to 'default'.",
+                "description": "How to handle benchmark identities (skill-bench, *-bench): 'bucket' isolates them to the '_bench' theme; 'reject' drops them to 'default'.",
+                "type": "text",
                 "default": DEFAULTS["bench_mode"],
                 "choices": ["bucket", "reject"],
             },
             {
                 "key": "conversation_embed_policy",
-                "description": "v0.4: which captured turns get an embedding. 'all' (recall-safe; every turn that passed the noise filter) | 'substantive_only' (user turns + assistant turns >=120 chars; caps HNSW growth) | 'none' (text-only, conversation recall disabled).",
+                "description": "Which captured turns get an embedding. 'all' (recall-safe; every turn that passed the noise filter) | 'substantive_only' (user turns + assistant turns >=120 chars; caps HNSW growth) | 'none' (text-only, conversation recall disabled).",
+                "type": "text",
                 "default": DEFAULTS["conversation_embed_policy"],
                 "choices": ["all", "substantive_only", "none"],
             },
             {
                 "key": "ttl_days",
-                "description": "v0.4: advisory retention window for conversations (memory_entries are NEVER pruned). 0 = off. Pruning only ever happens when an operator runs `hermes-pgvector prune` — this value is the default for that command, never an automatic background delete.",
-                "default": str(DEFAULTS["ttl_days"]),
+                "description": "Advisory retention window for conversations (memory_entries are NEVER pruned). 0 = off. Pruning only ever happens when an operator runs `hermes-pgvector prune` — this value is the default for that command, never an automatic background delete.",
+                "type": "integer",
+                "default": DEFAULTS["ttl_days"],
+                "minimum": 0,
             },
             {
                 "key": "embed_timeout",
                 "description": "Seconds to wait for an embedding on the AGENT thread (prefetch, recall_memory, recall_conversation) and during the init-time bulk import. Kept short on purpose: a timeout here degrades recall to full-text-only, which beats making the agent wait. Raise it only if recall quality matters more than latency on your endpoint.",
-                "default": str(DEFAULTS["embed_timeout"]),
+                "type": "number",
+                "default": DEFAULTS["embed_timeout"],
+                "minimum": 0.1,
             },
             {
                 "key": "embed_write_timeout",
                 "description": "Seconds to wait for an embedding on the BACKGROUND writer path. Nothing waits on this, and giving up costs a permanently unsearchable row (recoverable only by `hermes-pgvector backfill`), so it is far more generous than embed_timeout. Raise it if your endpoint is slow: writes that time out land with a NULL embedding.",
-                "default": str(DEFAULTS["embed_write_timeout"]),
+                "type": "number",
+                "default": DEFAULTS["embed_write_timeout"],
+                "minimum": 0.1,
             },
             {
                 "key": "embed_write_retries",
-                "description": "v0.4: bounded embed retries on the background writer path ONLY (the hot path — prefetch/recall/sync — always uses a single attempt). Durable recovery of missed embeddings is the `hermes-pgvector backfill` sweep, not inline retries.",
-                "default": str(DEFAULTS["embed_write_retries"]),
+                "description": "Bounded embed retries on the background writer path ONLY (the hot path — prefetch/recall/sync — always uses a single attempt). Durable recovery of missed embeddings is the `hermes-pgvector backfill` sweep, not inline retries.",
+                "type": "integer",
+                "default": DEFAULTS["embed_write_retries"],
+                "minimum": 0,
+            },
+            {
+                "key": "embed_write_backoff",
+                "description": "Base seconds for the exponential backoff between embed_write_retries attempts on the background writer path (backoff * 2**attempt_index).",
+                "type": "number",
+                "default": DEFAULTS["embed_write_backoff"],
+                "minimum": 0.0,
+            },
+            {
+                "key": "write_contexts",
+                "description": "Comma-separated agent_context values (from initialize()'s kwargs) allowed to WRITE, e.g. 'primary,cron'. Contexts not listed skip on_memory_write / sync_turn / on_session_end / on_delegation (recall still works). A missing agent_context kwarg is treated as 'primary'.",
+                "type": "text",
+                "default": DEFAULTS["write_contexts"],
+            },
+            {
+                "key": "shutdown_drain_timeout",
+                "description": "Seconds shutdown() waits for the writer queue to drain. While draining, embeds are skipped (rows land text-only; `hermes-pgvector backfill` heals them later) so the drain stays DB-only and fast.",
+                "type": "number",
+                "default": DEFAULTS["shutdown_drain_timeout"],
+                "minimum": 0.0,
+            },
+            {
+                "key": "prefetch_budget",
+                "description": "Hard wall-clock budget (seconds) for prefetch()'s synchronous fallback path (embed + search), used when queue_prefetch() has not already cached a block for the session. Must stay below the host's external-provider prefetch timeout (8s), or the host logs a timeout warning and skips this provider on later turns until the stuck call returns.",
+                "type": "number",
+                "default": DEFAULTS["prefetch_budget"],
+                "minimum": 0.1,
+                "maximum": 7.5,
             },
         ]
 
@@ -1550,8 +2079,8 @@ class PgvectorMemoryProvider(MemoryProvider):
             existing.setdefault("plugins", {})
             # Merge, don't replace: `values` only carries keys declared by
             # get_config_schema(), so a wholesale assignment silently deletes
-            # live hand-edited keys that are read at runtime but not declared
-            # (identity_aliases, embed_write_backoff).
+            # hand-edited keys the setup flow did not send (e.g. a YAML-mapping
+            # identity_aliases, or any key added by a newer version).
             current = existing["plugins"].get("pgvector") or {}
             existing["plugins"]["pgvector"] = {**current, **values}
             with open(config_path, "w", encoding="utf-8") as fh:
@@ -1574,6 +2103,14 @@ class PgvectorMemoryProvider(MemoryProvider):
 
     def _maybe_embed(self, content: str) -> Optional[List[float]]:
         if not _as_bool(self._config.get("embed_on_write"), True):
+            return None
+        if self._draining:
+            # v0.6.0 (M3): shutdown() is draining the writer queue -- skip the
+            # embed endpoint entirely so the drain is DB-only and fast. Rows
+            # land text-only (embedding=NULL); `hermes-pgvector backfill`
+            # heals them later. Deliberately checked here (not just in
+            # shutdown()) so every _worker call site that embeds is covered
+            # by one guard.
             return None
         _write_timeout = _as_float(self._config.get("embed_write_timeout"),
                                    DEFAULTS["embed_write_timeout"])

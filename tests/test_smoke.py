@@ -109,7 +109,10 @@ def test_health_reports_ok(store):
     h = s.health()
     assert h["ok"] is True
     assert h["error"] == ""
-    assert h["row_count"] >= 0
+    # v0.6.0 (M6): health() reports an approximate row_count_estimate from
+    # pg_class.reltuples instead of running COUNT(*) -- it can legitimately
+    # be None on a table that has never been ANALYZEd yet.
+    assert h["row_count_estimate"] is None or isinstance(h["row_count_estimate"], int)
 
 
 def test_add_dedupes_on_exact_content(store):
@@ -231,12 +234,12 @@ def test_bulk_upsert_md_skips_existing(store, tmp_path):
 
     # First run: inserts 3 rows. embed_fn=None → text-only writes.
     r1 = s.bulk_upsert_md(agent_identity=agent, target="memory", file_path=md, embed_fn=None)
-    assert r1 == {"parsed": 3, "inserted": 3, "skipped": 0}
+    assert r1 == {"parsed": 3, "inserted": 3, "skipped": 0, "failed": 0}
     assert s.count(agent_identity=agent, target="memory") == 3
 
     # Second run on same file: all entries present, zero new inserts.
     r2 = s.bulk_upsert_md(agent_identity=agent, target="memory", file_path=md, embed_fn=None)
-    assert r2 == {"parsed": 3, "inserted": 0, "skipped": 3}
+    assert r2 == {"parsed": 3, "inserted": 0, "skipped": 3, "failed": 0}
     assert s.count(agent_identity=agent, target="memory") == 3
 
 
@@ -244,7 +247,7 @@ def test_bulk_upsert_md_missing_file(store, tmp_path):
     s, agent = store
     nope = tmp_path / "does-not-exist.md"
     r = s.bulk_upsert_md(agent_identity=agent, target="memory", file_path=nope, embed_fn=None)
-    assert r == {"parsed": 0, "inserted": 0, "skipped": 0}
+    assert r == {"parsed": 0, "inserted": 0, "skipped": 0, "failed": 0}
 
 
 # ---------------------------------------------------------------------------
