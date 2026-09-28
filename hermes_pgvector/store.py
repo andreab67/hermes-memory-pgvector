@@ -341,6 +341,10 @@ class MemoryStore:
             )
             match_params: tuple = (agent_identity, target, exact_content, exact_content)
         else:
+            # A blank old_text would be LIKE '%%' and overwrite the lowest-id
+            # row in scope; match nothing instead (caller falls back to add).
+            if _is_blank(old_text):
+                return 0
             match_sql = "agent_identity = %s AND target = %s AND content LIKE %s"
             match_params = (agent_identity, target, f"%{_escape_like(old_text)}%")
         with self._get_pool().connection() as conn:
@@ -1360,6 +1364,16 @@ class MemoryStore:
         required for >10 to guard against accidental data loss. Runs under
         advisory lock 9999 (shared with cleanup) so maintenance ops serialize."""
         self._assert_whitelisted(("memory_entries", "conversations"))  # consistency guard
+        # Identity-equal remap is a data-loss trap: every row conflicts with
+        # itself on the INSERT ... ON CONFLICT DO NOTHING, then the DELETE
+        # removes the originals. Refuse blank and equal identities up front.
+        if _is_blank(old_identity) or _is_blank(new_identity):
+            raise ValueError("remap_identity requires non-blank old and new identities")
+        if old_identity.strip() == new_identity.strip():
+            raise ValueError(
+                f"remap_identity: old and new identity are the same ({old_identity!r}); "
+                "refusing (it would delete every row)"
+            )
         with self._get_pool().connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT count(*) FROM memory_entries WHERE agent_identity = %s", (old_identity,))

@@ -1,8 +1,9 @@
 """DB-gated tests for v0.4.0 store methods. Skip without PG_TEST_DSN.
 
-IMPORTANT: point PG_TEST_DSN at a THROWAWAY database, never production. Several
-methods under test (backfill_null_embeddings, prune_conversations) operate across
-the WHOLE table, not a single agent_identity, so they are only safe in isolation.
+IMPORTANT: point PG_TEST_DSN at a THROWAWAY database, never production. The
+whole-table methods under test (backfill_null_embeddings, prune_conversations)
+run against a per-test scratch database (`scratch_store`, needs
+PG_TEST_ADMIN_DSN) so they never touch other rows of the shared database.
 The 002-dependent tests skip unless migration 002 has been applied to the test DB.
 """
 
@@ -17,6 +18,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hermes_pgvector.store import MemoryStore  # noqa: E402
+# Per-test throwaway database for tests that act on whole tables.
+from test_v060_migrations_cli import scratch_db, scratch_store  # noqa: E402,F401
 
 
 @pytest.fixture
@@ -44,19 +47,19 @@ def _needs_002(s):
 
 # --- backfill -------------------------------------------------------------
 
-def test_backfill_null_embeddings_recovers_searchability(store):
-    s, agent = store
+def test_backfill_null_embeddings_recovers_searchability(scratch_store):
+    s, agent = scratch_store
     s.add(agent_identity=agent, target="memory", content="alpha backfill row")
     s.add(agent_identity=agent, target="memory", content="beta backfill row")
 
     dry = s.backfill_null_embeddings(embed_fn=lambda t: [0.1] * 768, tables=("memory_entries",), dry_run=True)
-    assert dry["memory_entries"]["remaining"] >= 2
+    assert dry["memory_entries"]["remaining"] == 2
 
     res = s.backfill_null_embeddings(embed_fn=lambda t: [0.1] * 768, tables=("memory_entries",))
-    assert res["memory_entries"]["succeeded"] >= 2
+    assert res["memory_entries"]["succeeded"] == 2
 
     found = s.search(query_embedding=[0.1] * 768, agent_identity=agent, limit=10)
-    assert len(found) >= 2  # rows are now reachable via the vector index path
+    assert len(found) == 2  # rows are now reachable via the vector index path
 
 
 def test_backfill_dim_guard_rejects_wrong_dims(store):
@@ -176,8 +179,8 @@ def test_remove_underscore_and_backslash_literal(store):
 
 # --- prune ----------------------------------------------------------------
 
-def test_prune_conversations_deletes_old(store):
-    s, agent = store
+def test_prune_conversations_deletes_old(scratch_store):
+    s, agent = scratch_store
     s.append_turn(session_id="sess-prune", agent_identity=agent, role="user", content="old turn to prune")
     import psycopg
     with psycopg.connect(s._dsn) as conn:
@@ -187,8 +190,8 @@ def test_prune_conversations_deletes_old(store):
                 (agent,),
             )
             conn.commit()
-    assert s.prune_conversations(older_than_days=90, dry_run=True) >= 1
-    assert s.prune_conversations(older_than_days=90, dry_run=False) >= 1
+    assert s.prune_conversations(older_than_days=90, dry_run=True) == 1
+    assert s.prune_conversations(older_than_days=90, dry_run=False) == 1
     assert s.count_turns(agent_identity=agent) == 0
 
 

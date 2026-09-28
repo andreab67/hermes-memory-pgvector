@@ -49,8 +49,9 @@ def _load_config_file(path: Optional[str]) -> dict:
         plugins = (data.get("plugins") or {})
         return plugins.get("pgvector") or {}
     except Exception as exc:  # noqa: BLE001
-        print(f"warning: could not read config {path}: {exc}", file=sys.stderr)
-        return {}
+        # An explicit --config that cannot be read must not silently fall
+        # back to DEFAULTS (destructive commands would hit the default DSN).
+        raise ValueError(f"could not read config {path}: {exc}") from exc
 
 
 def _resolve(args, file_cfg: dict, key: str):
