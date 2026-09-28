@@ -296,3 +296,34 @@ def test_prefixed_form_still_covers_platforms_outside_the_enumeration():
     )
     assert canonical == GROUP_BUCKET
     assert reason == "group-bucket"
+
+
+# ---------------------------------------------------------------------------
+# P3PROV-1: the host also emits chat types 'forum' (Telegram supergroups with
+# topics) and 'webhook' (webhook / msgraph_webhook deliveries). Both carry a
+# participant / delivery id, so both must bucket.
+# ---------------------------------------------------------------------------
+
+FORUM_WEBHOOK_KEYS = [
+    "agent:main:telegram:forum:-100123:42:987654321",
+    "agent:main:webhook:webhook:webhook:r1:d1:webhook:r1",
+    "agent:main:msgraph_webhook:webhook:x",
+    "telegram:forum:-100123:42:9",
+    "webhook:webhook:r1",
+]
+
+
+def test_forum_and_webhook_keys_bucket_as_group():
+    for key in FORUM_WEBHOOK_KEYS:
+        assert normalize_identity(key) == (GROUP_BUCKET, True, "group-bucket"), key
+
+
+def test_forum_and_webhook_do_not_sweep_ordinary_themes():
+    for benign in (
+        "eng:channel:alerts",
+        "ops:group:oncall",
+        "desk:signal:main",
+        "eng:forum:design",
+        "ops:webhook:deploys",
+    ):
+        assert normalize_identity(benign) == (benign, False, "unchanged"), benign

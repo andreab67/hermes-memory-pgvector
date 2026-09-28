@@ -475,15 +475,17 @@ def _embed_with_config(
     key_env = config.get("embed_api_key_env")
     return _embed_text(
         text,
-        base_url=config.get("embed_url", DEFAULTS["embed_url"]),
-        model=config.get("embed_model", DEFAULTS["embed_model"]),
+        # `or`, not a .get default: a blank `embed_url:` in config.yaml loads
+        # as None and would otherwise reach embed() as base_url=None.
+        base_url=config.get("embed_url") or DEFAULTS["embed_url"],
+        model=config.get("embed_model") or DEFAULTS["embed_model"],
         timeout=timeout,
         retries=retries,
         backoff=backoff,
         max_total=max_total,
         dim=_embed_dim(config),
         api_key_env=str(key_env).strip() if key_env else None,
-        protocol=config.get("embed_protocol", DEFAULTS["embed_protocol"]),
+        protocol=config.get("embed_protocol") or DEFAULTS["embed_protocol"],
     )
 
 
@@ -2239,6 +2241,11 @@ class PgvectorMemoryProvider(MemoryProvider):
         except EmbeddingError as exc:
             if not self._embed_warned:
                 logger.warning("pgvector embed failed (degrading to text-only): %s", exc)
+                self._embed_warned = True
+            return None
+        except Exception as exc:  # noqa: BLE001 -- an embed-side bug must never drop a durable row
+            if not self._embed_warned:
+                logger.warning("pgvector embed failed (degrading to text-only): %r", exc)
                 self._embed_warned = True
             return None
 
