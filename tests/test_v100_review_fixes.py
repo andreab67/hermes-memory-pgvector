@@ -77,12 +77,20 @@ def test_remap_identity_same_identity_is_refused_and_rows_survive(store, dry_run
     assert s.count(agent_identity=agent) == 3
 
 
-def test_remap_identity_whitespace_equal_identity_is_refused(store):
+def test_remap_identity_whitespace_padded_identity_is_a_real_remap(store):
+    # Matching is by exact string, so "x" -> "x  " is not a self-remap
+    # (P2STORE-3A): the rows move instead of being refused or deleted.
     s, agent = store
     _seed(s, agent)
-    with pytest.raises(ValueError):
-        s.remap_identity(old_identity=agent, new_identity=agent + "  ", dry_run=False)
-    assert s.count(agent_identity=agent) == 3
+    padded = agent + "  "
+    try:
+        s.remap_identity(old_identity=agent, new_identity=padded, dry_run=False)
+        assert s.count(agent_identity=agent) == 0
+        assert s.count(agent_identity=padded) == 3
+    finally:
+        with s._get_pool().connection() as conn:
+            conn.execute("DELETE FROM memory_entries WHERE agent_identity = %s", (padded,))
+            conn.commit()
 
 
 @pytest.mark.parametrize("old,new", [("", "x"), ("x", ""), ("  ", "x"), ("x", " ")])

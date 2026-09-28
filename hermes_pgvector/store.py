@@ -52,8 +52,17 @@ def _escape_like(text: str) -> str:
 # spelled in a UTF8 database (LATIN1 rejects U+2007, SQL_ASCII rejects >U+007F),
 # so other encodings get the ASCII-only class; the Python strip() guard in
 # backfill_null_embeddings covers the rest.
-_HAS_TEXT_SQL_UTF8 = r"content ~ E'[^[:space:]\u00a0\u0085\u001c-\u001f\u2007\u202f]'"
-_HAS_TEXT_SQL_ASCII = r"content ~ E'[^[:space:]\x1c-\x1f]'"
+#
+# [:space:] is deliberately NOT used: it is locale-dependent (a UTF8 database
+# with LC_CTYPE='C' does not treat U+1680, U+2000-U+200A, U+2028/9, U+205F or
+# U+3000 as space), so blank rows made of them passed the filter forever and
+# `remaining` never reached 0. The classes below spell out exactly the set
+# str.isspace() accepts (verified over all code points), independent of locale.
+_HAS_TEXT_SQL_UTF8 = (
+    r"content ~ E'[^\x09-\x0d\x1c-\x20\u0085\u00a0\u1680\u2000-\u200a"
+    r"\u2028-\u2029\u202f\u205f\u3000]'"
+)
+_HAS_TEXT_SQL_ASCII = r"content ~ E'[^\x09-\x0d\x1c-\x20]'"
 
 
 def _is_blank(text: Optional[str]) -> bool:
@@ -382,19 +391,39 @@ class MemoryStore:
             match_params = (agent_identity, target, f"%{_escape_like(old_text)}%")
         with self._get_pool().connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    UPDATE memory_entries
-                       SET content = %s, embedding = %s::vector, updated_at = now()
-                     WHERE id = (
-                         SELECT id FROM memory_entries
-                          WHERE {match_sql}
-                          ORDER BY id LIMIT 1
-                     )
-                    """,
-                    (new_content, vec_literal, *match_params),
-                )
-                updated = cur.rowcount
+                try:
+                    with conn.transaction():  # savepoint-scoped
+                        cur.execute(
+                            f"""
+                            UPDATE memory_entries
+                               SET content = %s, embedding = %s::vector, updated_at = now()
+                             WHERE id = (
+                                 SELECT id FROM memory_entries
+                                  WHERE {match_sql}
+                                  ORDER BY id LIMIT 1
+                             )
+                            """,
+                            (new_content, vec_literal, *match_params),
+                        )
+                        updated = cur.rowcount
+                except psycopg.errors.UniqueViolation:
+                    # Another row in this scope already holds new_content, so
+                    # the edited entry is now a duplicate. The built-in memory
+                    # no longer has the old text: drop the stale row instead
+                    # of leaving it recallable.
+                    with conn.transaction():
+                        cur.execute(
+                            f"""
+                            DELETE FROM memory_entries
+                             WHERE id = (
+                                 SELECT id FROM memory_entries
+                                  WHERE {match_sql}
+                                  ORDER BY id LIMIT 1
+                             )
+                            """,
+                            match_params,
+                        )
+                        updated = cur.rowcount
                 conn.commit()
                 return int(updated)
 
@@ -1244,7 +1273,23 @@ class MemoryStore:
                     if isinstance(text, (bytes, bytearray)):
                         # SQL_ASCII databases hand text back as bytes; decode so
                         # embed() and the `content = %s` compare get str.
-                        text = bytes(text).decode("utf-8", "replace")
+                        try:
+                            text = bytes(text).decode("utf-8")
+                        except UnicodeDecodeError:
+                            # Non-UTF-8 bytes cannot round-trip: a lossy
+                            # decode would embed mangled text and then the
+                            # guarded UPDATE (`content = %s`) could never
+                            # match, misreporting the row as skipped_changed
+                            # forever. Count it failed (honest: it stays
+                            # NULL) but do NOT touch the consecutive-failure
+                            # counter -- it says nothing about the endpoint.
+                            processed += 1
+                            failed += 1
+                            logger.warning(
+                                "backfill %s: row id=%s holds non-UTF-8 bytes; "
+                                "cannot embed (fix or delete the row)", t, last_id,
+                            )
+                            continue
                     if not (text or "").strip():
                         # Defensive: the SQL prefilter can disagree with
                         # str.strip() under another encoding/collation; never
@@ -1417,7 +1462,7 @@ class MemoryStore:
         # removes the originals. Refuse blank and equal identities up front.
         if _is_blank(old_identity) or _is_blank(new_identity):
             raise ValueError("remap_identity requires non-blank old and new identities")
-        if old_identity.strip() == new_identity.strip():
+        if old_identity == new_identity:
             raise ValueError(
                 f"remap_identity: old and new identity are the same ({old_identity!r}); "
                 "refusing (it would delete every row)"
