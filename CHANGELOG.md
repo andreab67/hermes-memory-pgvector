@@ -65,7 +65,9 @@ changes and no new migrations relative to 0.6.0.
   entry into content that already exists left the stale row recallable.
 - Telegram `forum`, LINE `room` and `webhook` session keys were not
   recognised as multi-party, so the raw key -- including a participant id -- became a
-  theme of its own, readable from any theme via `scope='all'`.
+  theme of its own, readable from any theme via `scope='all'`. The bare
+  per-platform DM key `agent:<ns>:<platform>:dm` (a DM with no chat or
+  sender id) is now DM-bucketed too.
 - The embed client accepted vectors containing NaN/Infinity/null (or an
   integer too large for a float), which the database then rejected, losing
   the durable row; they now degrade to a text-only row like any other embed
