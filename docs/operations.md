@@ -124,6 +124,12 @@ your signal that a content-level scrub may still be needed. `--tables`
 scopes both the scan and the delete to just the named table(s) (default:
 both `memory_entries` and `conversations`).
 
+The scan covers `content` only, not the `metadata` column: when the raw
+session key differs from the canonical identity, rows record it as
+`metadata->>'raw_identity'`, and for DM/group buckets that raw key can
+contain a phone number or participant id. Deleting the rows removes it, but
+the scan will not flag it, so check metadata separately if that matters.
+
 ## remap
 
 Merges one `agent_identity` into another — the tool for folding a mixed-case

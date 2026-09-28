@@ -1,5 +1,7 @@
 # PLAN-1.0 — autonomous execution plan for hermes-memory-pgvector 1.0
 
+> **Historical — already executed in 2026-09 (v0.6.0 released 2026-09-26; 1.0.0rc1 merged via PR #11). Do not re-run this plan.** Final promotion follows [`RELEASING.md`](RELEASING.md).
+
 This file is an executable brief for a Claude Code session running **Opus 5.5 as the orchestrator**,
 delegating implementation to **Sonnet subagents** wherever possible. It runs end to end without a
 human. It prepares two pull requests and stops. **It never publishes anything**: the maintainer
