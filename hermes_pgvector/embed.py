@@ -322,10 +322,14 @@ def _post(
     # NaN/Infinity (Python's json accepts them), null or strings would pass
     # the length check but make the DB reject the vector, losing the durable
     # row. EmbeddingError lets callers fall back to a text-only row.
-    if not all(
-        isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
-        for x in vec
-    ):
+    try:
+        ok = all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+            for x in vec
+        )
+    except OverflowError:  # an int too large for a float (json accepts any size)
+        ok = False
+    if not ok:
         raise EmbeddingError("response embedding contains non-finite or non-numeric values")
     return vec
 

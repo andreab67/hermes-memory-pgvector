@@ -13,9 +13,9 @@ returns" and returns "" -- the thread itself keeps running, detached.
 This is only avoidable if the provider enforces its OWN, shorter, overall
 deadline on the embed call it makes inside prefetch() -- PLAN-1.0.md Sec 3
 calls this `prefetch_budget`, default 5.0s (comfortably under upstream's
-8.0s). hermes_pgvector/__init__.py enforces that budget (it is shorter than
-`embed_timeout`, default 10.0s, which is ABOVE upstream's 8.0s), so a failure
-here is a real regression: prefetch() outlived upstream's timeout.
+8.0s). hermes_pgvector/__init__.py enforces that budget as one shared deadline
+for the embed call, and clamps any configured value to at most 7.5s, so a
+failure here is a real regression: prefetch() outlived upstream's timeout.
 """
 
 from __future__ import annotations

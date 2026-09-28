@@ -46,7 +46,7 @@ mkdir -p "$HERMES_HOME/plugins"
 if [[ -d "$PLUGIN_DIR" ]]; then
     # Leading "." keeps the backup out of hermes-agent provider discovery,
     # which skips plugin dirs whose name starts with "_" or ".".
-    BACKUP="$HERMES_HOME/plugins/.pgvector.bak.$(date +%Y%m%d-%H%M%S)"
+    BACKUP="$HERMES_HOME/plugins/.pgvector.bak-$(date +%Y%m%d-%H%M%S)"
     echo "    existing install detected, backing up to $BACKUP"
     mv "$PLUGIN_DIR" "$BACKUP"
 fi
