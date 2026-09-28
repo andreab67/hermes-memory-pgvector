@@ -312,6 +312,13 @@ DEFAULTS = {
 _PREFETCH_BUDGET_MIN = 0.1
 _PREFETCH_BUDGET_MAX = 7.5
 
+# Bounds for prefetch_limit / min_similarity; get_config_schema advertises
+# them and _compute_prefetch_block clamps to them.
+_PREFETCH_LIMIT_MIN = 1
+_PREFETCH_LIMIT_MAX = 50
+_MIN_SIMILARITY_MIN = 0.0
+_MIN_SIMILARITY_MAX = 1.0
+
 
 def _as_bool(value: Any, default: bool) -> bool:
     """Coerce a config value to a real bool.
@@ -1016,10 +1023,14 @@ class PgvectorMemoryProvider(MemoryProvider):
             rows = store.search(
                 query_embedding=vec,
                 agent_identity=self._agent_identity,
-                limit=_as_int(self._config.get("prefetch_limit"),
-                              DEFAULTS["prefetch_limit"]),
-                min_similarity=_as_float(self._config.get("min_similarity"),
-                                         DEFAULTS["min_similarity"]),
+                limit=max(_PREFETCH_LIMIT_MIN, min(
+                    _as_int(self._config.get("prefetch_limit"),
+                            DEFAULTS["prefetch_limit"]),
+                    _PREFETCH_LIMIT_MAX)),
+                min_similarity=max(_MIN_SIMILARITY_MIN, min(
+                    _as_float(self._config.get("min_similarity"),
+                              DEFAULTS["min_similarity"]),
+                    _MIN_SIMILARITY_MAX)),
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("pgvector prefetch query failed: %s", exc)
@@ -1144,12 +1155,20 @@ class PgvectorMemoryProvider(MemoryProvider):
         Guarded import, matching how this module already reaches for
         `agent.memory_provider` / `hermes_constants`: outside hermes-agent the
         content is simply used as-is.
+
+        When the host helper is present but returns None/empty (a bare
+        `/skill` with no user instruction) the host skips sync_turn()
+        entirely, so this returns "" -- callers must treat that as "nothing
+        to store" rather than falling back to the multi-KB skill body.
         """
         try:
             from agent.skill_commands import (
                 extract_user_instruction_from_skill_message as _strip,
             )
-            return _strip(content) or content
+        except Exception:  # noqa: BLE001 -- host internals are optional
+            return content
+        try:
+            return _strip(content) or ""
         except Exception:  # noqa: BLE001 -- host internals are optional
             return content
 
@@ -1332,24 +1351,20 @@ class PgvectorMemoryProvider(MemoryProvider):
                     role = (msg.get("role") or "").lower()
                     if role not in ("user", "assistant"):
                         continue
-                    raw = msg.get("content") or ""
-                    content = (
-                        _flatten_user_content(raw) if role == "user"
-                        else raw if isinstance(raw, str)
-                        else " ".join(
-                            p.get("text", "") for p in raw
-                            if isinstance(p, dict) and p.get("type") == "text"
-                        ) if isinstance(raw, list) else str(raw)
-                    )
+                    # The host flattens every role with the same helper
+                    # before sync_turn(), so do the same for a matching hash.
+                    content = _flatten_user_content(msg.get("content") or "")
+                    # Normalize user turns the way the host does: a /skill
+                    # turn reaches sync_turn() as just the user's instruction
+                    # (and not at all for a bare /skill). Noise-check, dedup
+                    # and STORE that same string, never the skill body.
+                    if role == "user":
+                        content = self._strip_skill_scaffolding(content)
+                        if not content:
+                            continue
                     if self._is_noise(content, min_chars=min_chars):
                         continue
-                    # Fingerprint the NORMALIZED form for user turns, so a
-                    # /skill turn matches what sync_turn() was handed.
-                    fp_content = (
-                        self._strip_skill_scaffolding(content)
-                        if role == "user" else content
-                    )
-                    fp = self._turn_fingerprint(role, fp_content)
+                    fp = self._turn_fingerprint(role, content)
                     if fp in self._turn_fingerprints:
                         continue  # already enqueued by sync_turn this session
                     accepted = self._writer.enqueue(
@@ -2016,16 +2031,16 @@ class PgvectorMemoryProvider(MemoryProvider):
                 "description": "Max ambient recall results injected per turn",
                 "type": "integer",
                 "default": DEFAULTS["prefetch_limit"],
-                "minimum": 1,
-                "maximum": 50,
+                "minimum": _PREFETCH_LIMIT_MIN,
+                "maximum": _PREFETCH_LIMIT_MAX,
             },
             {
                 "key": "min_similarity",
                 "description": "Cosine similarity cutoff for ambient prefetch",
                 "type": "number",
                 "default": DEFAULTS["min_similarity"],
-                "minimum": 0.0,
-                "maximum": 1.0,
+                "minimum": _MIN_SIMILARITY_MIN,
+                "maximum": _MIN_SIMILARITY_MAX,
             },
             {
                 "key": "embed_on_write",
