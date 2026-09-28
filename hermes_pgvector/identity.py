@@ -43,7 +43,11 @@ from typing import Iterable, Mapping, Optional, Tuple
 # 'desk:signal:main') into the DM bucket, breaking theme isolation on nothing
 # but the word "signal".
 _DM_RE = re.compile(
-    r"(?:^|:)dm:|(?:^|:)(?:whatsapp|telegram|signal):(?=dm:|\+?\d)",
+    # The bare host key agent:<ns>:<platform>:dm (a DM with neither chat id
+    # nor sender id -- gateway/session.py build_session_key's per-platform
+    # sink) has no trailing segment, so it needs its own anchored form.
+    r"(?:^|:)dm:|^agent:[^:]+:[^:]+:dm$"
+    r"|(?:^|:)(?:whatsapp|telegram|signal):(?=dm:|\+?\d)",
     re.IGNORECASE,
 )
 

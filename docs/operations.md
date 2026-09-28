@@ -164,7 +164,8 @@ hermes-pgvector stats --config $HERMES_HOME/config.yaml
 ```
 
 Prints `health()` (liveness + `row_count_estimate` — an approximation from
-`pg_class.reltuples`, not an exact count), exact scoped row counts for
+`pg_class.reltuples`, not an exact count), exact total row counts (a full `COUNT(*)` -- slow on
+multi-million-row tables) for
 `memory_entries` / `conversations`, per-table NULL-embedding counts (a
 dry-run `backfill`), and — if migration `002` is applied — per-agent
 attribution from `v_agent_memory`.

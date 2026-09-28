@@ -16,7 +16,8 @@ that test ends -- tests never call .stop() themselves.
 
 This file intentionally does NOT touch how the rest of the suite decides to
 skip: the PG_TEST_DSN / PG_TEST_EMBED_URL gates in the existing test modules
-are untouched, and no autouse fixture is added here.
+are untouched. The one autouse fixture (_no_host_hermes_constants) only
+isolates the suite from a REAL host install's config.yaml.
 """
 
 from __future__ import annotations
@@ -49,3 +50,17 @@ def fake_embed_server() -> Callable[..., str]:
 
     for srv in started:
         srv.stop()
+
+
+@pytest.fixture(autouse=True)
+def _no_host_hermes_constants(monkeypatch):
+    """Keep tests off the developer's real $HERMES_HOME/config.yaml.
+
+    identity_signature() and _load_plugin_config() read config.yaml through
+    hermes_constants whenever it is importable (a machine with hermes-agent
+    installed); a test that builds a provider from an explicit config= dict
+    would then see the host's config instead. Tests that need the loader
+    install their own fake module with monkeypatch.setitem, which overrides
+    this.
+    """
+    monkeypatch.setitem(sys.modules, "hermes_constants", None)

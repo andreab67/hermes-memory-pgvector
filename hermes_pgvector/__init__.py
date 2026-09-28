@@ -225,7 +225,7 @@ DEFAULTS = {
     # header, OpenAI-compatible path with the Ollama-native fallback.
     # embed_dim must equal the model's output AND the vector(N) columns;
     # changing it on an existing database needs a column migration + re-embed
-    # (see README, "Changing the embedding dimension").
+    # (see docs/upgrading.md, "Changing the embedding dimension").
     "embed_dim": 768,
     # NAME of an environment variable holding a bearer token (e.g.
     # "OPENROUTER_API_KEY"), never the token itself. Read at call time.
@@ -2011,7 +2011,7 @@ class PgvectorMemoryProvider(MemoryProvider):
             },
             {
                 "key": "embed_dim",
-                "description": "Vector length the embed model returns. Must also match the database's vector(N) columns (768 as created by migration 001). Changing it on an existing database requires migrating those columns and re-embedding every row -- see README, 'Changing the embedding dimension'.",
+                "description": "Vector length the embed model returns. Must also match the database's vector(N) columns (768 as created by migration 001). Changing it on an existing database requires migrating those columns and re-embedding every row -- see docs/upgrading.md, 'Changing the embedding dimension'.",
                 "type": "integer",
                 "default": DEFAULTS["embed_dim"],
                 "minimum": 1,

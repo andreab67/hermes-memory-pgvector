@@ -335,3 +335,13 @@ def test_forum_and_webhook_do_not_sweep_ordinary_themes():
         "war:room:incident-42",
     ):
         assert normalize_identity(benign) == (benign, False, "unchanged"), benign
+
+
+def test_bare_host_dm_key_is_dm_bucketed():
+    # P5PROV-1: a DM with neither chat id nor sender id gets the bare host
+    # key agent:<ns>:<platform>:dm; it must land in the DM sink, not become
+    # its own theme readable via scope='all'.
+    for key in ("agent:main:telegram:dm", "agent:main~:relay:dm", "agent:work:line:dm"):
+        assert normalize_identity(key) == (DM_BUCKET, True, "dm-bucket"), key
+    for benign in ("eng:dm", "desk:signal:main", "agent-dm", "ops:dm-router"):
+        assert normalize_identity(benign)[0] != DM_BUCKET, benign
