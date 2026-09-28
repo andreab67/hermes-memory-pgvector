@@ -58,6 +58,14 @@ def test_as_bool_none_returns_default():
     assert _as_bool(None, False) is False
 
 
+def test_as_bool_blank_and_unrecognized_strings_return_default():
+    # A blank / garbled value must behave like _as_int/_as_float's fallback,
+    # not silently flip a default-true toggle off.
+    for junk in ("", " ", "  ", "maybe", "tru"):
+        assert _as_bool(junk, True) is True, junk
+        assert _as_bool(junk, False) is False, junk
+
+
 # ---------------------------------------------------------------------------
 # _as_theme_list
 # ---------------------------------------------------------------------------

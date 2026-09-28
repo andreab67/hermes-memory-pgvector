@@ -105,6 +105,20 @@ def _migrate(admin_dsn: str, **kwargs):
         store.close()
 
 
+@pytest.fixture
+def scratch_store(scratch_db):
+    """(MemoryStore, agent_identity) on a freshly migrated throwaway database.
+    Tests that act on WHOLE tables (backfill, prune) use this instead of the
+    shared PG_TEST_DSN database so exact-equality assertions cannot be
+    disturbed by -- and cannot disturb -- other tests' rows."""
+    _migrate(scratch_db["admin_dsn"])
+    s = MemoryStore(scratch_db["runtime_dsn"])
+    try:
+        yield s, "pytest-scratch-" + secrets.token_hex(4)
+    finally:
+        s.close()
+
+
 # --- L10: migration files stay ASCII ---------------------------------------
 
 
@@ -399,6 +413,42 @@ def test_every_command_closes_its_store(scratch_db, monkeypatch):
     ])
     assert rc == 0
     assert closed["n"] == 4
+
+
+def test_every_command_closes_its_store_when_the_body_raises(monkeypatch):
+    """The failure-path half of the close() contract: each command's store
+    is closed in a `finally` even when the store call it makes raises. No
+    database is needed -- the store is constructed lazily and the store
+    method each command calls is replaced with one that raises."""
+    closed = {"n": 0}
+    real_close = MemoryStore.close
+
+    def _tracking_close(self):
+        closed["n"] += 1
+        return real_close(self)
+
+    def _boom(self, *a, **kw):
+        raise RuntimeError("simulated store failure")
+
+    monkeypatch.setattr(MemoryStore, "close", _tracking_close)
+    for name in (
+        "health", "prune_conversations", "scan_pii",
+        "remap_identity", "backfill_null_embeddings",
+    ):
+        monkeypatch.setattr(MemoryStore, name, _boom)
+
+    dsn = "dbname=irrelevant-never-connected"
+    invocations = [
+        ["stats", "--dsn", dsn],
+        ["prune", "--dsn", dsn, "--days", "5"],
+        ["cleanup", "--dsn", dsn, "--identities", "someone"],
+        ["remap", "--dsn", dsn, "--old", "a", "--new", "b"],
+        ["backfill", "--dsn", dsn],
+    ]
+    for i, argv in enumerate(invocations, start=1):
+        rc = cli.main(argv)
+        assert rc == 1, f"{argv[0]} should report the failure"
+        assert closed["n"] == i, f"{argv[0]} did not close its store on failure"
 
 
 def test_migrate_closes_its_store_even_on_failure(monkeypatch):

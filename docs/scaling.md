@@ -35,7 +35,9 @@ Postgres). Higher values improve recall accuracy at query time at the cost
 of latency — worth raising if `recall_memory`/`recall_conversation` seem to
 miss obviously-relevant rows on a large table. This plugin does not set it
 itself; it is a session-level Postgres GUC an operator can set via the DSN
-(`options=-c hnsw.ef_search=100`) or a connection-pool-level default.
+(keyword/value DSN: `options='-c hnsw.ef_search=100'` -- the quotes are
+required, or the space splits the option; URI DSN:
+`?options=-c%20hnsw.ef_search%3D100`) or a connection-pool-level default.
 
 ### Filtered search and `hnsw.iterative_scan`
 
@@ -128,6 +130,7 @@ approximation updated by autovacuum/`ANALYZE`) instead of an exact
 `COUNT(*)` — avoiding a full-table scan on every session `initialize()`.
 `count()` / `count_turns()` stay exact and index-backed for a *scoped*
 query (a single `agent_identity`), which is cheap at any table size. Do not
-expect `stats`' or `health()`'s global figure to be precise to the row on a
-table that changed recently; use a scoped `count()` (or `SELECT COUNT(*)`
+expect `health()`'s `row_count_estimate` to be precise to the row on a
+table that changed recently (`stats` also prints an exact total, at the cost
+of a full scan); use a scoped `count()` (or `SELECT COUNT(*)`
 directly) when exactness matters more than speed.

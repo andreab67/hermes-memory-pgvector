@@ -39,7 +39,7 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hermes_pgvector import PgvectorMemoryProvider  # noqa: E402
-from hermes_pgvector.store import MemoryStore  # noqa: E402
+from hermes_pgvector.store import _HAS_TEXT_SQL_ASCII, MemoryStore  # noqa: E402
 
 
 class _RecordingWriter:
@@ -168,8 +168,8 @@ def _scoped_backlog(s, agent):
     with s._get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute(
-                r"SELECT count(*) FROM memory_entries "
-                r"WHERE agent_identity = %s AND embedding IS NULL AND content ~ '\S'",
+                "SELECT count(*) FROM memory_entries "
+                f"WHERE agent_identity = %s AND embedding IS NULL AND {s._has_text_sql()}",
                 (agent,),
             )
             return int(cur.fetchone()[0])
@@ -208,7 +208,13 @@ def test_backfill_skips_whitespace_only_content(store):
     forever -- the same bug for a different shape. The predicate now matches
     Python's str.strip()."""
     s, agent = store
-    for blank in ("", "   ", chr(10), chr(9) + chr(10) + " "):
+    # chr(0xa0) NBSP, chr(0x85) NEL, chr(0x1f) unit separator, chr(0x2007)/
+    # chr(0x202f) no-break spaces: str.strip() removes them but Postgres '\S'
+    # (UTF8/en_US.utf8) calls them non-space, so they used to reach embed().
+    blanks = ("", "   ", chr(10), chr(9) + chr(10) + " ",
+              chr(0xa0), chr(0x85), chr(0x1c), chr(0x1f),
+              chr(0x2007), chr(0x202f), " " + chr(0xa0) + chr(0x1f) + chr(0x85))
+    for blank in blanks:
         _insert_raw(s, agent, blank)
     real_id = _insert_raw(s, agent, "a real note alongside the blank ones")
 
@@ -221,13 +227,72 @@ def test_backfill_skips_whitespace_only_content(store):
     report = s.backfill_null_embeddings(embed_fn=_embed_fn, tables=["memory_entries"])
 
     assert all(x.strip() for x in seen), f"a blank row reached embed(): {seen!r}"
-    assert report["memory_entries"]["unembeddable"] >= 4
+    assert report["memory_entries"]["unembeddable"] >= len(blanks)
+    assert report["memory_entries"]["failed"] == 0
     assert _scoped_backlog(s, agent) == 0
 
     with s._get_pool().connection() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT embedding IS NULL FROM memory_entries WHERE id = %s", (real_id,))
             assert cur.fetchone()[0] is False
+
+
+@pytest.mark.parametrize("encoding", ["SQL_ASCII", "LATIN1"])
+def test_backfill_on_non_utf8_database_does_not_crash(encoding):
+    """The UTF8 predicate spells U+2007 etc. as E'\u2007', which LATIN1 (no
+    equivalent) and SQL_ASCII (>U+007F) reject -- backfill would raise. Non-UTF8
+    databases must get the ASCII-only predicate, with the Python strip() guard
+    as the backstop for the non-ASCII blanks."""
+    import re
+    import psycopg
+    admin, runtime = os.environ.get("PG_TEST_ADMIN_DSN"), os.environ.get("PG_TEST_DSN")
+    if not (admin and runtime):
+        pytest.skip("PG_TEST_ADMIN_DSN / PG_TEST_DSN not set")
+
+    def with_db(dsn, name):
+        return re.sub(r"dbname=\S+", f"dbname={name}", dsn)
+
+    name = "pytest_empty_" + encoding.lower() + "_" + os.urandom(3).hex()
+    maint = with_db(admin, "postgres")
+    with psycopg.connect(maint, autocommit=True) as conn:
+        conn.execute(
+            f"CREATE DATABASE \"{name}\" ENCODING '{encoding}' "
+            "LC_COLLATE 'C' LC_CTYPE 'C' TEMPLATE template0"
+        )
+    s = None
+    try:
+        admin_dsn = with_db(admin, name)
+        m = MemoryStore(admin_dsn)
+        try:
+            m.apply_all_migrations(admin_dsn=admin_dsn)
+        finally:
+            m.close()
+        s = MemoryStore(with_db(runtime, name))
+        assert s._has_text_sql() == _HAS_TEXT_SQL_ASCII
+        for blank in ("", " ", chr(10), chr(0x1f), chr(0x1c), chr(0xa0)):
+            _insert_raw(s, "pytest-enc", blank)
+        real_id = _insert_raw(s, "pytest-enc", "a real note")
+        seen = []
+
+        def _embed_fn(text):
+            seen.append(text)
+            return [0.1] * 768
+
+        report = s.backfill_null_embeddings(embed_fn=_embed_fn, tables=["memory_entries"])
+        # SQL_ASCII returns text as bytes; normalise for the assertions.
+        seen = [x.decode() if isinstance(x, bytes) else x for x in seen]
+        assert seen.count("a real note") == 1
+        assert all(x.strip() for x in seen), seen
+        assert report["memory_entries"]["failed"] == 0
+        with s._get_pool().connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT embedding IS NULL FROM memory_entries WHERE id = %s", (real_id,))
+                assert cur.fetchone()[0] is False
+    finally:
+        if s is not None:
+            s.close()
+        with psycopg.connect(maint, autocommit=True) as conn:
+            conn.execute(f'DROP DATABASE IF EXISTS "{name}" WITH (FORCE)')
 
 
 # ---------------------------------------------------------------------------

@@ -16,6 +16,7 @@ from __future__ import annotations
 import http.client
 import json
 import logging
+import math
 import os
 import time
 import urllib.error
@@ -258,6 +259,10 @@ def _embed_once(
     )
 
 
+# pgvector stores float4; a finite value beyond this is rejected by the DB.
+_FLOAT4_MAX = 3.4028234663852886e38
+
+
 def _post(
     url: str,
     body: dict,
@@ -318,6 +323,19 @@ def _post(
             f"expected {dim} dims (embed_dim), got {len(vec)} -- embed_model, "
             "embed_dim and the vector(N) columns must all agree"
         )
+    # NaN/Infinity (Python's json accepts them), null or strings would pass
+    # the length check but make the DB reject the vector, losing the durable
+    # row. EmbeddingError lets callers fall back to a text-only row.
+    try:
+        ok = all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+            and abs(x) <= _FLOAT4_MAX
+            for x in vec
+        )
+    except OverflowError:  # an int too large for a float (json accepts any size)
+        ok = False
+    if not ok:
+        raise EmbeddingError("response embedding contains non-finite or non-numeric values")
     return vec
 
 

@@ -55,9 +55,10 @@ would corrupt every future similarity comparison for that row. Either:
   `vector(N)` columns together — see "Changing the embedding dimension" in
   [upgrading.md](upgrading.md#changing-the-embedding-dimension).
 
-`hermes-pgvector backfill` and `stats` probe the endpoint's dimension
-*before* touching any row and abort the whole run on a mismatch, so this
-never partially corrupts a table.
+`hermes-pgvector backfill` (not `--dry-run`, and not `stats`, which never
+contacts the endpoint) probes the endpoint's dimension *before* touching any
+row and aborts the whole run on a mismatch -- `error: ...` on stderr, exit
+`1` -- so this never partially corrupts a table.
 
 ## Embed endpoint down: rows land text-only, recall degrades
 

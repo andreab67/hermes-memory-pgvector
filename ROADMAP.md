@@ -174,20 +174,20 @@ Two dependency-only releases, no code changes in either. This package opens a si
 
 ---
 
-### M6 — Public release (v0.6.0 → v1.0) — v0.6.0 DONE, "released" pending
+### M6 — Public release (v0.6.0 → v1.0) — DONE (v1.0.0)
 
 **Goal:** documentation, contract guarantees, and a CHANGELOG good enough that someone landing on this plugin from the hermes-agent docs can deploy it cleanly without reading the source.
 
 | Capability | Status |
 |---|---|
 | Stable, typed config schema (`get_config_schema()`: real `type`/`default`/`minimum`/`maximum` per key) | DONE (v0.6.0) |
-| CI: unit + live-DB matrix (Python 3.11–3.13 × Postgres 16/17), build/wheel checks, version consistency | DONE (v0.6.0) |
+| CI: unit + live-DB matrix (Python 3.11–3.13 × Postgres 16/17/18), build/wheel checks, version consistency | DONE (v0.6.0) |
 | Conformance test: validate `MemoryProvider` ABC + `MemoryManager` call-shape contract against upstream (pinned ref in `conformance/HERMES_AGENT_REF`) | DONE (v0.6.0) |
 | CHANGELOG.md (Keep a Changelog format) | DONE (v0.6.0) |
 | Full docs set: config reference, operations, scaling, troubleshooting, upgrading, release checklist, security policy | DONE (v0.6.0) |
-| **Released as 1.0.0** | NOT YET — v0.6.0 is the release candidate; a soak period and `release/1.0.0rc1` (version/metadata only, no behaviour change) precede the actual 1.0.0 tag |
+| **Released as 1.0.0** | DONE (v1.0.0, 2026-09-28) — 1.0.0rc1 was never published; 1.0.0 adds the fixes from a pre-release full-codebase review (see [CHANGELOG.md](CHANGELOG.md#100---2026-09-28)) |
 
-A prior 1.0-readiness review found four High-severity defects and thirteen Medium/Low ones; every one of them (H1–H4, M1–M7 except roadmap-M5, L1–L6, L8–L10) is fixed in v0.6.0 — see [CHANGELOG.md](CHANGELOG.md#060---unreleased). L7 (theme-filtered ANN recall at very large table sizes) did not reproduce at the tested scale and is documented as a scaling consideration instead of a fix — see [docs/scaling.md](docs/scaling.md).
+A prior 1.0-readiness review found four High-severity defects and thirteen Medium/Low ones; every one of them (H1–H4, M1–M7 except roadmap-M5, L1–L6, L8–L10) is fixed in v0.6.0 — see [CHANGELOG.md](CHANGELOG.md#060---2026-09-26). L7 (theme-filtered ANN recall at very large table sizes) did not reproduce at the tested scale and is documented as a scaling consideration instead of a fix — see [docs/scaling.md](docs/scaling.md).
 
 ---
 

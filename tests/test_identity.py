@@ -296,3 +296,52 @@ def test_prefixed_form_still_covers_platforms_outside_the_enumeration():
     )
     assert canonical == GROUP_BUCKET
     assert reason == "group-bucket"
+
+
+# ---------------------------------------------------------------------------
+# P3PROV-1: the host also emits chat types 'forum' (Telegram supergroups with
+# topics) and 'webhook' (webhook / msgraph_webhook deliveries). Both carry a
+# participant / delivery id, so both must bucket.
+# ---------------------------------------------------------------------------
+
+FORUM_WEBHOOK_KEYS = [
+    "agent:main:telegram:forum:-100123:42:987654321",
+    "agent:main:webhook:webhook:webhook:r1:d1:webhook:r1",
+    "agent:main:msgraph_webhook:webhook:x",
+    "telegram:forum:-100123:42:9",
+    "webhook:webhook:r1",
+    # LINE multi-person rooms (P4PROV-1)
+    "agent:main:line:room:R123:U9f8e7d",
+    "line:room:R1:U1",
+    # plugin platforms, unprefixed
+    "irc:channel:#ops:nick1",
+    "teams:group:19abc:user42",
+]
+
+
+def test_forum_and_webhook_keys_bucket_as_group():
+    for key in FORUM_WEBHOOK_KEYS:
+        assert normalize_identity(key) == (GROUP_BUCKET, True, "group-bucket"), key
+
+
+def test_forum_and_webhook_do_not_sweep_ordinary_themes():
+    for benign in (
+        "eng:channel:alerts",
+        "ops:group:oncall",
+        "desk:signal:main",
+        "eng:forum:design",
+        "ops:webhook:deploys",
+        "eng:room:x",
+        "war:room:incident-42",
+    ):
+        assert normalize_identity(benign) == (benign, False, "unchanged"), benign
+
+
+def test_bare_host_dm_key_is_dm_bucketed():
+    # P5PROV-1: a DM with neither chat id nor sender id gets the bare host
+    # key agent:<ns>:<platform>:dm; it must land in the DM sink, not become
+    # its own theme readable via scope='all'.
+    for key in ("agent:main:telegram:dm", "agent:main~:relay:dm", "agent:work:line:dm"):
+        assert normalize_identity(key) == (DM_BUCKET, True, "dm-bucket"), key
+    for benign in ("eng:dm", "desk:signal:main", "agent-dm", "ops:dm-router"):
+        assert normalize_identity(benign)[0] != DM_BUCKET, benign

@@ -45,6 +45,26 @@ def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+# SQL twin of "not _is_blank(content)". Bracket form because \S alone misses the
+# characters Python strips but Postgres (UTF8/en_US.utf8) calls non-space:
+# U+00A0, U+0085, U+001C-U+001F, U+2007, U+202F. Checked over every code point.
+# Escapes (E-string) keep this source ASCII. The non-ASCII members can only be
+# spelled in a UTF8 database (LATIN1 rejects U+2007, SQL_ASCII rejects >U+007F),
+# so other encodings get the ASCII-only class; the Python strip() guard in
+# backfill_null_embeddings covers the rest.
+#
+# [:space:] is deliberately NOT used: it is locale-dependent (a UTF8 database
+# with LC_CTYPE='C' does not treat U+1680, U+2000-U+200A, U+2028/9, U+205F or
+# U+3000 as space), so blank rows made of them passed the filter forever and
+# `remaining` never reached 0. The classes below spell out exactly the set
+# str.isspace() accepts (verified over all code points), independent of locale.
+_HAS_TEXT_SQL_UTF8 = (
+    r"content ~ E'[^\x09-\x0d\x1c-\x20\u0085\u00a0\u1680\u2000-\u200a"
+    r"\u2028-\u2029\u202f\u205f\u3000]'"
+)
+_HAS_TEXT_SQL_ASCII = r"content ~ E'[^\x09-\x0d\x1c-\x20]'"
+
+
 def _is_blank(text: Optional[str]) -> bool:
     """True for None, "", or whitespace-only — matches Python's str.strip()."""
     return not (text or "").strip()
@@ -100,6 +120,28 @@ class MemoryStore:
         self._timeout = timeout
         self._max_idle = max_idle
         self._max_lifetime = max_lifetime
+        self._has_text_sql_cached: Optional[str] = None
+
+    def _has_text_sql(self) -> str:
+        """SQL predicate for "content has text str.strip() would keep",
+        chosen by the database's server_encoding and cached per store.
+        Fail-soft to the ASCII-only predicate (not cached, so it retries)."""
+        cached = self._has_text_sql_cached
+        if cached is not None:
+            return cached
+        try:
+            with self._get_pool().connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT current_setting('server_encoding')")
+                    enc = cur.fetchone()[0]
+            if isinstance(enc, (bytes, bytearray)):
+                enc = bytes(enc).decode("ascii", "replace")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("server_encoding probe failed, using ASCII predicate: %s", exc)
+            return _HAS_TEXT_SQL_ASCII
+        pred = _HAS_TEXT_SQL_UTF8 if str(enc).upper() == "UTF8" else _HAS_TEXT_SQL_ASCII
+        self._has_text_sql_cached = pred
+        return pred
 
     # -- Pool lifecycle ------------------------------------------------------
 
@@ -181,7 +223,7 @@ class MemoryStore:
 
         runtime_role (H1): when given, set on THIS connection with
         `SELECT set_config('hermes_pgvector.runtime_role', runtime_role, false)`
-        before executing the migration file, so 002/004/005's `DO $$ ... $$`
+        before executing the migration file, so 002/004's `DO $$ ... $$`
         GRANT blocks resolve the role to grant via `current_setting(...)`
         instead of falling back to 'hermes'. Applied per-connection because
         each call to this method opens its own connection (and GUCs set with
@@ -341,23 +383,47 @@ class MemoryStore:
             )
             match_params: tuple = (agent_identity, target, exact_content, exact_content)
         else:
+            # A blank old_text would be LIKE '%%' and overwrite the lowest-id
+            # row in scope; match nothing instead (caller falls back to add).
+            if _is_blank(old_text):
+                return 0
             match_sql = "agent_identity = %s AND target = %s AND content LIKE %s"
             match_params = (agent_identity, target, f"%{_escape_like(old_text)}%")
         with self._get_pool().connection() as conn:
             with conn.cursor() as cur:
-                cur.execute(
-                    f"""
-                    UPDATE memory_entries
-                       SET content = %s, embedding = %s::vector, updated_at = now()
-                     WHERE id = (
-                         SELECT id FROM memory_entries
-                          WHERE {match_sql}
-                          ORDER BY id LIMIT 1
-                     )
-                    """,
-                    (new_content, vec_literal, *match_params),
-                )
-                updated = cur.rowcount
+                try:
+                    with conn.transaction():  # savepoint-scoped
+                        cur.execute(
+                            f"""
+                            UPDATE memory_entries
+                               SET content = %s, embedding = %s::vector, updated_at = now()
+                             WHERE id = (
+                                 SELECT id FROM memory_entries
+                                  WHERE {match_sql}
+                                  ORDER BY id LIMIT 1
+                             )
+                            """,
+                            (new_content, vec_literal, *match_params),
+                        )
+                        updated = cur.rowcount
+                except psycopg.errors.UniqueViolation:
+                    # Another row in this scope already holds new_content, so
+                    # the edited entry is now a duplicate. The built-in memory
+                    # no longer has the old text: drop the stale row instead
+                    # of leaving it recallable.
+                    with conn.transaction():
+                        cur.execute(
+                            f"""
+                            DELETE FROM memory_entries
+                             WHERE id = (
+                                 SELECT id FROM memory_entries
+                                  WHERE {match_sql}
+                                  ORDER BY id LIMIT 1
+                             )
+                            """,
+                            match_params,
+                        )
+                        updated = cur.rowcount
                 conn.commit()
                 return int(updated)
 
@@ -1148,19 +1214,23 @@ class MemoryStore:
                     "the vector column)"
                 )
 
+        has_text = self._has_text_sql()
         for t in tables:
             with self._get_pool().connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        # content ~ '\S' means "has at least one non-whitespace
-                        # character", which matches Python's str.strip()
-                        # exactly. Postgres trim() defaults to SPACES ONLY, so a
-                        # row holding just a newline or a tab would still be
-                        # selected here, still raise EmbeddingError("empty
-                        # input"), and still fail on every run -- the very bug
-                        # this filter exists to stop.
-                        rf"SELECT count(*) FILTER (WHERE content ~ '\S'), "
-                        rf"       count(*) FILTER (WHERE content !~ '\S' OR content IS NULL) "
+                        # has_text means "has at least one character that
+                        # Python's str.strip() would keep". Plain '\S' is NOT
+                        # equivalent: on UTF8/en_US.utf8 Postgres treats
+                        # U+00A0, U+0085, U+001C..U+001F, U+2007 and U+202F as
+                        # non-space although str.strip() removes them, so
+                        # those rows passed the filter, raised
+                        # EmbeddingError("empty input") and failed on every
+                        # run. Postgres trim() defaults to SPACES ONLY, so a
+                        # row holding just a newline or a tab would fail the
+                        # same way -- the very bug this filter exists to stop.
+                        f"SELECT count(*) FILTER (WHERE {has_text}), "
+                        f"       count(*) FILTER (WHERE NOT COALESCE({has_text}, false)) "
                         f"FROM {t} WHERE embedding IS NULL"
                     )
                     row = cur.fetchone()
@@ -1189,7 +1259,7 @@ class MemoryStore:
                         cur.execute(
                             f"SELECT id, content FROM {t} "
                             f"WHERE embedding IS NULL "
-                            rf"  AND content ~ '\S' "
+                            f"  AND {has_text} "
                             f"  AND id > %s "
                             f"ORDER BY id LIMIT %s",
                             (last_id, batch_size),
@@ -1199,6 +1269,33 @@ class MemoryStore:
                     break
                 for r in rows:
                     last_id = r["id"]
+                    text = r["content"]
+                    if isinstance(text, (bytes, bytearray)):
+                        # SQL_ASCII databases hand text back as bytes; decode so
+                        # embed() and the `content = %s` compare get str.
+                        try:
+                            text = bytes(text).decode("utf-8")
+                        except UnicodeDecodeError:
+                            # Non-UTF-8 bytes cannot round-trip: a lossy
+                            # decode would embed mangled text and then the
+                            # guarded UPDATE (`content = %s`) could never
+                            # match, misreporting the row as skipped_changed
+                            # forever. Count it failed (honest: it stays
+                            # NULL) but do NOT touch the consecutive-failure
+                            # counter -- it says nothing about the endpoint.
+                            processed += 1
+                            failed += 1
+                            logger.warning(
+                                "backfill %s: row id=%s holds non-UTF-8 bytes; "
+                                "cannot embed (fix or delete the row)", t, last_id,
+                            )
+                            continue
+                    if not (text or "").strip():
+                        # Defensive: the SQL prefilter can disagree with
+                        # str.strip() under another encoding/collation; never
+                        # hand a blank to embed() (it would count as failed
+                        # forever).
+                        continue
                     processed += 1
                     # The whole embed → literal → UPDATE pipeline is fail-soft
                     # per row (v0.4.2): a vector that embeds "successfully" but
@@ -1206,14 +1303,14 @@ class MemoryStore:
                     # transient DB error) must mark THIS row failed and move
                     # on, not abort the run for every remaining table.
                     try:
-                        vec = embed_fn(r["content"])
+                        vec = embed_fn(text)
                         vec_literal = to_pgvector_literal(vec)
                         with self._get_pool().connection() as conn:
                             with conn.cursor() as cur:
                                 cur.execute(
                                     f"UPDATE {t} SET embedding = %s::vector "
                                     f"WHERE id = %s AND embedding IS NULL AND content = %s",
-                                    (vec_literal, r["id"], r["content"]),
+                                    (vec_literal, r["id"], text),
                                 )
                                 row_changed = cur.rowcount > 0
                                 conn.commit()
@@ -1241,7 +1338,7 @@ class MemoryStore:
                 with conn.cursor() as cur:
                     cur.execute(
                         f"SELECT count(*) FROM {t} "
-                        rf"WHERE embedding IS NULL AND content ~ '\S'"
+                        f"WHERE embedding IS NULL AND {has_text}"
                     )
                     remaining = int(cur.fetchone()[0])
             entry: Dict[str, Any] = {
@@ -1360,6 +1457,16 @@ class MemoryStore:
         required for >10 to guard against accidental data loss. Runs under
         advisory lock 9999 (shared with cleanup) so maintenance ops serialize."""
         self._assert_whitelisted(("memory_entries", "conversations"))  # consistency guard
+        # Identity-equal remap is a data-loss trap: every row conflicts with
+        # itself on the INSERT ... ON CONFLICT DO NOTHING, then the DELETE
+        # removes the originals. Refuse blank and equal identities up front.
+        if _is_blank(old_identity) or _is_blank(new_identity):
+            raise ValueError("remap_identity requires non-blank old and new identities")
+        if old_identity == new_identity:
+            raise ValueError(
+                f"remap_identity: old and new identity are the same ({old_identity!r}); "
+                "refusing (it would delete every row)"
+            )
         with self._get_pool().connection() as conn:
             with conn.cursor() as cur:
                 cur.execute("SELECT count(*) FROM memory_entries WHERE agent_identity = %s", (old_identity,))

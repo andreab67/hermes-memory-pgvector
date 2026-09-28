@@ -49,8 +49,9 @@ def _load_config_file(path: Optional[str]) -> dict:
         plugins = (data.get("plugins") or {})
         return plugins.get("pgvector") or {}
     except Exception as exc:  # noqa: BLE001
-        print(f"warning: could not read config {path}: {exc}", file=sys.stderr)
-        return {}
+        # An explicit --config that cannot be read must not silently fall
+        # back to DEFAULTS (destructive commands would hit the default DSN).
+        raise ValueError(f"could not read config {path}: {exc}") from exc
 
 
 def _resolve(args, file_cfg: dict, key: str):
@@ -196,7 +197,7 @@ def cmd_install(args) -> int:
 
     # A pre-existing symlink or hand-installed plugin dir is not ours to
     # clobber silently. --force replaces a symlink outright and moves a real
-    # directory aside with a timestamped .bak suffix.
+    # directory aside with a hidden timestamped .<name>.bak-<ts> sibling.
     if shim_dir.is_symlink():
         if not args.force:
             print(
@@ -217,8 +218,11 @@ def cmd_install(args) -> int:
             )
             return 1
         from datetime import datetime
+        # Leading "." keeps the backup out of hermes-agent provider discovery
+        # (it skips plugin dirs named with a leading "_" or "."); otherwise the
+        # old install would be found as a second provider.
         bak = shim_dir.with_name(
-            shim_dir.name + ".bak-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+            "." + shim_dir.name + ".bak-" + datetime.now().strftime("%Y%m%d-%H%M%S")
         )
         shim_dir.rename(bak)
         print(f"moved existing install aside to {bak}")
@@ -468,7 +472,7 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--admin-dsn", required=True, help="superuser/owner DSN (CREATE/GRANT)")
     m.add_argument(
         "--runtime-role", default=None,
-        help="runtime role to GRANT DML to in 002/004/005 (default: 'hermes'; "
+        help="runtime role to GRANT DML to in 002/004 (default: 'hermes'; "
              "psql users get the same effect with "
              "PGOPTIONS='-c hermes_pgvector.runtime_role=NAME')",
     )

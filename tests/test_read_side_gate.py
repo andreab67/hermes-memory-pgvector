@@ -185,3 +185,42 @@ def test_group_agent_keeps_access_to_its_own_rows(monkeypatch):
     excl = set(p._store.kwargs.get("exclude_identities") or [])
     assert GROUP_BUCKET not in excl
     assert excl == {DM_BUCKET, BENCH_BUCKET}
+
+
+# --- recall_conversation: gate branches beyond the primary search path -----
+
+def test_recall_conversation_hybrid_failure_fallback_excludes_sinks(monkeypatch):
+    """Same danger as the recall_memory fallback: if hybrid_search_turns
+    raises, the fallback search_turns() must still carry exclude_identities."""
+    p = _provider("marketing", monkeypatch)
+    calls = {}
+
+    def _boom(**kw):
+        raise RuntimeError("hybrid exploded")
+
+    def _fallback(**kw):
+        calls.update(kw)
+        return []
+
+    p._store.hybrid_search_turns = _boom
+    p._store.search_turns = _fallback
+    p.handle_tool_call("recall_conversation", {"query": "q", "scope": "all"})
+    assert calls, "the fallback search_turns() must have run"
+    assert set(calls.get("exclude_identities") or []) == {DM_BUCKET, GROUP_BUCKET, BENCH_BUCKET}
+
+
+def test_recall_conversation_session_scope_without_session_id_excludes_sinks(monkeypatch):
+    """scope='session' with an empty session id would be an unfiltered
+    cross-theme sweep; the gate must exclude the restricted sinks."""
+    p = _provider("marketing", monkeypatch)
+    p._session_id = ""
+    p.handle_tool_call("recall_conversation", {"query": "q", "scope": "session"})
+    assert p._store.kwargs.get("session_id") is None
+    assert set(p._store.kwargs.get("exclude_identities") or []) == {DM_BUCKET, GROUP_BUCKET, BENCH_BUCKET}
+
+
+def test_recall_conversation_session_scope_with_session_id_needs_no_exclusion(monkeypatch):
+    p = _provider("marketing", monkeypatch)
+    p.handle_tool_call("recall_conversation", {"query": "q", "scope": "session"})
+    assert p._store.kwargs.get("session_id") == "sess-gate"
+    assert not p._store.kwargs.get("exclude_identities")

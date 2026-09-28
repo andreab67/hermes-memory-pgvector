@@ -33,6 +33,8 @@ import pytest
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hermes_pgvector.store import MemoryStore  # noqa: E402
+# Per-test throwaway database for tests that act on whole tables.
+from test_v060_migrations_cli import scratch_db, scratch_store  # noqa: E402,F401
 
 
 @pytest.fixture
@@ -54,10 +56,10 @@ def store():
 
 # --- H3: keyset pagination + consecutive-failure breaker -------------------
 
-def test_backfill_keyset_pagination_gets_past_failing_rows(store):
+def test_backfill_keyset_pagination_gets_past_failing_rows(scratch_store):
     """A block of permanently-failing rows at the low end of the id range
     must not stall every later row -- each row is visited exactly once."""
-    s, agent = store
+    s, agent = scratch_store
     for i in range(5):
         s.append_turn(session_id="s", agent_identity=agent, role="user",
                        content=f"POISON {agent} {i}")
@@ -79,8 +81,8 @@ def test_backfill_keyset_pagination_gets_past_failing_rows(store):
     assert result["processed"] == 10
 
 
-def test_backfill_consecutive_failure_breaker_trips_and_notes(store):
-    s, agent = store
+def test_backfill_consecutive_failure_breaker_trips_and_notes(scratch_store):
+    s, agent = scratch_store
     for i in range(6):
         s.append_turn(session_id="s", agent_identity=agent, role="user",
                        content=f"POISON {agent} {i}")
@@ -104,9 +106,9 @@ def test_backfill_consecutive_failure_breaker_trips_and_notes(store):
     assert result["processed"] == 3
 
 
-def test_backfill_success_resets_the_consecutive_counter(store):
+def test_backfill_success_resets_the_consecutive_counter(scratch_store):
     """Failures interleaved with successes must never trip the breaker."""
-    s, agent = store
+    s, agent = scratch_store
     for i in range(10):
         s.append_turn(session_id="s", agent_identity=agent, role="user",
                        content=f"row {agent} {i}")
@@ -136,10 +138,10 @@ def test_backfill_success_resets_the_consecutive_counter(store):
 
 # --- M2: guarded UPDATE ------------------------------------------------------
 
-def test_backfill_skips_a_row_changed_mid_run(store):
+def test_backfill_skips_a_row_changed_mid_run(scratch_store):
     """A replace() landing between backfill's SELECT and UPDATE must not
     stamp the NEW content with the OLD text's embedding."""
-    s, agent = store
+    s, agent = scratch_store
     rid = s.add(agent_identity=agent, target="memory", content="original text")
     assert rid is not None
 

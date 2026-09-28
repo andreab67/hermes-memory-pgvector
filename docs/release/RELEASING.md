@@ -18,6 +18,12 @@ publish step (deliberately — see
 - [ ] `CHANGELOG.md`: change `## [X.Y.Z] - Unreleased` to
       `## [X.Y.Z] - YYYY-MM-DD` (today's date, in the release commit — not
       before).
+- [ ] **Promoting a release candidate to final** (e.g. `1.0.0rc1` ->
+      `1.0.0`): bump `pyproject.toml` and `plugin.yaml` to the final
+      version (step 1), then add or rename the CHANGELOG heading to
+      `## [1.0.0] - YYYY-MM-DD` and keep a note about the rc under it
+      (e.g. "promoted from 1.0.0rc1, no behaviour change" -- only if that
+      is literally true; list any post-rc fix like any other change).
 - [ ] Confirm every finding/behaviour change fixed since the last release
       has an entry (Added/Changed/Fixed, plus a **Breaking / upgrade
       notes** block for anything that needs operator action).
@@ -117,8 +123,8 @@ hermes memory status        # expect: Provider: pgvector; Status: available
 
 Tagging does **not** create a GitHub Release — that is a separate object
 with its own release notes, and PyPI's project page links to it. Create it
-manually (or `gh release create vX.Y.Z --notes-file <(sed -n '/## \[X.Y.Z\]/,/## \[/p' CHANGELOG.md)`
-trimmed to just that section), pointing at the pushed tag.
+manually (or `gh release create vX.Y.Z --notes-file <(awk -v v='X.Y.Z' 'BEGIN{h="## [" v "] "} index($0,h)==1{f=1;next} /^## \[/{f=0} f' CHANGELOG.md)`,
+which prints only that version's section body), pointing at the pushed tag.
 
 - [ ] GitHub Release created, notes match the CHANGELOG entry.
 

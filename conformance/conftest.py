@@ -55,21 +55,35 @@ import pytest
 _CONFORMANCE_DIR = Path(__file__).resolve().parent
 _REPO_ROOT = _CONFORMANCE_DIR.parent
 
+# pytest options whose NEXT argv element is a value, not a path. (The
+# `--opt=value` forms start with "-" and are skipped as flags already.)
+_VALUE_OPTIONS = {"-k", "-m", "-p", "-o", "-c", "-W", "--deselect", "--ignore", "--ignore-glob"}
+
 
 def pytest_ignore_collect(collection_path: Path, config: pytest.Config) -> bool:
-    """True (ignore) unless `conformance` was explicitly named on the command line.
+    """True (ignore) unless this directory was explicitly named on the command line.
 
     `config.invocation_params.args` is the raw argv pytest was invoked with
-    (flags and all). A bare `pytest -q` / `pytest` from the repo root has no
-    non-flag argument at all -> ignore. `pytest conformance -q`,
+    (flags and all). Only path-like args count: `pytest conformance -q`,
     `pytest conformance/test_x.py::test_y`, or an absolute path under this
-    directory all contain "conformance" in one of the non-flag args -> collect.
+    directory -> collect. A bare `pytest -q`, or a mere mention of the word
+    in an option value (`pytest -k conformance`), does not -> ignore.
     """
     args = [str(a) for a in config.invocation_params.args]
+    skip_next = False
     for arg in args:
-        if arg.startswith("-"):
+        if skip_next:  # value of a preceding `-k expr` / `-m expr` / ...
+            skip_next = False
             continue
-        if "conformance" in arg.replace("\\", "/"):
+        if arg.startswith("-"):
+            if arg in _VALUE_OPTIONS:
+                skip_next = True
+            continue
+        try:
+            path = (config.invocation_params.dir / arg.split("::")[0]).resolve()
+        except (OSError, ValueError):
+            continue
+        if path == _CONFORMANCE_DIR or _CONFORMANCE_DIR in path.parents:
             return False
     return True
 
@@ -82,17 +96,6 @@ def pinned_ref() -> str:
 @pytest.fixture(scope="session")
 def hermes_agent_ref() -> str:
     return pinned_ref()
-
-
-@pytest.fixture
-def pg_test_dsn() -> str:
-    """PG_TEST_DSN, or a clean skip -- same gate the tests/ suite uses."""
-    import os
-
-    dsn = os.environ.get("PG_TEST_DSN")
-    if not dsn:
-        pytest.skip("PG_TEST_DSN not set")
-    return dsn
 
 
 @pytest.fixture

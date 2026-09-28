@@ -5,7 +5,9 @@ and what to alert on. See [configuration.md](configuration.md) for every
 config key and [troubleshooting.md](troubleshooting.md) for failure modes.
 
 Every command below resolves connection + embed settings CLI flag > `--config
-<config.yaml>` > built-in default. Destructive commands (`prune`, `cleanup`,
+<config.yaml>` > built-in default. An explicit `--config` that cannot be read
+or parsed is an error (message on stderr, exit 1), never a silent fallback to
+the built-in defaults. Destructive commands (`prune`, `cleanup`,
 `remap`) default to dry-run; pass `--execute` to actually mutate. Every
 mutating run is recorded in `memory_maintenance_log`.
 
@@ -24,7 +26,7 @@ Idempotent — every migration uses `IF NOT EXISTS` / `IF EXISTS`, so
 re-running on an already-migrated database is a no-op except for whatever is
 genuinely new.
 
-**Runtime role.** Migrations `002`, `004`, and `005` grant the runtime role
+**Runtime role.** Migrations `002` and `004` grant the runtime role
 DML on the tables they create or touch. The role defaults to `hermes`; if
 yours is different, pass it explicitly so the grants land on the right role
 instead of silently no-op'ing with a `NOTICE`:
@@ -71,6 +73,7 @@ touching a row) if the endpoint's vectors don't match `embed_dim`.
 | Code | Meaning |
 |---|---|
 | `0` | Done — `remaining: 0` on every table, no table aborted. |
+| `1` | Error before or outside the per-row loop — e.g. the embed endpoint returns vectors of the wrong dimension (`embed_dim` mismatch), an unreadable `--config`, or a database error (`error: ...` on stderr). Alert on it like `2`. |
 | `2` | Embed endpoint unavailable, or a table's pass aborted after `max_consecutive_failures` (default 20) consecutive row failures. |
 | `3` | Rows still remain NULL or failed this run, but no abort — usually just means "more than one run's worth of backlog"; re-run. |
 
@@ -124,6 +127,12 @@ your signal that a content-level scrub may still be needed. `--tables`
 scopes both the scan and the delete to just the named table(s) (default:
 both `memory_entries` and `conversations`).
 
+The scan covers `content` only, not the `metadata` column: when the raw
+session key differs from the canonical identity, rows record it as
+`metadata->>'raw_identity'`, and for DM/group buckets that raw key can
+contain a phone number or participant id. Deleting the rows removes it, but
+the scan will not flag it, so check metadata separately if that matters.
+
 ## remap
 
 Merges one `agent_identity` into another — the tool for folding a mixed-case
@@ -142,6 +151,10 @@ data-loss guard. `conversations` rows are moved with a plain `UPDATE` (no
 unique constraint there). Runs under an advisory lock shared with `cleanup`
 so the two never interleave.
 
+`remap` refuses a blank `--old` or `--new`, and refuses identical `--old` and
+`--new` (an identity-equal merge would drop every row). Both are errors (exit
+1) even in dry-run, before any row is read or changed.
+
 ## stats
 
 Read-only health + row-count summary:
@@ -151,7 +164,8 @@ hermes-pgvector stats --config $HERMES_HOME/config.yaml
 ```
 
 Prints `health()` (liveness + `row_count_estimate` — an approximation from
-`pg_class.reltuples`, not an exact count), exact scoped row counts for
+`pg_class.reltuples`, not an exact count), exact total row counts (a full `COUNT(*)` -- slow on
+multi-million-row tables) for
 `memory_entries` / `conversations`, per-table NULL-embedding counts (a
 dry-run `backfill`), and — if migration `002` is applied — per-agent
 attribution from `v_agent_memory`.

@@ -44,16 +44,36 @@ def main() -> int:
         print(f"missing dependency: {exc}", file=sys.stderr)
         return 2
 
-    with psycopg.connect(admin, autocommit=True) as conn:
-        if conn.execute("SELECT 1 FROM pg_roles WHERE rolname = 'hermes'").fetchone():
-            print("a role named 'hermes' exists in this cluster; use a fresh one", file=sys.stderr)
-            return 2
-        conn.execute(f"DROP DATABASE IF EXISTS {DB}")
-        if not conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (ROLE,)).fetchone():
-            conn.execute(f"CREATE ROLE {ROLE} LOGIN PASSWORD '{ROLE}'")
-        conn.execute(f"CREATE DATABASE {DB}")
+    try:
+        with psycopg.connect(admin, autocommit=True) as conn:
+            if conn.execute("SELECT 1 FROM pg_roles WHERE rolname = 'hermes'").fetchone():
+                print("a role named 'hermes' exists in this cluster; use a fresh one", file=sys.stderr)
+                return 2
+            conn.execute(f"DROP DATABASE IF EXISTS {DB}")
+            if not conn.execute("SELECT 1 FROM pg_roles WHERE rolname = %s", (ROLE,)).fetchone():
+                conn.execute(f"CREATE ROLE {ROLE} LOGIN PASSWORD '{ROLE}'")
+            conn.execute(f"CREATE DATABASE {DB}")
+    except psycopg.Error as exc:
+        print(f"environment problem during setup: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
 
-    db_admin = _dsn_with_db(admin, DB)
+    try:
+        return _check(admin, _dsn_with_db(admin, DB))
+    except psycopg.Error as exc:
+        print(f"environment problem: {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 2
+    finally:
+        try:
+            with psycopg.connect(admin, autocommit=True) as conn:
+                conn.execute(f"DROP DATABASE IF EXISTS {DB}")
+        except psycopg.Error as exc:
+            print(f"warning: could not drop {DB}: {exc}", file=sys.stderr)
+
+
+def _check(admin: str, db_admin: str) -> int:
+    import psycopg
+    import hermes_pgvector
+
     cli = [sys.executable, "-m", "hermes_pgvector", "migrate", "--admin-dsn", db_admin]
     help_text = subprocess.run(cli[:4] + ["--help"], capture_output=True, text=True).stdout
     if "--runtime-role" in help_text:
@@ -82,8 +102,6 @@ def main() -> int:
                 print(f"FAIL: {ROLE} lacks {label}")
                 ok = False
 
-    with psycopg.connect(admin, autocommit=True) as conn:
-        conn.execute(f"DROP DATABASE IF EXISTS {DB}")
     print("PASS" if ok else "BUG PRESENT")
     return 0 if ok else 1
 

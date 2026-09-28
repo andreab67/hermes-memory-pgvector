@@ -225,7 +225,7 @@ DEFAULTS = {
     # header, OpenAI-compatible path with the Ollama-native fallback.
     # embed_dim must equal the model's output AND the vector(N) columns;
     # changing it on an existing database needs a column migration + re-embed
-    # (see README, "Changing the embedding dimension").
+    # (see docs/upgrading.md, "Changing the embedding dimension").
     "embed_dim": 768,
     # NAME of an environment variable holding a bearer token (e.g.
     # "OPENROUTER_API_KEY"), never the token itself. Read at call time.
@@ -306,6 +306,20 @@ DEFAULTS = {
 }
 
 
+# Bounds for prefetch_budget. The maximum sits below the host's 8s hard cap on
+# an external provider's prefetch (upstream _EXTERNAL_PREFETCH_TIMEOUT_S); the
+# config schema and prefetch()'s clamp both read these so they cannot drift.
+_PREFETCH_BUDGET_MIN = 0.1
+_PREFETCH_BUDGET_MAX = 7.5
+
+# Bounds for prefetch_limit / min_similarity; get_config_schema advertises
+# them and _compute_prefetch_block clamps to them.
+_PREFETCH_LIMIT_MIN = 1
+_PREFETCH_LIMIT_MAX = 50
+_MIN_SIMILARITY_MIN = 0.0
+_MIN_SIMILARITY_MAX = 1.0
+
+
 def _as_bool(value: Any, default: bool) -> bool:
     """Coerce a config value to a real bool.
 
@@ -313,13 +327,22 @@ def _as_bool(value: Any, default: bool) -> bool:
     hand-edited config.yaml (YAML bools), and save_config(), which persists
     the config schema's declared values -- the STRINGS "true"/"false". A plain
     truthiness test silently inverts the string form (bool("false") is True),
-    so every boolean toggle reads through here.
+    so every boolean toggle reads through here. Only the explicit true/false
+    vocabularies are honoured; None, blank and unrecognized strings return
+    `default`.
     """
     if value is None:
         return default
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    # Blank / unrecognized: fall back to the default, like _as_int/_as_float,
+    # so a blank value for a default-true toggle does not silently disable it.
+    return default
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -452,16 +475,50 @@ def _embed_with_config(
     key_env = config.get("embed_api_key_env")
     return _embed_text(
         text,
-        base_url=config.get("embed_url", DEFAULTS["embed_url"]),
-        model=config.get("embed_model", DEFAULTS["embed_model"]),
+        # `or`, not a .get default: a blank `embed_url:` in config.yaml loads
+        # as None and would otherwise reach embed() as base_url=None.
+        base_url=config.get("embed_url") or DEFAULTS["embed_url"],
+        model=config.get("embed_model") or DEFAULTS["embed_model"],
         timeout=timeout,
         retries=retries,
         backoff=backoff,
         max_total=max_total,
         dim=_embed_dim(config),
         api_key_env=str(key_env).strip() if key_env else None,
-        protocol=config.get("embed_protocol", DEFAULTS["embed_protocol"]),
+        protocol=config.get("embed_protocol") or DEFAULTS["embed_protocol"],
     )
+
+
+_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
+_IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
+
+
+def _flatten_user_content(content: Any) -> str:
+    """Flatten user message content exactly as the host does before sync_turn().
+
+    Mirrors upstream agent.codex_responses_adapter._summarize_user_message_for_log
+    (called with a newline separator): text parts joined with newlines, images collapsed
+    to a "[N image(s)]" prefix, "" for None, str() for other scalars. The
+    on_session_end backstop fingerprints this form, so a multimodal turn hashes
+    the same as what sync_turn() already recorded.
+    """
+    if not isinstance(content, list):
+        return "" if content is None else str(content)
+    texts: List[str] = []
+    images = 0
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                texts.append(part)
+        elif isinstance(part, dict):
+            ptype = str(part.get("type") or "").strip().lower()
+            text = part.get("text")
+            if ptype in _TEXT_PART_TYPES and isinstance(text, str) and text:
+                texts.append(text)
+            elif ptype in _IMAGE_PART_TYPES:
+                images += 1
+    note = f"[{images} image{'s' if images != 1 else ''}]" if images else ""
+    return " ".join(bit for bit in (note, "\n".join(texts).strip()) if bit)
 
 
 def _load_plugin_config() -> dict:
@@ -508,6 +565,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         self._healthy: bool = False
         self._delegation_enabled: bool = False        # set in initialize() iff migration 002 applied
         self._embed_warned: bool = False
+        self._embed_bug_warned: set = set()
         self._db_warned: bool = False
         # v0.6.0 (M4) -- agent_context gate. True until the first initialize()
         # decides otherwise, so a provider used without initialize() (unit
@@ -874,7 +932,13 @@ class PgvectorMemoryProvider(MemoryProvider):
         # embed() as its timeout, which is now ONE shared deadline across
         # embed_protocol='auto''s two HTTP attempts, not a fresh timeout for
         # each (see embed.py).
-        budget = _as_float(self._config.get("prefetch_budget"), DEFAULTS["prefetch_budget"])
+        budget = min(
+            max(
+                _as_float(self._config.get("prefetch_budget"), DEFAULTS["prefetch_budget"]),
+                _PREFETCH_BUDGET_MIN,
+            ),
+            _PREFETCH_BUDGET_MAX,
+        )
         deadline = time.monotonic() + budget
         return self._compute_prefetch_block(query, timeout=budget, deadline=deadline)
 
@@ -962,10 +1026,14 @@ class PgvectorMemoryProvider(MemoryProvider):
             rows = store.search(
                 query_embedding=vec,
                 agent_identity=self._agent_identity,
-                limit=_as_int(self._config.get("prefetch_limit"),
-                              DEFAULTS["prefetch_limit"]),
-                min_similarity=_as_float(self._config.get("min_similarity"),
-                                         DEFAULTS["min_similarity"]),
+                limit=max(_PREFETCH_LIMIT_MIN, min(
+                    _as_int(self._config.get("prefetch_limit"),
+                            DEFAULTS["prefetch_limit"]),
+                    _PREFETCH_LIMIT_MAX)),
+                min_similarity=max(_MIN_SIMILARITY_MIN, min(
+                    _as_float(self._config.get("min_similarity"),
+                              DEFAULTS["min_similarity"]),
+                    _MIN_SIMILARITY_MAX)),
             )
         except Exception as exc:  # noqa: BLE001
             logger.debug("pgvector prefetch query failed: %s", exc)
@@ -1090,12 +1158,20 @@ class PgvectorMemoryProvider(MemoryProvider):
         Guarded import, matching how this module already reaches for
         `agent.memory_provider` / `hermes_constants`: outside hermes-agent the
         content is simply used as-is.
+
+        When the host helper is present but returns None/empty (a bare
+        `/skill` with no user instruction) the host skips sync_turn()
+        entirely, so this returns "" -- callers must treat that as "nothing
+        to store" rather than falling back to the multi-KB skill body.
         """
         try:
             from agent.skill_commands import (
                 extract_user_instruction_from_skill_message as _strip,
             )
-            return _strip(content) or content
+        except Exception:  # noqa: BLE001 -- host internals are optional
+            return content
+        try:
+            return _strip(content) or ""
         except Exception:  # noqa: BLE001 -- host internals are optional
             return content
 
@@ -1178,6 +1254,19 @@ class PgvectorMemoryProvider(MemoryProvider):
             return
         try:
             child_identity = kwargs.get("child_identity") or kwargs.get("agent_identity")
+            if isinstance(child_identity, str) and child_identity:
+                # Same governance initialize() applies to this agent's own
+                # identity; a raw value would bypass the allow-list/aliases/
+                # bench isolation. Upstream does not pass this today
+                # (tools/delegate_tool_results.py), so None stays None.
+                child_identity, _, _ = normalize_identity(
+                    child_identity,
+                    allowed_themes=_as_theme_list(self._config.get("allowed_themes")),
+                    aliases=_as_alias_map(self._config.get("identity_aliases")),
+                    bench_mode=self._config.get("bench_mode", "bucket"),
+                )
+            else:
+                child_identity = None
             child_session_id = kwargs.get("child_session_id") or kwargs.get("session_id")
             self._writer.enqueue(
                 action="edge",
@@ -1265,23 +1354,20 @@ class PgvectorMemoryProvider(MemoryProvider):
                     role = (msg.get("role") or "").lower()
                     if role not in ("user", "assistant"):
                         continue
-                    raw = msg.get("content") or ""
-                    content = (
-                        raw if isinstance(raw, str)
-                        else " ".join(
-                            p.get("text", "") for p in raw
-                            if isinstance(p, dict) and p.get("type") == "text"
-                        ) if isinstance(raw, list) else str(raw)
-                    )
+                    # The host flattens every role with the same helper
+                    # before sync_turn(), so do the same for a matching hash.
+                    content = _flatten_user_content(msg.get("content") or "")
+                    # Normalize user turns the way the host does: a /skill
+                    # turn reaches sync_turn() as just the user's instruction
+                    # (and not at all for a bare /skill). Noise-check, dedup
+                    # and STORE that same string, never the skill body.
+                    if role == "user":
+                        content = self._strip_skill_scaffolding(content)
+                        if not content:
+                            continue
                     if self._is_noise(content, min_chars=min_chars):
                         continue
-                    # Fingerprint the NORMALIZED form for user turns, so a
-                    # /skill turn matches what sync_turn() was handed.
-                    fp_content = (
-                        self._strip_skill_scaffolding(content)
-                        if role == "user" else content
-                    )
-                    fp = self._turn_fingerprint(role, fp_content)
+                    fp = self._turn_fingerprint(role, content)
                     if fp in self._turn_fingerprints:
                         continue  # already enqueued by sync_turn this session
                     accepted = self._writer.enqueue(
@@ -1866,18 +1952,39 @@ class PgvectorMemoryProvider(MemoryProvider):
         """Governance config that must bust a cached gateway agent when it
         changes. Upstream calls this on an UNINITIALIZED instance on every
         inbound message (agent.memory_provider.MemoryProvider.identity_signature),
-        so it reads self._config only -- no I/O, no self._store, cheap and
-        read-only. allowed_themes/identity_aliases/bench_mode decide which
+        and the gateway memoises ONE provider per process, so self._config
+        (frozen at register()) would never reflect an edit. Instead the values
+        come from config.yaml, memoised on (path, st_mtime_ns, st_size) -- one
+        stat per call, a re-parse only when the file changed (same pattern as
+        upstream's Honcho provider). self._config is never mutated and is the
+        fallback on any stat/parse failure. No self._store, never raises.
+        allowed_themes/identity_aliases/bench_mode decide which
         theme a raw identity normalizes to (identity.normalize_identity);
         write_contexts decides whether a context writes at all -- a cached
         agent built under the OLD values would keep routing/writing wrong
         until the process restarts, without this.
         """
+        try:
+            from hermes_constants import get_hermes_home
+            path = get_hermes_home() / "config.yaml"
+            stat = path.stat()
+            key = (str(path), stat.st_mtime_ns, stat.st_size)
+            memo = getattr(self, "_sig_memo", None)
+            if memo is not None and memo[0] == key:
+                return dict(memo[1])
+            values = self._signature_values({**DEFAULTS, **_load_plugin_config()})
+            self._sig_memo = (key, values)
+            return dict(values)
+        except Exception:  # noqa: BLE001 -- never raise; fall back to the frozen config
+            return self._signature_values(self._config)
+
+    @staticmethod
+    def _signature_values(config: Dict[str, Any]) -> Dict[str, Any]:
         return {
-            "pgvector.allowed_themes": _as_theme_list(self._config.get("allowed_themes")),
-            "pgvector.identity_aliases": _as_alias_map(self._config.get("identity_aliases")),
-            "pgvector.bench_mode": self._config.get("bench_mode", DEFAULTS["bench_mode"]),
-            "pgvector.write_contexts": _as_write_contexts(self._config.get("write_contexts")),
+            "pgvector.allowed_themes": _as_theme_list(config.get("allowed_themes")),
+            "pgvector.identity_aliases": _as_alias_map(config.get("identity_aliases")),
+            "pgvector.bench_mode": config.get("bench_mode", DEFAULTS["bench_mode"]),
+            "pgvector.write_contexts": _as_write_contexts(config.get("write_contexts")),
         }
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
@@ -1904,7 +2011,7 @@ class PgvectorMemoryProvider(MemoryProvider):
             },
             {
                 "key": "embed_dim",
-                "description": "Vector length the embed model returns. Must also match the database's vector(N) columns (768 as created by migration 001). Changing it on an existing database requires migrating those columns and re-embedding every row -- see README, 'Changing the embedding dimension'.",
+                "description": "Vector length the embed model returns. Must also match the database's vector(N) columns (768 as created by migration 001). Changing it on an existing database requires migrating those columns and re-embedding every row -- see docs/upgrading.md, 'Changing the embedding dimension'.",
                 "type": "integer",
                 "default": DEFAULTS["embed_dim"],
                 "minimum": 1,
@@ -1927,16 +2034,16 @@ class PgvectorMemoryProvider(MemoryProvider):
                 "description": "Max ambient recall results injected per turn",
                 "type": "integer",
                 "default": DEFAULTS["prefetch_limit"],
-                "minimum": 1,
-                "maximum": 50,
+                "minimum": _PREFETCH_LIMIT_MIN,
+                "maximum": _PREFETCH_LIMIT_MAX,
             },
             {
                 "key": "min_similarity",
                 "description": "Cosine similarity cutoff for ambient prefetch",
                 "type": "number",
                 "default": DEFAULTS["min_similarity"],
-                "minimum": 0.0,
-                "maximum": 1.0,
+                "minimum": _MIN_SIMILARITY_MIN,
+                "maximum": _MIN_SIMILARITY_MAX,
             },
             {
                 "key": "embed_on_write",
@@ -2062,8 +2169,8 @@ class PgvectorMemoryProvider(MemoryProvider):
                 "description": "Hard wall-clock budget (seconds) for prefetch()'s synchronous fallback path (embed + search), used when queue_prefetch() has not already cached a block for the session. Must stay below the host's external-provider prefetch timeout (8s), or the host logs a timeout warning and skips this provider on later turns until the stuck call returns.",
                 "type": "number",
                 "default": DEFAULTS["prefetch_budget"],
-                "minimum": 0.1,
-                "maximum": 7.5,
+                "minimum": _PREFETCH_BUDGET_MIN,
+                "maximum": _PREFETCH_BUDGET_MAX,
             },
         ]
 
@@ -2136,6 +2243,16 @@ class PgvectorMemoryProvider(MemoryProvider):
             if not self._embed_warned:
                 logger.warning("pgvector embed failed (degrading to text-only): %s", exc)
                 self._embed_warned = True
+            return None
+        except Exception as exc:  # noqa: BLE001 -- an embed-side bug must never drop a durable row
+            # Not an endpoint failure but a bug: never hide it behind the
+            # one-shot EmbeddingError warning (a transient outage earlier
+            # would otherwise silence it); warn once per exception type.
+            kind = type(exc).__name__
+            warned = self.__dict__.setdefault("_embed_bug_warned", set())
+            if kind not in warned:
+                warned.add(kind)
+                logger.warning("pgvector embed raised unexpectedly (degrading to text-only)", exc_info=exc)
             return None
 
 

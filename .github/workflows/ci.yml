@@ -110,7 +110,9 @@ jobs:
             sleep 0.5
           done
       - name: pytest -q (live DB + embed endpoint, expect 0 skipped)
-        run: pytest -q
+        run: |
+          pytest -q --junitxml=pytest-live.xml
+          python -c "import sys, xml.etree.ElementTree as ET; r = ET.parse('pytest-live.xml').getroot(); s = r if r.tag == 'testsuite' else r.find('testsuite'); n = int(s.get('skipped')); print('skipped:', n); sys.exit(1 if n else 0)"
       # Every docs/code-review/repro-2026-09-26/repro_*.py that applies to
       # this cluster. Each exits 0 once its finding is fixed and 1 if the bug
       # comes back, so they are required regression checks (flipped at Gate G1).
@@ -222,8 +224,14 @@ jobs:
               -H "Content-Type: application/json" -d '{"model":"x","input":"ping"}' && break
             sleep 0.5
           done
-      - name: Run upstream conformance suite (pinned ref)
-        run: scripts/conformance.sh
+      # Zero-skip gate: every conformance module importorskips / skips on a
+      # missing env, so without this a HERMES_AGENT_REF bump that makes
+      # plugins.memory unimportable would go green with everything skipped.
+      # (A leading `--` flag is forwarded to pytest, not taken as the REF.)
+      - name: Run upstream conformance suite (pinned ref, expect 0 skipped)
+        run: |
+          scripts/conformance.sh --junitxml=pytest-conformance.xml
+          python -c "import sys, xml.etree.ElementTree as ET; r = ET.parse('pytest-conformance.xml').getroot(); s = r if r.tag == 'testsuite' else r.find('testsuite'); n = int(s.get('skipped')); print('skipped:', n); sys.exit(1 if n else 0)"
       - name: Show fake embed server log on failure
         if: failure()
         run: cat "$RUNNER_TEMP/fake-embed-server.log" || true
@@ -283,8 +291,10 @@ jobs:
               -H "Content-Type: application/json" -d '{"model":"x","input":"ping"}' && break
             sleep 0.5
           done
-      - name: Run upstream conformance suite (hermes-agent main -- drift report)
-        run: scripts/conformance.sh main
+      - name: Run upstream conformance suite (hermes-agent main -- drift report, expect 0 skipped)
+        run: |
+          scripts/conformance.sh main --junitxml=pytest-conformance.xml
+          python -c "import sys, xml.etree.ElementTree as ET; r = ET.parse('pytest-conformance.xml').getroot(); s = r if r.tag == 'testsuite' else r.find('testsuite'); n = int(s.get('skipped')); print('skipped:', n); sys.exit(1 if n else 0)"
       - name: Show fake embed server log on failure
         if: failure()
         run: cat "$RUNNER_TEMP/fake-embed-server.log" || true

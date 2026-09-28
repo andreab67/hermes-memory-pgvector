@@ -99,6 +99,27 @@ def test_writer_path_passes_the_configured_write_timeout(monkeypatch):
     assert rec.timeouts == [42.0], f"writer path did not plumb the timeout: {rec.timeouts}"
 
 
+def test_maybe_embed_passes_the_retry_and_total_budget_kwargs(monkeypatch):
+    """_Recorder swallows **kw, so pin the writer's bounded-retry contract
+    explicitly: max_total is 2x the write timeout (the two protocol paths),
+    retries/backoff come from config."""
+    seen = {}
+
+    def _spy(text, **kw):
+        seen.update(kw)
+        return [0.0] * 768
+
+    monkeypatch.setattr(pgvector_pkg, "_embed_text", _spy)
+    p = PgvectorMemoryProvider(config={
+        "embed_write_timeout": 12.0, "embed_write_retries": 4, "embed_write_backoff": 0.7,
+    })
+    assert p._maybe_embed("some durable content worth embedding") is not None
+    assert seen["timeout"] == 12.0
+    assert seen["max_total"] == 24.0
+    assert seen["retries"] == 4
+    assert seen["backoff"] == 0.7
+
+
 def test_writer_and_hot_path_do_not_share_a_timeout(monkeypatch):
     """The regression that motivated this: one hardcoded value for both."""
     p, rec = _provider(monkeypatch, embed_timeout=2.0, embed_write_timeout=60.0)
@@ -285,7 +306,10 @@ def test_auto_protocol_skips_the_second_path_when_the_budget_is_exhausted(monkey
 
     def _fake_post(url, body, *, timeout, extract, dim=768, api_key_env=None):
         seen_timeouts.append(timeout)
-        _time.sleep(timeout)  # eats the ENTIRE budget it was handed
+        # Eats the ENTIRE budget it was handed. Slightly over-sleep: on a
+        # coarse clock time.sleep(t) can advance monotonic() by a hair less
+        # than t, which would leave a sliver of budget and start path two.
+        _time.sleep(timeout + 0.05)
         raise embed_mod.EmbeddingError("down")
 
     monkeypatch.setattr(embed_mod, "_post", _fake_post)

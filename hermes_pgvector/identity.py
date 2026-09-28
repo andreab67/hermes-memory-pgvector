@@ -43,7 +43,11 @@ from typing import Iterable, Mapping, Optional, Tuple
 # 'desk:signal:main') into the DM bucket, breaking theme isolation on nothing
 # but the word "signal".
 _DM_RE = re.compile(
-    r"(?:^|:)dm:|(?:^|:)(?:whatsapp|telegram|signal):(?=dm:|\+?\d)",
+    # The bare host key agent:<ns>:<platform>:dm (a DM with neither chat id
+    # nor sender id -- gateway/session.py build_session_key's per-platform
+    # sink) has no trailing segment, so it needs its own anchored form.
+    r"(?:^|:)dm:|^agent:[^:]+:[^:]+:dm$"
+    r"|(?:^|:)(?:whatsapp|telegram|signal):(?=dm:|\+?\d)",
     re.IGNORECASE,
 )
 
@@ -57,6 +61,8 @@ _PLATFORMS = (
     "local|telegram|discord|whatsapp_cloud|whatsapp|slack|signal|mattermost"
     "|matrix|homeassistant|email|sms|dingtalk|webhook|feishu|wecom_callback"
     "|wecom|weixin|qqbot|bluebubbles|msgraph_webhook|yuanbao|relay|api_server"
+    # plugin platforms (hermes-agent plugins/platforms/*)
+    "|a2a|buzz|google_chat|irc|line|ntfy|photon|raft|simplex|teams"
 )
 
 # Multi-party session keys (group / channel / thread). Host layout is
@@ -81,9 +87,17 @@ _PLATFORMS = (
 #      would swallow ordinary themes like 'eng:channel:alerts' or
 #      'ops:group:oncall'. That over-match is the trap the v0.4.2 note below
 #      records for a bare ':signal:' alternative.
+# The chat types the host (hermes-agent gateway/session.py build_session_key)
+# emits for non-DM traffic: group, channel, thread, plus 'forum' (Telegram
+# supergroups with topics: plugins/platforms/telegram/adapter.py),
+# 'webhook' (gateway/platforms/webhook.py, msgraph_webhook.py) and 'room'
+# (LINE multi-person rooms: plugins/platforms/line/adapter.py). Every one of
+# them carries a participant / delivery id in the key. A type missing here
+# passes through unchanged and becomes a per-user theme readable via
+# scope='all'.
 _GROUP_RE = re.compile(
-    r"^agent:[^:]+:[^:]+:(?:group|channel|thread)(?::|$)"
-    r"|(?:^|:)(?:" + _PLATFORMS + r"):(?:group|channel|thread)(?::|$)",
+    r"^agent:[^:]+:[^:]+:(?:group|channel|thread|forum|webhook|room)(?::|$)"
+    r"|(?:^|:)(?:" + _PLATFORMS + r"):(?:group|channel|thread|forum|webhook|room)(?::|$)",
     re.IGNORECASE,
 )
 

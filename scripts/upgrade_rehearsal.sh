@@ -32,7 +32,7 @@
 #   ADMIN_PORT       admin connection port. When unset, read from the shared
 #                     test harness's port file (scripts/test-env.sh's own
 #                     TEST_ENV_STATE_DIR convention):
-#                       "${TEST_ENV_STATE_DIR:-$HOME/.hpg-test-env}/pg17.port"
+#                       "${TEST_ENV_STATE_DIR:-$REPO_ROOT/.cache/test-env}/pg17.port"
 #                     Run `scripts/test-env.sh up pg17` first if that file
 #                     does not exist yet, or set ADMIN_PORT explicitly.
 #   DB_NAME          database to drop + recreate (default: upgrade_rehearsal)
@@ -77,7 +77,7 @@ PYTHON="${PYTHON:-python3}"
 KEEP="${KEEP:-0}"
 
 if [ -z "${ADMIN_PORT:-}" ]; then
-  STATE_DIR="${TEST_ENV_STATE_DIR:-$HOME/.hpg-test-env}"
+  STATE_DIR="${TEST_ENV_STATE_DIR:-$REPO_ROOT/.cache/test-env}"
   PORT_FILE="$STATE_DIR/pg17.port"
   if [ ! -f "$PORT_FILE" ]; then
     echo "error: ADMIN_PORT is not set and no harness port file at $PORT_FILE" >&2

@@ -604,7 +604,31 @@ def test_shutdown_drain_timeout_accepts_a_string_config_value():
 _BOGUS_DSN = "host=127.0.0.1 port=1 dbname=nonexistent connect_timeout=1"
 
 
-def test_initialize_clears_draining_flag_for_the_new_writer():
+class _UnhealthyStore:
+    """MemoryStore stand-in whose health() fails immediately, so initialize()
+    takes its degraded path without a real connection attempt (a bogus DSN
+    blocks ~5s on the pool timeout per test)."""
+
+    def __init__(self, dsn):
+        self.dsn = dsn
+
+    def ensure_schema(self):
+        return None
+
+    def health(self):
+        return {"ok": False, "error": "fake", "row_count_estimate": None}
+
+    def close(self):
+        return None
+
+
+@pytest.fixture
+def unhealthy_store(monkeypatch):
+    import hermes_pgvector as pkg
+    monkeypatch.setattr(pkg, "MemoryStore", _UnhealthyStore)
+
+
+def test_initialize_clears_draining_flag_for_the_new_writer(unhealthy_store):
     p = PgvectorMemoryProvider(config={"dsn": _BOGUS_DSN})
     p._draining = True  # simulate a leftover flag from some earlier state
     p.initialize(session_id="s1", agent_identity="tester", hermes_home="/nonexistent")
@@ -612,7 +636,7 @@ def test_initialize_clears_draining_flag_for_the_new_writer():
     p.shutdown()
 
 
-def test_reinitialize_on_a_reused_provider_clears_draining_after_internal_shutdown():
+def test_reinitialize_on_a_reused_provider_clears_draining_after_internal_shutdown(unhealthy_store):
     """initialize() calls self.shutdown() first when the instance already has
     a store/writer (the gateway reuses one provider across sessions) -- that
     internal shutdown() sets _draining=True to fast-drain the OLD writer.
@@ -665,10 +689,15 @@ def test_as_write_contexts_malformed_value_falls_back_to_default():
 # ---------------------------------------------------------------------------
 
 def _init_and_get_gate(config=None, **kwargs):
-    p = PgvectorMemoryProvider(config={"dsn": _BOGUS_DSN, **(config or {})})
-    p.initialize(session_id="s1", agent_identity="tester", hermes_home="/nonexistent", **kwargs)
-    gate = (p._agent_context, p._writes_enabled)
-    p.shutdown()
+    import hermes_pgvector as pkg
+    # The gate tests never touch the DB; keep initialize() off the network so
+    # each one is instant (see _UnhealthyStore).
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setattr(pkg, "MemoryStore", _UnhealthyStore)
+        p = PgvectorMemoryProvider(config={"dsn": _BOGUS_DSN, **(config or {})})
+        p.initialize(session_id="s1", agent_identity="tester", hermes_home="/nonexistent", **kwargs)
+        gate = (p._agent_context, p._writes_enabled)
+        p.shutdown()
     return gate
 
 
@@ -942,9 +971,22 @@ def test_on_delegation_persists_parent_session_id_as_the_delegating_session(live
                 (p._agent_identity,),
             )
             row = cur.fetchone()
+            # _worker swallows exceptions, so a broken edge write would be
+            # silent -- assert the provenance edge really landed.
+            cur.execute(
+                "SELECT parent_identity, parent_session_id, child_session_id, kind "
+                "FROM memory_agent_edges WHERE parent_identity = %s",
+                (p._agent_identity,),
+            )
+            edges = cur.fetchall()
     assert row is not None
     assert row["parent_session_id"] == "grandparent-sess-live"
     assert row["metadata"].get("child_session_id") == "child-sess-live"
+    assert len(edges) == 1
+    assert edges[0]["parent_identity"] == p._agent_identity
+    assert edges[0]["parent_session_id"] == "parent-sess-live"
+    assert edges[0]["child_session_id"] == "child-sess-live"
+    assert edges[0]["kind"] == "delegated"
 
 
 # ---------------------------------------------------------------------------
