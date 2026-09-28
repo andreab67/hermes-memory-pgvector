@@ -21,8 +21,9 @@ publish step (deliberately — see
 - [ ] **Promoting a release candidate to final** (e.g. `1.0.0rc1` ->
       `1.0.0`): bump `pyproject.toml` and `plugin.yaml` to the final
       version (step 1), then add or rename the CHANGELOG heading to
-      `## [1.0.0] - YYYY-MM-DD` and keep the rc's entry/note (e.g. "promoted
-      from 1.0.0rc1, no behaviour change") under it.
+      `## [1.0.0] - YYYY-MM-DD` and keep a note about the rc under it
+      (e.g. "promoted from 1.0.0rc1, no behaviour change" -- only if that
+      is literally true; list any post-rc fix like any other change).
 - [ ] Confirm every finding/behaviour change fixed since the last release
       has an entry (Added/Changed/Fixed, plus a **Breaking / upgrade
       notes** block for anything that needs operator action).

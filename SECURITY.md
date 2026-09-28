@@ -5,7 +5,7 @@
 | Version | Supported |
 |---|---|
 | 1.x (latest) | Yes |
-| 0.6.x | Best-effort until 1.0.0 is released — 1.0.0 has no behaviour change from 0.6.0, so upgrading is a drop-in |
+| 0.6.x | No — upgrade to 1.x (no schema changes from 0.6.0; read the 1.0.0 upgrade notes in [CHANGELOG.md](CHANGELOG.md)) |
 | 0.5.x | No — upgrade to 0.6.x or later (0.5.0 and earlier also carry the pre-0.5.1 data-loss bug — see [CHANGELOG.md](CHANGELOG.md)) |
 | < 0.5.0 | No — please upgrade |
 

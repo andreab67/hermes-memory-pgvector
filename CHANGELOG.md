@@ -3,22 +3,92 @@
 All notable changes to `hermes-memory-pgvector` are documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/).
-This project does not yet follow strict semantic versioning (pre-1.0) — see
-[ROADMAP.md](ROADMAP.md) and the "Compatibility policy" section of
-[README.md](README.md) for what is considered the public, semver-covered
-surface (`plugins.pgvector.*` config keys, tool names/params, CLI
+From 1.0.0 on this project follows semantic versioning on its public
+surface — see the "Compatibility policy" section of
+[README.md](README.md) for what that surface is (`plugins.pgvector.*` config keys, tool names/params, CLI
 commands/flags/exit codes, table/column names, the `pgvector` provider name,
 and the package entry point — `MemoryStore` and every internal module are
 not).
 
-## [1.0.0rc1] - Unreleased
+## [1.0.0] - 2026-09-28
 
-No behaviour changes relative to 0.6.0. Declares the compatibility policy
-stable: the public surface listed in the "Compatibility policy" section of
-[README.md](README.md) is now guaranteed stable across the 1.x series,
-with breaking changes to that surface reserved for a future 2.0. `1.0.0`
-will be this same release candidate re-tagged, unchanged, after a soak
-period.
+First stable release. Declares the compatibility policy stable: the public
+surface listed in the "Compatibility policy" section of
+[README.md](README.md) is guaranteed stable across the 1.x series, with
+breaking changes to that surface reserved for a future 2.0.
+
+`1.0.0` is **not** a plain re-tag of `1.0.0rc1` (which was never published
+to PyPI): a full-codebase review before release
+([`docs/code-review/full-codebase-review-2026-09-28.md`](docs/code-review/full-codebase-review-2026-09-28.md))
+found one High and a number of Medium/Low defects, all fixed here. No schema
+changes and no new migrations relative to 0.6.0.
+
+### Breaking / upgrade notes
+
+- **`hermes-pgvector remap` refuses blank or identical `--old`/`--new`**
+  (`error:` on stderr, exit 1, dry-run included). Before, an identity-equal
+  `remap --execute` deleted every `memory_entries` row of that identity.
+- **An explicit `--config` that cannot be read or parsed is now an error**
+  (exit 1) for `stats`, `backfill`, `prune`, `cleanup` and `remap`. It used
+  to print a warning and silently fall back to the built-in default DSN.
+- **Boolean config keys** honour only `1/true/yes/on` and `0/false/no/off`;
+  blank or unrecognised values now mean the key's default. A blank value for
+  a default-on key (e.g. `hybrid_search`) used to read as `false`.
+- **`prefetch_budget`, `prefetch_limit` and `min_similarity` are clamped** to
+  the ranges the config schema already advertised (0.1-7.5 s, 1-50,
+  0.0-1.0).
+- **Install backups are hidden**: `install.sh` and `hermes-pgvector install
+  --force` now move a previous install to `plugins/.pgvector.bak-<ts>`, so
+  hermes-agent no longer discovers the backup as a second memory provider.
+  Check `~/.hermes/plugins/` for an old visible `pgvector.bak*` directory
+  and remove it.
+
+### Fixed
+
+- **High — `remap` data loss**: `remap --old X --new X --execute` deleted
+  every `memory_entries` row for `X` and exited 0 (each row conflicted with
+  itself on the insert, then the delete removed the originals).
+- `identity_signature()` read the config frozen at startup, so edits to
+  `allowed_themes` / `identity_aliases` / `bench_mode` / `write_contexts`
+  never rebuilt cached gateway agents until a restart. It now re-reads
+  `config.yaml` (one `stat` per call, re-parse only on change).
+- The `on_session_end` backstop wrote multimodal / multi-part user turns a
+  second time (it flattened content differently from the host), and stored
+  multi-KB `/skill` scaffolding for bare or trivial skill invocations.
+- `replace()` with a blank `old_text` overwrote an arbitrary row; editing an
+  entry into content that already exists left the stale row recallable.
+- The embed client accepted vectors containing NaN/Infinity/null, which the
+  database then rejected, losing the durable row; they now degrade to a
+  text-only row like any other embed failure.
+- `backfill`: blank rows made of non-ASCII whitespace (NBSP, U+2000-range,
+  U+3000, ...) or of U+001C-U+001F were retried and counted as failed on
+  every sweep, or left in `remaining` forever on some collations; the blank
+  filter now matches Python's `str.strip()` independent of locale. On
+  `SQL_ASCII` databases backfill no longer fails every row (`text = bytea`),
+  and rows that are not valid UTF-8 are reported as failed instead of as a
+  concurrent edit.
+- `on_delegation`: a host-supplied child identity is normalised like the
+  agent's own (it is NULL with current upstream, which does not pass one).
+- `scripts/conformance.sh` on a reused clone checked out a stale local branch
+  instead of the ref it had just fetched.
+- Docs: `hnsw.ef_search` DSN example (the unquoted form broke the
+  connection), manual-install migrations path, identity resolution order
+  (default-profile CLI/cron sessions resolve to the theme `hermes`), the
+  `cleanup` PII scan not covering `metadata.raw_identity`, test environment
+  variables.
+
+### Changed
+
+- CI: the live and conformance jobs fail on any skipped test, so a broken
+  environment can no longer pass green; many new regression tests (about
+  80) cover the fixes above.
+- The repro scripts under `docs/code-review/repro-2026-09-26/` exit 2 (not
+  1, "bug present") on environment problems.
+
+## [1.0.0rc1] - never published
+
+Version/metadata-only release candidate (merged, not uploaded to PyPI); its
+content is included in 1.0.0.
 
 ## [0.6.0] - 2026-09-26
 
