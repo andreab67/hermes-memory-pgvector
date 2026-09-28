@@ -54,7 +54,10 @@ def test_install_force_moves_foreign_dir_aside(tmp_path):
     d.mkdir(parents=True)
     (d / "__init__.py").write_text("# hand-written plugin, not a shim\n", encoding="utf-8")
     assert main(["install", "--hermes-home", str(tmp_path), "--force"]) == 0
-    baks = list((tmp_path / "plugins").glob("pgvector.bak-*"))
+    # The backup must be hidden (leading ".") so hermes-agent discovery, which
+    # skips dirs starting with "_" or ".", never sees it as a second provider.
+    assert not list((tmp_path / "plugins").glob("pgvector.bak-*"))
+    baks = list((tmp_path / "plugins").glob(".pgvector.bak-*"))
     assert len(baks) == 1
     assert "hand-written" in (baks[0] / "__init__.py").read_text(encoding="utf-8")
     assert SHIM_MARKER in (d / "__init__.py").read_text(encoding="utf-8")

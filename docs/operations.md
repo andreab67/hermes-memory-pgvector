@@ -5,7 +5,9 @@ and what to alert on. See [configuration.md](configuration.md) for every
 config key and [troubleshooting.md](troubleshooting.md) for failure modes.
 
 Every command below resolves connection + embed settings CLI flag > `--config
-<config.yaml>` > built-in default. Destructive commands (`prune`, `cleanup`,
+<config.yaml>` > built-in default. An explicit `--config` that cannot be read
+or parsed is an error (message on stderr, exit 1), never a silent fallback to
+the built-in defaults. Destructive commands (`prune`, `cleanup`,
 `remap`) default to dry-run; pass `--execute` to actually mutate. Every
 mutating run is recorded in `memory_maintenance_log`.
 
@@ -147,6 +149,10 @@ NOTHING`; more than 10 dropped duplicates requires `--force` as a
 data-loss guard. `conversations` rows are moved with a plain `UPDATE` (no
 unique constraint there). Runs under an advisory lock shared with `cleanup`
 so the two never interleave.
+
+`remap` refuses a blank `--old` or `--new`, and refuses identical `--old` and
+`--new` (an identity-equal merge would drop every row). Both are errors (exit
+1) even in dry-run, before any row is read or changed.
 
 ## stats
 

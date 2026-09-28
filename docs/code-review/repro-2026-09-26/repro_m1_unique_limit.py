@@ -34,6 +34,14 @@ def main() -> int:
     store = MemoryStore(dsn)
     ok = True
     try:
+        # Connection/setup problems are environment failures (exit 2), not the bug.
+        try:
+            with store._get_pool().connection() as conn:
+                conn.execute("DELETE FROM memory_entries WHERE agent_identity = %s", (IDENTITY,))
+                conn.commit()
+        except Exception as exc:  # noqa: BLE001 - connection, schema
+            print(f"environment problem during setup: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 2
         for n in (3000, 6000, 20000):
             text = secrets.token_hex(n // 2)
             try:
@@ -48,10 +56,13 @@ def main() -> int:
                 ok = False
             else:
                 print(f"ok: {n}-char entry inserted once, duplicate ignored")
-        with store._get_pool().connection() as conn:
-            conn.execute("DELETE FROM memory_entries WHERE agent_identity = %s", (IDENTITY,))
-            conn.commit()
     finally:
+        try:
+            with store._get_pool().connection() as conn:
+                conn.execute("DELETE FROM memory_entries WHERE agent_identity = %s", (IDENTITY,))
+                conn.commit()
+        except Exception as exc:  # noqa: BLE001
+            print(f"warning: could not clean up seeded rows: {exc}", file=sys.stderr)
         store.close()
     print("PASS" if ok else "BUG PRESENT")
     return 0 if ok else 1

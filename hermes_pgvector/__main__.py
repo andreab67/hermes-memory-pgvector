@@ -197,7 +197,7 @@ def cmd_install(args) -> int:
 
     # A pre-existing symlink or hand-installed plugin dir is not ours to
     # clobber silently. --force replaces a symlink outright and moves a real
-    # directory aside with a timestamped .bak suffix.
+    # directory aside with a hidden timestamped .<name>.bak-<ts> sibling.
     if shim_dir.is_symlink():
         if not args.force:
             print(
@@ -218,8 +218,11 @@ def cmd_install(args) -> int:
             )
             return 1
         from datetime import datetime
+        # Leading "." keeps the backup out of hermes-agent provider discovery
+        # (it skips plugin dirs named with a leading "_" or "."); otherwise the
+        # old install would be found as a second provider.
         bak = shim_dir.with_name(
-            shim_dir.name + ".bak-" + datetime.now().strftime("%Y%m%d-%H%M%S")
+            "." + shim_dir.name + ".bak-" + datetime.now().strftime("%Y%m%d-%H%M%S")
         )
         shim_dir.rename(bak)
         print(f"moved existing install aside to {bak}")

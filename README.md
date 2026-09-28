@@ -115,7 +115,7 @@ client = AsyncOpenAI(
 
 The gateway plumbs `X-Hermes-Session-Key` through as `gateway_session_key=…` in `MemoryProvider.initialize` kwargs, taking priority over the profile default so unprofiled API traffic doesn't collapse every minion into one shared `default` scope.
 
-Identity resolution order in `initialize`: `gateway_session_key` > `agent_identity` (unless it is `default`) > `agent_workspace` > `default`. Upstream hermes-agent always passes `agent_workspace="hermes"` (and `agent_identity=<profile name>`), so a default-profile CLI or cron session with no gateway session key lands in the theme `hermes`, not `default`; named profiles land in their profile name. Set the `X-Hermes-Session-Key` header (or a non-default profile) if you want a scope other than `hermes`.
+Identity resolution order in `initialize`: `gateway_session_key` > `agent_identity` (unless it is `default`) > `agent_workspace` > `default`. Upstream hermes-agent always passes `agent_workspace="hermes"` (and `agent_identity=<profile name>`), so a default-profile CLI or cron session with no gateway session key lands in the theme `hermes`, not `default`; named profiles land in their profile name. Set the `X-Hermes-Session-Key` header (or a non-default profile) if you want a scope other than `hermes`. When `allowed_themes` is set, `hermes` and your profile names are not exempt: include them in the list if you want those sessions to keep their own theme, otherwise they fall back to `default`.
 
 Convention: lowercase, dash-separated, stable (identities are case-folded automatically — `Marketing` and `marketing` are the same theme). Governed sinks that always exist regardless of your themes: `whatsapp-dm` (collapsed DM/session keys), `external-group` (collapsed group/channel/thread keys), `_bench` (benchmark traffic), `default` (only when the host passes no identity kwargs at all). Set `plugins.pgvector.allowed_themes` to your product/worker list to enforce an allow-list — an unknown or typo'd header then falls back to `default` (one-time warning) instead of silently minting a new theme.
 
@@ -168,6 +168,18 @@ pytest -q                                    # no DB/embed endpoint: everything 
 # Live mode (against a throwaway Postgres + your embed endpoint)
 export PG_TEST_DSN='dbname=hermes_test user=postgres host=/var/run/postgresql'
 export PG_TEST_EMBED_URL='http://your-embed-endpoint:11434'
+# Superuser DSN for the same database: the migration, CLI and empty-content
+# tests skip without it, and CI fails on any skip.
+export PG_TEST_ADMIN_DSN='dbname=hermes_test user=postgres host=/var/run/postgresql'
+pytest -q
+```
+
+The simplest path is the bundled harness (Postgres + pgvector in Docker and a
+fake embed server), which prints all the variables for you:
+
+```bash
+scripts/test-env.sh up pg17
+eval "$(scripts/test-env.sh db hermes_test)"
 pytest -q
 ```
 

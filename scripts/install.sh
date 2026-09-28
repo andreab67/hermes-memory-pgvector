@@ -44,7 +44,9 @@ echo "==> Installing plugin module..."
 mkdir -p "$HERMES_HOME/plugins"
 
 if [[ -d "$PLUGIN_DIR" ]]; then
-    BACKUP="${PLUGIN_DIR}.bak.$(date +%Y%m%d-%H%M%S)"
+    # Leading "." keeps the backup out of hermes-agent provider discovery,
+    # which skips plugin dirs whose name starts with "_" or ".".
+    BACKUP="$HERMES_HOME/plugins/.pgvector.bak.$(date +%Y%m%d-%H%M%S)"
     echo "    existing install detected, backing up to $BACKUP"
     mv "$PLUGIN_DIR" "$BACKUP"
 fi
@@ -69,7 +71,7 @@ Next steps (admin once):
      Add --runtime-role NAME if your runtime role is not 'hermes' (default
      migrations 002/004/005 grant DML to 'hermes'; a role that does not
      exist yet gets a NOTICE, never a failed migration — grant manually in
-     that case). Or apply migrations/00*.sql in lexical order with psql -f;
+     that case). Or apply hermes_pgvector/migrations/00*.sql in lexical order with psql -f;
      migration 004 grants the runtime role DML on the 001 tables — no
      manual OWNER transfer needed anymore.
 
