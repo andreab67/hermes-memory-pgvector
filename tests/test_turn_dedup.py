@@ -158,8 +158,9 @@ def test_accepted_turn_is_fingerprinted():
 # ---------------------------------------------------------------------------
 # Consumer side: on_session_end() must actually SKIP a turn already
 # fingerprinted by sync_turn(), not just let sync_turn() populate a set
-# nobody reads. Requires _delegation_enabled=True -- on_session_end() is a
-# no-op until migration 002 is applied (see pgvector/__init__.py).
+# nobody reads. The turn backstop no longer needs migration 002 (v0.6.0 L9);
+# _delegation_enabled=True only lets these tests also observe the
+# register_agent enqueue (see pgvector/__init__.py).
 # ---------------------------------------------------------------------------
 
 class _CountingWriter:
@@ -178,7 +179,7 @@ class _CountingWriter:
 def _provider_for_session_end(writer) -> PgvectorMemoryProvider:
     p = PgvectorMemoryProvider()
     p._healthy = True
-    p._delegation_enabled = True  # on_session_end() no-ops otherwise
+    p._delegation_enabled = True  # only gates the register_agent enqueue (L9)
     p._writer = writer
     p._agent_identity = "default"
     p._raw_identity = "default"
@@ -237,7 +238,7 @@ _MSGS = [{"role": "user", "content": _LONG_U}, {"role": "assistant", "content": 
 def _end_provider(writer):
     p = PgvectorMemoryProvider()
     p._healthy = True
-    p._delegation_enabled = True          # on_session_end no-ops without 002
+    p._delegation_enabled = True          # only gates register_agent (L9)
     p._writer = writer
     p._agent_identity = "default"
     p._raw_identity = "default"

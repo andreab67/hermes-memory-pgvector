@@ -306,6 +306,13 @@ DEFAULTS = {
 }
 
 
+# Bounds for prefetch_budget. The maximum sits below the host's 8s hard cap on
+# an external provider's prefetch (upstream _EXTERNAL_PREFETCH_TIMEOUT_S); the
+# config schema and prefetch()'s clamp both read these so they cannot drift.
+_PREFETCH_BUDGET_MIN = 0.1
+_PREFETCH_BUDGET_MAX = 7.5
+
+
 def _as_bool(value: Any, default: bool) -> bool:
     """Coerce a config value to a real bool.
 
@@ -313,13 +320,22 @@ def _as_bool(value: Any, default: bool) -> bool:
     hand-edited config.yaml (YAML bools), and save_config(), which persists
     the config schema's declared values -- the STRINGS "true"/"false". A plain
     truthiness test silently inverts the string form (bool("false") is True),
-    so every boolean toggle reads through here.
+    so every boolean toggle reads through here. Only the explicit true/false
+    vocabularies are honoured; None, blank and unrecognized strings return
+    `default`.
     """
     if value is None:
         return default
     if isinstance(value, bool):
         return value
-    return str(value).strip().lower() in ("1", "true", "yes", "on")
+    text = str(value).strip().lower()
+    if text in ("1", "true", "yes", "on"):
+        return True
+    if text in ("0", "false", "no", "off"):
+        return False
+    # Blank / unrecognized: fall back to the default, like _as_int/_as_float,
+    # so a blank value for a default-true toggle does not silently disable it.
+    return default
 
 
 def _as_int(value: Any, default: int) -> int:
@@ -462,6 +478,38 @@ def _embed_with_config(
         api_key_env=str(key_env).strip() if key_env else None,
         protocol=config.get("embed_protocol", DEFAULTS["embed_protocol"]),
     )
+
+
+_TEXT_PART_TYPES = frozenset({"text", "input_text", "output_text"})
+_IMAGE_PART_TYPES = frozenset({"image_url", "input_image"})
+
+
+def _flatten_user_content(content: Any) -> str:
+    """Flatten user message content exactly as the host does before sync_turn().
+
+    Mirrors upstream agent.codex_responses_adapter._summarize_user_message_for_log
+    (called with a newline separator): text parts joined with newlines, images collapsed
+    to a "[N image(s)]" prefix, "" for None, str() for other scalars. The
+    on_session_end backstop fingerprints this form, so a multimodal turn hashes
+    the same as what sync_turn() already recorded.
+    """
+    if not isinstance(content, list):
+        return "" if content is None else str(content)
+    texts: List[str] = []
+    images = 0
+    for part in content:
+        if isinstance(part, str):
+            if part:
+                texts.append(part)
+        elif isinstance(part, dict):
+            ptype = str(part.get("type") or "").strip().lower()
+            text = part.get("text")
+            if ptype in _TEXT_PART_TYPES and isinstance(text, str) and text:
+                texts.append(text)
+            elif ptype in _IMAGE_PART_TYPES:
+                images += 1
+    note = f"[{images} image{'s' if images != 1 else ''}]" if images else ""
+    return " ".join(bit for bit in (note, "\n".join(texts).strip()) if bit)
 
 
 def _load_plugin_config() -> dict:
@@ -874,7 +922,13 @@ class PgvectorMemoryProvider(MemoryProvider):
         # embed() as its timeout, which is now ONE shared deadline across
         # embed_protocol='auto''s two HTTP attempts, not a fresh timeout for
         # each (see embed.py).
-        budget = _as_float(self._config.get("prefetch_budget"), DEFAULTS["prefetch_budget"])
+        budget = min(
+            max(
+                _as_float(self._config.get("prefetch_budget"), DEFAULTS["prefetch_budget"]),
+                _PREFETCH_BUDGET_MIN,
+            ),
+            _PREFETCH_BUDGET_MAX,
+        )
         deadline = time.monotonic() + budget
         return self._compute_prefetch_block(query, timeout=budget, deadline=deadline)
 
@@ -1178,6 +1232,19 @@ class PgvectorMemoryProvider(MemoryProvider):
             return
         try:
             child_identity = kwargs.get("child_identity") or kwargs.get("agent_identity")
+            if isinstance(child_identity, str) and child_identity:
+                # Same governance initialize() applies to this agent's own
+                # identity; a raw value would bypass the allow-list/aliases/
+                # bench isolation. Upstream does not pass this today
+                # (tools/delegate_tool_results.py), so None stays None.
+                child_identity, _, _ = normalize_identity(
+                    child_identity,
+                    allowed_themes=_as_theme_list(self._config.get("allowed_themes")),
+                    aliases=_as_alias_map(self._config.get("identity_aliases")),
+                    bench_mode=self._config.get("bench_mode", "bucket"),
+                )
+            else:
+                child_identity = None
             child_session_id = kwargs.get("child_session_id") or kwargs.get("session_id")
             self._writer.enqueue(
                 action="edge",
@@ -1267,7 +1334,8 @@ class PgvectorMemoryProvider(MemoryProvider):
                         continue
                     raw = msg.get("content") or ""
                     content = (
-                        raw if isinstance(raw, str)
+                        _flatten_user_content(raw) if role == "user"
+                        else raw if isinstance(raw, str)
                         else " ".join(
                             p.get("text", "") for p in raw
                             if isinstance(p, dict) and p.get("type") == "text"
@@ -1866,18 +1934,39 @@ class PgvectorMemoryProvider(MemoryProvider):
         """Governance config that must bust a cached gateway agent when it
         changes. Upstream calls this on an UNINITIALIZED instance on every
         inbound message (agent.memory_provider.MemoryProvider.identity_signature),
-        so it reads self._config only -- no I/O, no self._store, cheap and
-        read-only. allowed_themes/identity_aliases/bench_mode decide which
+        and the gateway memoises ONE provider per process, so self._config
+        (frozen at register()) would never reflect an edit. Instead the values
+        come from config.yaml, memoised on (path, st_mtime_ns, st_size) -- one
+        stat per call, a re-parse only when the file changed (same pattern as
+        upstream's Honcho provider). self._config is never mutated and is the
+        fallback on any stat/parse failure. No self._store, never raises.
+        allowed_themes/identity_aliases/bench_mode decide which
         theme a raw identity normalizes to (identity.normalize_identity);
         write_contexts decides whether a context writes at all -- a cached
         agent built under the OLD values would keep routing/writing wrong
         until the process restarts, without this.
         """
+        try:
+            from hermes_constants import get_hermes_home
+            path = get_hermes_home() / "config.yaml"
+            stat = path.stat()
+            key = (str(path), stat.st_mtime_ns, stat.st_size)
+            memo = getattr(self, "_sig_memo", None)
+            if memo is not None and memo[0] == key:
+                return dict(memo[1])
+            values = self._signature_values({**DEFAULTS, **_load_plugin_config()})
+            self._sig_memo = (key, values)
+            return dict(values)
+        except Exception:  # noqa: BLE001 -- never raise; fall back to the frozen config
+            return self._signature_values(self._config)
+
+    @staticmethod
+    def _signature_values(config: Dict[str, Any]) -> Dict[str, Any]:
         return {
-            "pgvector.allowed_themes": _as_theme_list(self._config.get("allowed_themes")),
-            "pgvector.identity_aliases": _as_alias_map(self._config.get("identity_aliases")),
-            "pgvector.bench_mode": self._config.get("bench_mode", DEFAULTS["bench_mode"]),
-            "pgvector.write_contexts": _as_write_contexts(self._config.get("write_contexts")),
+            "pgvector.allowed_themes": _as_theme_list(config.get("allowed_themes")),
+            "pgvector.identity_aliases": _as_alias_map(config.get("identity_aliases")),
+            "pgvector.bench_mode": config.get("bench_mode", DEFAULTS["bench_mode"]),
+            "pgvector.write_contexts": _as_write_contexts(config.get("write_contexts")),
         }
 
     def get_config_schema(self) -> List[Dict[str, Any]]:
@@ -2062,8 +2151,8 @@ class PgvectorMemoryProvider(MemoryProvider):
                 "description": "Hard wall-clock budget (seconds) for prefetch()'s synchronous fallback path (embed + search), used when queue_prefetch() has not already cached a block for the session. Must stay below the host's external-provider prefetch timeout (8s), or the host logs a timeout warning and skips this provider on later turns until the stuck call returns.",
                 "type": "number",
                 "default": DEFAULTS["prefetch_budget"],
-                "minimum": 0.1,
-                "maximum": 7.5,
+                "minimum": _PREFETCH_BUDGET_MIN,
+                "maximum": _PREFETCH_BUDGET_MAX,
             },
         ]
 
