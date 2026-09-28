@@ -53,9 +53,12 @@ echo
 # 1. Clone (or reuse + fetch/checkout) hermes-agent --------------------------
 if [ -d "$HERMES_AGENT_DIR/.git" ]; then
     echo "==> Reusing existing clone; fetching $REF..."
-    git -C "$HERMES_AGENT_DIR" fetch --quiet origin "$REF" || true
-    if ! git -C "$HERMES_AGENT_DIR" checkout --quiet "$REF" 2>/dev/null; then
-        git -C "$HERMES_AGENT_DIR" checkout --quiet FETCH_HEAD
+    # Check out what was just fetched (detached), not a possibly stale local
+    # branch of the same name; only fall back to $REF if the fetch failed.
+    if git -C "$HERMES_AGENT_DIR" fetch --quiet origin "$REF"; then
+        git -C "$HERMES_AGENT_DIR" checkout --quiet --detach FETCH_HEAD
+    else
+        git -C "$HERMES_AGENT_DIR" checkout --quiet "$REF"
     fi
 else
     echo "==> Cloning hermes-agent from $HERMES_AGENT_REPO_URL..."

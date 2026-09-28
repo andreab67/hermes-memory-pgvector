@@ -84,7 +84,7 @@ mkdir -p ~/.hermes/plugins
 cp -r hermes_pgvector ~/.hermes/plugins/pgvector
 ```
 
-Then apply migrations and activate as in Option 1 above (`hermes-pgvector migrate --admin-dsn ...`, or `psql -f` each `migrations/*.sql` in order — see [docs/operations.md](docs/operations.md) for the full admin walkthrough and [docs/upgrading.md](docs/upgrading.md) if you're coming from an older version).
+Then apply migrations and activate as in Option 1 above (`hermes-pgvector migrate --admin-dsn ...`, or `psql -f` each `hermes_pgvector/migrations/*.sql` in order — see [docs/operations.md](docs/operations.md) for the full admin walkthrough and [docs/upgrading.md](docs/upgrading.md) if you're coming from an older version).
 
 ## Configuration
 

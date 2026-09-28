@@ -35,7 +35,9 @@ Postgres). Higher values improve recall accuracy at query time at the cost
 of latency — worth raising if `recall_memory`/`recall_conversation` seem to
 miss obviously-relevant rows on a large table. This plugin does not set it
 itself; it is a session-level Postgres GUC an operator can set via the DSN
-(`options=-c hnsw.ef_search=100`) or a connection-pool-level default.
+(keyword/value DSN: `options='-c hnsw.ef_search=100'` -- the quotes are
+required, or the space splits the option; URI DSN:
+`?options=-c%20hnsw.ef_search%3D100`) or a connection-pool-level default.
 
 ### Filtered search and `hnsw.iterative_scan`
 

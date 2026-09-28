@@ -22,7 +22,7 @@ Read this whole section before upgrading — the ordering in step 2 matters.
 
    ```bash
    # On EVERY host running this plugin:
-   pip install -U hermes-memory-pgvector==0.6.0
+   pip install -U hermes-memory-pgvector   # 0.6.0 or newer
    sudo systemctl restart hermes.service   # or however you run hermes
 
    # THEN, once every writer is upgraded, on the admin/DB host:
