@@ -13,12 +13,9 @@ returns" and returns "" -- the thread itself keeps running, detached.
 This is only avoidable if the provider enforces its OWN, shorter, overall
 deadline on the embed call it makes inside prefetch() -- PLAN-1.0.md Sec 3
 calls this `prefetch_budget`, default 5.0s (comfortably under upstream's
-8.0s). WP-D2 is adding that to hermes_pgvector/__init__.py in PARALLEL with
-this work package and may not have landed in this checkout yet: today,
-prefetch() only has `embed_timeout` (default 10.0s, i.e. ABOVE upstream's
-8.0s budget), so this test is EXPECTED TO FAIL until WP-D2 lands. Written
-correctly regardless, per the WP-F brief: run it and report the failure
-mode, don't weaken it to pass.
+8.0s). hermes_pgvector/__init__.py enforces that budget (it is shorter than
+`embed_timeout`, default 10.0s, which is ABOVE upstream's 8.0s), so a failure
+here is a real regression: prefetch() outlived upstream's timeout.
 """
 
 from __future__ import annotations
@@ -76,8 +73,8 @@ def test_prefetch_all_does_not_trip_the_external_prefetch_timeout(
             "MemoryManager logged an external-prefetch timeout warning: "
             f"{timeout_warnings!r} -- the provider's prefetch() did not return "
             "within upstream's external_prefetch_timeout budget "
-            f"({manager._external_prefetch_timeout}s). This is EXPECTED until "
-            "prefetch_budget (WP-D2) lands and is set below that timeout."
+            f"({manager._external_prefetch_timeout}s); prefetch_budget must stay "
+            "below that timeout."
         )
         assert result == "", f"expected no recall context from a timed-out embed, got: {result!r}"
         assert elapsed < manager._external_prefetch_timeout, (

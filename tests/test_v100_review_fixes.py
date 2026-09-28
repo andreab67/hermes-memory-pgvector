@@ -164,10 +164,13 @@ def test_replace_blank_old_text_matches_nothing(store, blank):
     s, agent = store
     s.add(agent_identity=agent, target="memory", content="first entry")
     s.add(agent_identity=agent, target="memory", content="second entry")
+    # Contains a double space and a newline+tab, so each whitespace-only
+    # `blank` WOULD match via LIKE if replace() lacked the blank guard.
+    s.add(agent_identity=agent, target="memory", content="a  b\n\tc")
     n = s.replace(agent_identity=agent, target="memory", old_text=blank, new_content="OVERWRITTEN")
     assert n == 0
     contents = {r["content"] for r in s.list_entries(agent_identity=agent, target="memory", limit=10)}
-    assert contents == {"first entry", "second entry"}
+    assert contents == {"first entry", "second entry", "a  b\n\tc"}
 
 
 # --- OPS-2: explicit --config must be readable --------------------------------
