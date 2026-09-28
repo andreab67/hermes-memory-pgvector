@@ -26,7 +26,7 @@ Idempotent — every migration uses `IF NOT EXISTS` / `IF EXISTS`, so
 re-running on an already-migrated database is a no-op except for whatever is
 genuinely new.
 
-**Runtime role.** Migrations `002`, `004`, and `005` grant the runtime role
+**Runtime role.** Migrations `002` and `004` grant the runtime role
 DML on the tables they create or touch. The role defaults to `hermes`; if
 yours is different, pass it explicitly so the grants land on the right role
 instead of silently no-op'ing with a `NOTICE`:
@@ -73,6 +73,7 @@ touching a row) if the endpoint's vectors don't match `embed_dim`.
 | Code | Meaning |
 |---|---|
 | `0` | Done — `remaining: 0` on every table, no table aborted. |
+| `1` | Error before or outside the per-row loop — e.g. the embed endpoint returns vectors of the wrong dimension (`embed_dim` mismatch), an unreadable `--config`, or a database error (`error: ...` on stderr). Alert on it like `2`. |
 | `2` | Embed endpoint unavailable, or a table's pass aborted after `max_consecutive_failures` (default 20) consecutive row failures. |
 | `3` | Rows still remain NULL or failed this run, but no abort — usually just means "more than one run's worth of backlog"; re-run. |
 

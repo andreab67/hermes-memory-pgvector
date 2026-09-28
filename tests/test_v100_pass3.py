@@ -76,3 +76,24 @@ def test_maybe_embed_treats_any_exception_as_no_embedding(monkeypatch):
     monkeypatch.setattr(pkg, "_embed_with_config", boom)
     p = PgvectorMemoryProvider(config={})
     assert p._maybe_embed("some content") is None
+
+
+def test_unexpected_embed_error_is_logged_even_after_a_transient_embed_error(caplog, monkeypatch):
+    # P4PROV-2: a transient EmbeddingError used to consume the one-shot
+    # warning, so a later real embed-side bug degraded silently.
+    import hermes_pgvector as hp
+    from hermes_pgvector.embed import EmbeddingError
+
+    p = hp.PgvectorMemoryProvider(config={})
+    errors = iter([EmbeddingError("endpoint down"), TypeError("bad config value")])
+
+    def boom(*a, **k):
+        raise next(errors)
+
+    monkeypatch.setattr(hp, "_embed_with_config", boom)
+    with caplog.at_level("WARNING", logger=hp.logger.name):
+        assert p._maybe_embed("first") is None
+        assert p._maybe_embed("second") is None
+    msgs = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert any("endpoint down" in m for m in msgs)
+    assert any("unexpectedly" in m for m in msgs), msgs

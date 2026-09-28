@@ -565,6 +565,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         self._healthy: bool = False
         self._delegation_enabled: bool = False        # set in initialize() iff migration 002 applied
         self._embed_warned: bool = False
+        self._embed_bug_warned: set = set()
         self._db_warned: bool = False
         # v0.6.0 (M4) -- agent_context gate. True until the first initialize()
         # decides otherwise, so a provider used without initialize() (unit
@@ -2244,9 +2245,14 @@ class PgvectorMemoryProvider(MemoryProvider):
                 self._embed_warned = True
             return None
         except Exception as exc:  # noqa: BLE001 -- an embed-side bug must never drop a durable row
-            if not self._embed_warned:
-                logger.warning("pgvector embed failed (degrading to text-only): %r", exc)
-                self._embed_warned = True
+            # Not an endpoint failure but a bug: never hide it behind the
+            # one-shot EmbeddingError warning (a transient outage earlier
+            # would otherwise silence it); warn once per exception type.
+            kind = type(exc).__name__
+            warned = self.__dict__.setdefault("_embed_bug_warned", set())
+            if kind not in warned:
+                warned.add(kind)
+                logger.warning("pgvector embed raised unexpectedly (degrading to text-only)", exc_info=exc)
             return None
 
 

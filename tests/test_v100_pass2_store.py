@@ -122,7 +122,7 @@ def _serve(vec_json: str):
     return srv
 
 
-@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity", "null", '"x"', "true", "1" + "0" * 400])
+@pytest.mark.parametrize("bad", ["NaN", "Infinity", "-Infinity", "null", '"x"', "true", "1" + "0" * 400, "1e39"])
 def test_embed_rejects_non_finite_or_non_numeric_elements(bad):
     vals = ["0.5"] * 767 + [bad]
     srv = _serve("[" + ",".join(vals) + "]")

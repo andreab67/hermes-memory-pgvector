@@ -310,6 +310,12 @@ FORUM_WEBHOOK_KEYS = [
     "agent:main:msgraph_webhook:webhook:x",
     "telegram:forum:-100123:42:9",
     "webhook:webhook:r1",
+    # LINE multi-person rooms (P4PROV-1)
+    "agent:main:line:room:R123:U9f8e7d",
+    "line:room:R1:U1",
+    # plugin platforms, unprefixed
+    "irc:channel:#ops:nick1",
+    "teams:group:19abc:user42",
 ]
 
 
@@ -325,5 +331,7 @@ def test_forum_and_webhook_do_not_sweep_ordinary_themes():
         "desk:signal:main",
         "eng:forum:design",
         "ops:webhook:deploys",
+        "eng:room:x",
+        "war:room:incident-42",
     ):
         assert normalize_identity(benign) == (benign, False, "unchanged"), benign

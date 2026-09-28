@@ -37,12 +37,12 @@ changes and no new migrations relative to 0.6.0.
 - **`prefetch_budget`, `prefetch_limit` and `min_similarity` are clamped** to
   the ranges the config schema already advertised (0.1-7.5 s, 1-50,
   0.0-1.0).
-- **Telegram forum and webhook sessions are bucketed**: session keys with
-  chat type `forum` (Telegram supergroups with topics) or `webhook` now
-  normalise to the `external-group` theme like other multi-party traffic.
+- **Telegram forum, LINE room and webhook sessions are bucketed**: session
+  keys with chat type `forum` (Telegram supergroups with topics), `room`
+  (LINE multi-person rooms) or `webhook` now normalise to the `external-group` theme like other multi-party traffic.
   Rows already written under those raw keys are not rewritten; find them
   with `SELECT DISTINCT agent_identity FROM conversations WHERE
-  agent_identity ~ ':(forum|webhook):'` and fold them with `remap` if wanted.
+  agent_identity ~ ':(forum|room|webhook):'` and fold them with `remap` if wanted.
 - **Install backups are hidden**: `install.sh` and `hermes-pgvector install
   --force` now move a previous install to `plugins/.pgvector.bak-<ts>`, so
   hermes-agent no longer discovers the backup as a second memory provider.
@@ -63,8 +63,8 @@ changes and no new migrations relative to 0.6.0.
   multi-KB `/skill` scaffolding for bare or trivial skill invocations.
 - `replace()` with a blank `old_text` overwrote an arbitrary row; editing an
   entry into content that already exists left the stale row recallable.
-- Telegram `forum` and `webhook` session keys were not recognised as
-  multi-party, so the raw key -- including a participant id -- became a
+- Telegram `forum`, LINE `room` and `webhook` session keys were not
+  recognised as multi-party, so the raw key -- including a participant id -- became a
   theme of its own, readable from any theme via `scope='all'`.
 - The embed client accepted vectors containing NaN/Infinity/null (or an
   integer too large for a float), which the database then rejected, losing

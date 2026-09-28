@@ -472,7 +472,7 @@ def build_parser() -> argparse.ArgumentParser:
     m.add_argument("--admin-dsn", required=True, help="superuser/owner DSN (CREATE/GRANT)")
     m.add_argument(
         "--runtime-role", default=None,
-        help="runtime role to GRANT DML to in 002/004/005 (default: 'hermes'; "
+        help="runtime role to GRANT DML to in 002/004 (default: 'hermes'; "
              "psql users get the same effect with "
              "PGOPTIONS='-c hermes_pgvector.runtime_role=NAME')",
     )

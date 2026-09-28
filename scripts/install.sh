@@ -69,7 +69,7 @@ Next steps (admin once):
        python -m hermes_pgvector migrate --admin-dsn \\
            "dbname=<your-memory-db> user=postgres host=/var/run/postgresql"
      Add --runtime-role NAME if your runtime role is not 'hermes' (default
-     migrations 002/004/005 grant DML to 'hermes'; a role that does not
+     migrations 002/004 grant DML to 'hermes'; a role that does not
      exist yet gets a NOTICE, never a failed migration — grant manually in
      that case). Or apply hermes_pgvector/migrations/00*.sql in lexical order with psql -f;
      migration 004 grants the runtime role DML on the 001 tables — no

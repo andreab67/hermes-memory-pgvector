@@ -57,6 +57,8 @@ _PLATFORMS = (
     "local|telegram|discord|whatsapp_cloud|whatsapp|slack|signal|mattermost"
     "|matrix|homeassistant|email|sms|dingtalk|webhook|feishu|wecom_callback"
     "|wecom|weixin|qqbot|bluebubbles|msgraph_webhook|yuanbao|relay|api_server"
+    # plugin platforms (hermes-agent plugins/platforms/*)
+    "|a2a|buzz|google_chat|irc|line|ntfy|photon|raft|simplex|teams"
 )
 
 # Multi-party session keys (group / channel / thread). Host layout is
@@ -83,14 +85,15 @@ _PLATFORMS = (
 #      records for a bare ':signal:' alternative.
 # The chat types the host (hermes-agent gateway/session.py build_session_key)
 # emits for non-DM traffic: group, channel, thread, plus 'forum' (Telegram
-# supergroups with topics: plugins/platforms/telegram/adapter.py) and
-# 'webhook' (gateway/platforms/webhook.py, msgraph_webhook.py). Every one of
+# supergroups with topics: plugins/platforms/telegram/adapter.py),
+# 'webhook' (gateway/platforms/webhook.py, msgraph_webhook.py) and 'room'
+# (LINE multi-person rooms: plugins/platforms/line/adapter.py). Every one of
 # them carries a participant / delivery id in the key. A type missing here
 # passes through unchanged and becomes a per-user theme readable via
 # scope='all'.
 _GROUP_RE = re.compile(
-    r"^agent:[^:]+:[^:]+:(?:group|channel|thread|forum|webhook)(?::|$)"
-    r"|(?:^|:)(?:" + _PLATFORMS + r"):(?:group|channel|thread|forum|webhook)(?::|$)",
+    r"^agent:[^:]+:[^:]+:(?:group|channel|thread|forum|webhook|room)(?::|$)"
+    r"|(?:^|:)(?:" + _PLATFORMS + r"):(?:group|channel|thread|forum|webhook|room)(?::|$)",
     re.IGNORECASE,
 )
 

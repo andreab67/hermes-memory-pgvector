@@ -259,6 +259,10 @@ def _embed_once(
     )
 
 
+# pgvector stores float4; a finite value beyond this is rejected by the DB.
+_FLOAT4_MAX = 3.4028234663852886e38
+
+
 def _post(
     url: str,
     body: dict,
@@ -325,6 +329,7 @@ def _post(
     try:
         ok = all(
             isinstance(x, (int, float)) and not isinstance(x, bool) and math.isfinite(x)
+            and abs(x) <= _FLOAT4_MAX
             for x in vec
         )
     except OverflowError:  # an int too large for a float (json accepts any size)

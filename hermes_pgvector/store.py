@@ -223,7 +223,7 @@ class MemoryStore:
 
         runtime_role (H1): when given, set on THIS connection with
         `SELECT set_config('hermes_pgvector.runtime_role', runtime_role, false)`
-        before executing the migration file, so 002/004/005's `DO $$ ... $$`
+        before executing the migration file, so 002/004's `DO $$ ... $$`
         GRANT blocks resolve the role to grant via `current_setting(...)`
         instead of falling back to 'hermes'. Applied per-connection because
         each call to this method opens its own connection (and GUCs set with
