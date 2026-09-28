@@ -45,6 +45,17 @@ def _escape_like(text: str) -> str:
     return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
+# SQL twin of "not _is_blank(content)". Bracket form because \S alone misses the
+# characters Python strips but Postgres (UTF8/en_US.utf8) calls non-space:
+# U+00A0, U+0085, U+001C-U+001F, U+2007, U+202F. Checked over every code point.
+# Escapes (E-string) keep this source ASCII. The non-ASCII members can only be
+# spelled in a UTF8 database (LATIN1 rejects U+2007, SQL_ASCII rejects >U+007F),
+# so other encodings get the ASCII-only class; the Python strip() guard in
+# backfill_null_embeddings covers the rest.
+_HAS_TEXT_SQL_UTF8 = r"content ~ E'[^[:space:]\u00a0\u0085\u001c-\u001f\u2007\u202f]'"
+_HAS_TEXT_SQL_ASCII = r"content ~ E'[^[:space:]\x1c-\x1f]'"
+
+
 def _is_blank(text: Optional[str]) -> bool:
     """True for None, "", or whitespace-only — matches Python's str.strip()."""
     return not (text or "").strip()
@@ -100,6 +111,28 @@ class MemoryStore:
         self._timeout = timeout
         self._max_idle = max_idle
         self._max_lifetime = max_lifetime
+        self._has_text_sql_cached: Optional[str] = None
+
+    def _has_text_sql(self) -> str:
+        """SQL predicate for "content has text str.strip() would keep",
+        chosen by the database's server_encoding and cached per store.
+        Fail-soft to the ASCII-only predicate (not cached, so it retries)."""
+        cached = self._has_text_sql_cached
+        if cached is not None:
+            return cached
+        try:
+            with self._get_pool().connection() as conn:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT current_setting('server_encoding')")
+                    enc = cur.fetchone()[0]
+            if isinstance(enc, (bytes, bytearray)):
+                enc = bytes(enc).decode("ascii", "replace")
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("server_encoding probe failed, using ASCII predicate: %s", exc)
+            return _HAS_TEXT_SQL_ASCII
+        pred = _HAS_TEXT_SQL_UTF8 if str(enc).upper() == "UTF8" else _HAS_TEXT_SQL_ASCII
+        self._has_text_sql_cached = pred
+        return pred
 
     # -- Pool lifecycle ------------------------------------------------------
 
@@ -1152,19 +1185,23 @@ class MemoryStore:
                     "the vector column)"
                 )
 
+        has_text = self._has_text_sql()
         for t in tables:
             with self._get_pool().connection() as conn:
                 with conn.cursor() as cur:
                     cur.execute(
-                        # content ~ '\S' means "has at least one non-whitespace
-                        # character", which matches Python's str.strip()
-                        # exactly. Postgres trim() defaults to SPACES ONLY, so a
-                        # row holding just a newline or a tab would still be
-                        # selected here, still raise EmbeddingError("empty
-                        # input"), and still fail on every run -- the very bug
-                        # this filter exists to stop.
-                        rf"SELECT count(*) FILTER (WHERE content ~ '\S'), "
-                        rf"       count(*) FILTER (WHERE content !~ '\S' OR content IS NULL) "
+                        # has_text means "has at least one character that
+                        # Python's str.strip() would keep". Plain '\S' is NOT
+                        # equivalent: on UTF8/en_US.utf8 Postgres treats
+                        # U+00A0, U+0085, U+001C..U+001F, U+2007 and U+202F as
+                        # non-space although str.strip() removes them, so
+                        # those rows passed the filter, raised
+                        # EmbeddingError("empty input") and failed on every
+                        # run. Postgres trim() defaults to SPACES ONLY, so a
+                        # row holding just a newline or a tab would fail the
+                        # same way -- the very bug this filter exists to stop.
+                        f"SELECT count(*) FILTER (WHERE {has_text}), "
+                        f"       count(*) FILTER (WHERE NOT COALESCE({has_text}, false)) "
                         f"FROM {t} WHERE embedding IS NULL"
                     )
                     row = cur.fetchone()
@@ -1193,7 +1230,7 @@ class MemoryStore:
                         cur.execute(
                             f"SELECT id, content FROM {t} "
                             f"WHERE embedding IS NULL "
-                            rf"  AND content ~ '\S' "
+                            f"  AND {has_text} "
                             f"  AND id > %s "
                             f"ORDER BY id LIMIT %s",
                             (last_id, batch_size),
@@ -1203,6 +1240,17 @@ class MemoryStore:
                     break
                 for r in rows:
                     last_id = r["id"]
+                    text = r["content"]
+                    if isinstance(text, (bytes, bytearray)):
+                        # SQL_ASCII databases hand text back as bytes; decode so
+                        # embed() and the `content = %s` compare get str.
+                        text = bytes(text).decode("utf-8", "replace")
+                    if not (text or "").strip():
+                        # Defensive: the SQL prefilter can disagree with
+                        # str.strip() under another encoding/collation; never
+                        # hand a blank to embed() (it would count as failed
+                        # forever).
+                        continue
                     processed += 1
                     # The whole embed → literal → UPDATE pipeline is fail-soft
                     # per row (v0.4.2): a vector that embeds "successfully" but
@@ -1210,14 +1258,14 @@ class MemoryStore:
                     # transient DB error) must mark THIS row failed and move
                     # on, not abort the run for every remaining table.
                     try:
-                        vec = embed_fn(r["content"])
+                        vec = embed_fn(text)
                         vec_literal = to_pgvector_literal(vec)
                         with self._get_pool().connection() as conn:
                             with conn.cursor() as cur:
                                 cur.execute(
                                     f"UPDATE {t} SET embedding = %s::vector "
                                     f"WHERE id = %s AND embedding IS NULL AND content = %s",
-                                    (vec_literal, r["id"], r["content"]),
+                                    (vec_literal, r["id"], text),
                                 )
                                 row_changed = cur.rowcount > 0
                                 conn.commit()
@@ -1245,7 +1293,7 @@ class MemoryStore:
                 with conn.cursor() as cur:
                     cur.execute(
                         f"SELECT count(*) FROM {t} "
-                        rf"WHERE embedding IS NULL AND content ~ '\S'"
+                        f"WHERE embedding IS NULL AND {has_text}"
                     )
                     remaining = int(cur.fetchone()[0])
             entry: Dict[str, Any] = {
