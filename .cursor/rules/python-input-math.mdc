@@ -1,0 +1,68 @@
+---
+description: Python input and arithmetic rules (conversion guards, arithmetic bounds, bounded growth) with bad and good examples.
+globs: **/*.py
+alwaysApply: false
+---
+<!-- master: ai-code-review/rules/python-input-math.md; do not edit generated copies @ 74ee5c043d79 -->
+
+## Guard empty and non-numeric input where it is converted
+`float("")` and `int("12a")` raise ValueError, which ends the program when nothing expects it at the conversion point.
+```python
+# bad
+weight_kg = float(input("Weight (kg): "))
+```
+```python
+# good
+def parse_weight(raw):
+    text = raw.strip()
+    if text == "":
+        raise ValueError("Enter a weight.")
+    try:
+        return float(text)
+    except ValueError:
+        raise ValueError(f"Weight must be a number, got {text!r}.") from None
+```
+<!-- src: catalog D07, D09 -->
+
+## Bound arithmetic against zero, negative and very large inputs
+Division by zero, `0 ** -1` and `1.5 ** 5000` raise instead of returning, and a negative base with a fractional power turns complex.
+```python
+# bad
+def compound(balance, rate, years):
+    return balance * (1 + rate) ** years
+```
+```python
+# good
+import math
+MIN_RATE = -1  # at or below this the base (1 + rate) is zero or negative
+MAX_YEARS = 200
+def compound(balance, rate, years):
+    if rate <= MIN_RATE or not 0 <= years <= MAX_YEARS:
+        raise ValueError(f"need rate > {MIN_RATE} and 0 <= years <= {MAX_YEARS}")
+    try:
+        result = float(balance) * (1.0 + rate) ** years
+    except OverflowError:
+        result = math.inf
+    if not math.isfinite(result):  # a finite power times a big balance can still be inf
+        raise ValueError("compound balance overflows a float")
+    return result
+```
+<!-- src: catalog D11 -->
+
+## Bound anything that grows
+A container that is only ever appended to keeps every entry until the process exits; cap it at what is actually read back.
+```python
+# bad
+recent_errors = []
+def record_error(error):
+    recent_errors.append(error)
+```
+```python
+# good
+from collections import deque
+RECENT_ERROR_LIMIT = 20
+recent_errors = deque(maxlen=RECENT_ERROR_LIMIT)
+def record_error(error):
+    recent_errors.append(error)
+```
+<!-- src: course, catalog D23 -->

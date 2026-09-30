@@ -1,0 +1,78 @@
+---
+description: Python error-handling rules (exceptions, failure reporting, sentinels, conditions) with bad and good examples.
+globs: **/*.py
+alwaysApply: false
+---
+<!-- master: ai-code-review/rules/python-errors.md; do not edit generated copies @ fce7e2f58eed -->
+
+## Catch specific exceptions
+Ctrl-C and sys.exit() arrive as exceptions too; a bare `except:` eats them, and any broad catch buries real bugs such as a NameError.
+```python
+# bad
+try:
+    port = int(env["PORT"])
+except:
+    port = DEFAULT_PORT
+```
+```python
+# good
+try:
+    port = int(env["PORT"])
+except (KeyError, ValueError):
+    port = DEFAULT_PORT
+```
+<!-- src: course -->
+
+## Return or raise, never print, to report failure
+Console output is invisible to the calling code, which carries on as if the call had worked.
+```python
+# bad
+def withdraw(account, amount):
+    if amount > account.balance:
+        print("Insufficient funds")
+        return
+    account.balance -= amount
+```
+```python
+# good
+def withdraw(account, amount):
+    if amount > account.balance:
+        raise InsufficientFunds(account.id, amount)
+    account.balance -= amount
+```
+<!-- src: course, catalog D14 -->
+
+## Do not return error sentinels
+An error string, None or -1 travels on as data until something far away crashes or computes garbage.
+```python
+# bad
+def parse_quantity(text):
+    if not text.isdigit():
+        return "invalid quantity"
+    return int(text)
+subtotal = unit_price * parse_quantity(raw)  # 3 * "invalid quantity" is a string
+```
+```python
+# good
+def parse_quantity(text):
+    if not text.isdigit():
+        raise ValueError(f"invalid quantity: {text!r}")
+    return int(text)
+```
+<!-- src: catalog D10 -->
+
+## Test the condition you mean, not truthiness
+Zero, an empty string and an empty list are falsy, so a bare truthiness test treats real values as missing; spell out the condition.
+```python
+# bad
+def set_volume(level=None):
+    if level:
+        mixer.volume = level  # level 0 (mute) is ignored
+```
+```python
+# good
+def set_volume(level=None):
+    if level is not None:
+        mixer.volume = level
+```
+<!-- src: course -->

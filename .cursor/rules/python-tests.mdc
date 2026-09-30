@@ -1,0 +1,25 @@
+---
+description: Python test rules (tests exercise the real code) with bad and good examples.
+globs: **/test_*.py, **/*_test.py, **/tests/**/*.py, **/conftest.py
+alwaysApply: false
+---
+<!-- master: ai-code-review/rules/python-tests.md; do not edit generated copies @ 61b7f7a1e59c -->
+
+## Tests import and exercise the code under test
+A test of a local copy or a standard-library stand-in keeps passing when the real module is broken or deleted.
+```python
+# bad
+def apply_discount(price, percent):  # pasted copy of pricing.apply_discount
+    return price * (100 - percent) / 100
+
+def test_apply_discount():
+    assert apply_discount(200, 10) == 180
+```
+```python
+# good
+from pricing import apply_discount
+
+def test_apply_discount():
+    assert apply_discount(200, 10) == 180
+```
+<!-- src: catalog D17 -->
