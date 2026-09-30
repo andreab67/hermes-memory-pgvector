@@ -113,7 +113,10 @@ logger = logging.getLogger(__name__)
 # Credential-looking fragments that must never round-trip into a tool response
 # (psycopg/libpq errors can echo conninfo verbatim; tool errors flow back to
 # the model and can be persisted durably by conversation capture).
-_CRED_RE = re.compile(r"(password|passfile|sslkey|sslpassword)=\S+", re.IGNORECASE)
+_CRED_RE = re.compile(
+    r"""(password|passfile|sslkey|sslpassword)\s*=\s*('(?:[^'\\]|\\.)*(?:'|$)|"[^"]*(?:"|$)|\S+)""",
+    re.IGNORECASE,
+)
 
 
 def _safe_err(exc: BaseException) -> str:
@@ -354,7 +357,7 @@ def _as_int(value: Any, default: int) -> int:
     """
     try:
         return int(value)
-    except (TypeError, ValueError):
+    except (TypeError, ValueError, OverflowError):
         return int(default)
 
 
@@ -725,7 +728,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         # endpoint.
         try:
             _queue_max = int(self._config.get("write_queue_maxsize", 256))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             _queue_max = int(DEFAULTS["write_queue_maxsize"])
         self._writer = AsyncWriter(self._worker, maxsize=_queue_max)
         # v0.6.0 (M3): a fresh writer means a fresh drain -- clear the flag a
@@ -1105,7 +1108,7 @@ class PgvectorMemoryProvider(MemoryProvider):
         sid = session_id or self._session_id or "default"
         try:
             min_chars = int(self._config.get("turn_min_chars", 40))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             min_chars = int(DEFAULTS["turn_min_chars"])
         policy = self._config.get("conversation_embed_policy", "all")
         psid = self._parent_session_id if self._delegation_enabled else None
@@ -1348,7 +1351,7 @@ class PgvectorMemoryProvider(MemoryProvider):
                 psid = self._parent_session_id if self._delegation_enabled else None
                 try:
                     min_chars = int(self._config.get("turn_min_chars", 40))
-                except (TypeError, ValueError):
+                except (TypeError, ValueError, OverflowError):
                     min_chars = int(DEFAULTS["turn_min_chars"])
                 for msg in messages:
                     role = (msg.get("role") or "").lower()
@@ -1740,7 +1743,7 @@ class PgvectorMemoryProvider(MemoryProvider):
 
         try:
             limit = max(1, min(int(args.get("limit", 5)), 20))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             limit = 5
 
         # Scope resolution: 'current' → my agent_identity; 'all' → no filter;
@@ -1856,7 +1859,7 @@ class PgvectorMemoryProvider(MemoryProvider):
             return tool_error("Missing required arg: query")
         try:
             limit = max(1, min(int(args.get("limit", 5)), 20))
-        except (TypeError, ValueError):
+        except (TypeError, ValueError, OverflowError):
             limit = 5
 
         # Case-folded like stored identities (M7) -- see handle_tool_call().
@@ -2183,7 +2186,8 @@ class PgvectorMemoryProvider(MemoryProvider):
             if config_path.exists():
                 with open(config_path, encoding="utf-8-sig") as fh:
                     existing = yaml.safe_load(fh) or {}
-            existing.setdefault("plugins", {})
+            if existing.get("plugins") is None:  # absent, or an empty `plugins:` key
+                existing["plugins"] = {}
             # Merge, don't replace: `values` only carries keys declared by
             # get_config_schema(), so a wholesale assignment silently deletes
             # hand-edited keys the setup flow did not send (e.g. a YAML-mapping
