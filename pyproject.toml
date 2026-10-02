@@ -90,3 +90,8 @@ exclude = ["tests*"]
 
 [tool.setuptools.package-data]
 hermes_pgvector = ["plugin.yaml", "migrations/*.sql"]
+
+# ai-code-review baseline: rules on top of ruff defaults. CI still runs the
+# narrower "ruff check --select E9,F63,F7,F82 ." gate (no style churn).
+[tool.ruff.lint]
+extend-select = ["B006", "SIM115", "SIM401", "BLE001"]
