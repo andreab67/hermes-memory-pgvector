@@ -1,8 +1,19 @@
 # Releasing
 
-Manual PyPI release checklist for maintainers. There is no automated
-publish step (deliberately — see
-[`docs/release/PLAN-1.0.md`](PLAN-1.0.md): "It never publishes anything").
+Release checklist for maintainers. Publishing is automated: pushing a
+`vX.Y.Z` tag runs `.github/workflows/release.yml`, which verifies the tag
+against `pyproject.toml`, runs the unit tests, builds, runs `twine check`,
+publishes to PyPI via Trusted Publishing (OIDC, no stored token) and creates
+the GitHub Release with the artifacts attached (notes = the CHANGELOG
+section). Steps 1-6 are still done by hand before tagging; steps 7 and 9
+are what the workflow automates (the manual commands remain as a fallback).
+`workflow_dispatch` runs the build and checks only, never publishing.
+
+One-time setup (owner): add a Trusted Publisher at
+<https://pypi.org/manage/project/hermes-memory-pgvector/settings/publishing/>
+with Owner `andreab67`, Repository `hermes-memory-pgvector`, Workflow
+`release.yml`, Environment `pypi`; and create a GitHub Environment named
+`pypi` (optionally with required reviewers) in the repo settings.
 
 ## 1. Version bump
 
@@ -97,12 +108,14 @@ python -m venv /tmp/hpg-testpypi-smoke
 
 ```bash
 git tag -s vX.Y.Z -m "vX.Y.Z"       # signed tag
-git push origin vX.Y.Z
-twine upload dist/*
+git push origin vX.Y.Z              # triggers release.yml -> PyPI + GitHub Release
 ```
 
 - [ ] Tag is signed (`-s`) and pushed.
-- [ ] `twine upload dist/*` (the real index, not TestPyPI) succeeds.
+- [ ] The `Release` workflow run is green (build, publish-pypi,
+      github-release).
+- [ ] Fallback only if the workflow cannot be used:
+      `twine upload dist/*` (the real index, not TestPyPI).
 
 ## 8. Post-release verification (one real host)
 
@@ -121,9 +134,10 @@ hermes memory status        # expect: Provider: pgvector; Status: available
 
 ## 9. GitHub Release object
 
-Tagging does **not** create a GitHub Release — that is a separate object
-with its own release notes, and PyPI's project page links to it. Create it
-manually (or `gh release create vX.Y.Z --notes-file <(awk -v v='X.Y.Z' 'BEGIN{h="## [" v "] "} index($0,h)==1{f=1;next} /^## \[/{f=0} f' CHANGELOG.md)`,
+Tagging alone does **not** create a GitHub Release — that is a separate
+object with its own release notes, and PyPI's project page links to it. The
+`github-release` job of `release.yml` creates it from the pushed tag. If you
+have to do it by hand, create it (or `gh release create vX.Y.Z --notes-file <(awk -v v='X.Y.Z' 'BEGIN{h="## [" v "] "} index($0,h)==1{f=1;next} /^## \[/{f=0} f' CHANGELOG.md)`,
 which prints only that version's section body), pointing at the pushed tag.
 
 - [ ] GitHub Release created, notes match the CHANGELOG entry.
