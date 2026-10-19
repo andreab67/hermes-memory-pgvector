@@ -1,0 +1,107 @@
+name: Release
+
+# Tag-triggered release: build + verify, publish to PyPI via Trusted
+# Publishing (OIDC, no stored token), then create the GitHub Release.
+# workflow_dispatch runs the build + checks only (dry run, nothing published).
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build (verify tag, test, sdist/wheel, twine check)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Verify tag matches pyproject version
+        if: github.event_name == 'push'
+        run: |
+          python - <<'PY'
+          import os, sys, tomllib
+          with open("pyproject.toml", "rb") as f:
+              version = tomllib.load(f)["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          expected = tag[1:] if tag.startswith("v") else tag
+          print(f"tag={tag} pyproject version={version}")
+          if version != expected:
+              sys.exit(f"tag {tag} does not match pyproject version {version}")
+          PY
+      - name: Install package + test deps + build tooling
+        run: pip install -e ".[test]" "build>=1,<2" "twine>=5,<7"
+      - name: pytest (DB-gated tests skip; the fake-embed-server tests still run)
+        run: pytest -q
+      - name: python -m build
+        run: python -m build
+      - name: twine check dist/*
+        run: twine check dist/*
+      - name: Upload dist/
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish-pypi:
+    name: publish to PyPI (Trusted Publishing)
+    needs: build
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    environment:
+      name: pypi
+      url: https://pypi.org/p/hermes-memory-pgvector
+    permissions:
+      id-token: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - uses: pypa/gh-action-pypi-publish@release/v1
+
+  github-release:
+    name: GitHub Release
+    needs: publish-pypi
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      # Checkout only for CHANGELOG.md (notes source).
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist/
+      - name: Create release with dist/* attached
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          # Release notes = this version's CHANGELOG section body (same awk as
+          # docs/release/RELEASING.md step 9); fall back to generated notes.
+          awk -v v="$version" 'BEGIN{h="## [" v "] "} index($0,h)==1{f=1;next} /^## \[/{f=0} f' CHANGELOG.md > "$RUNNER_TEMP/notes.md"
+          if [ -s "$RUNNER_TEMP/notes.md" ]; then
+            notes=(--notes-file "$RUNNER_TEMP/notes.md")
+          else
+            notes=(--generate-notes)
+          fi
+          # Pre-release tags (1.0.0rc1, 1.1.0b2, ...) are flagged as such.
+          flags=()
+          if [[ ! "$version" =~ ^[0-9]+(\.[0-9]+)*$ ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$GITHUB_REF_NAME" dist/* \
+            --verify-tag --title "$GITHUB_REF_NAME" "${notes[@]}" "${flags[@]}"

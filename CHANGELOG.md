@@ -10,6 +10,16 @@ commands/flags/exit codes, table/column names, the `pgvector` provider name,
 and the package entry point — `MemoryStore` and every internal module are
 not).
 
+## [Unreleased]
+
+### Changed
+
+- CI: tag-triggered PyPI release via Trusted Publishing
+  (`.github/workflows/release.yml`). Pushing a `vX.Y.Z` tag builds and tests
+  the package, publishes it to PyPI over OIDC (no stored token), and creates
+  the GitHub Release with the built artifacts attached. See
+  [`docs/release/RELEASING.md`](docs/release/RELEASING.md).
+
 ## [1.0.0] - 2026-09-28
 
 First stable release. Declares the compatibility policy stable: the public
