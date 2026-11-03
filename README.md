@@ -1,5 +1,7 @@
 # hermes-memory-pgvector
 
+Current version: **1.0.2**.
+
 **Postgres + pgvector memory provider for [hermes-agent](https://github.com/NousResearch/hermes-agent).** A shared memory substrate for a fleet of cooperating hermes-agent minions — built on Postgres and a single embedding endpoint you probably already run, with no LLM in the memory hot path.
 
 ```text
@@ -163,7 +165,7 @@ Tested in CI on every push/PR:
 
 ```bash
 pip install -e ".[test]"
-pytest -q                                    # no DB/embed endpoint: everything skips gracefully
+pytest -q                                    # offline tests run; live DB tests skip
 
 # Live mode (against a throwaway Postgres + your embed endpoint)
 export PG_TEST_DSN='dbname=hermes_test user=postgres host=/var/run/postgresql'
@@ -182,6 +184,17 @@ scripts/test-env.sh up pg17
 eval "$(scripts/test-env.sh db hermes_test)"
 pytest -q
 ```
+
+Coverage includes every runtime module and both statement and branch outcomes.
+Live CI enforces a 99.5% combined floor and rejects skipped tests. Run locally
+with `pytest tests/ --cov --cov-report=term-missing --cov-report=xml -q` after
+starting the harness. See [CONTRIBUTING.md](CONTRIBUTING.md) for enforced
+Ruff rules, local hooks, and test/review requirements.
+
+Release wheels and source archives are published through PyPI Trusted
+Publishing with PEP 740 attestations; GitHub artifacts also carry build
+provenance. The [release checklist](docs/release/RELEASING.md) explains how to
+verify them. Files published before 1.0.2 retain their original provenance.
 
 ## Rollback
 

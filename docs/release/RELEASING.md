@@ -2,12 +2,20 @@
 
 Release checklist for maintainers. Publishing is automated: pushing a
 `vX.Y.Z` tag runs `.github/workflows/release.yml`, which verifies the tag
-against `pyproject.toml`, runs the unit tests, builds, runs `twine check`,
+against `pyproject.toml`, runs the complete reusable CI suite (including
+zero-skip live PostgreSQL tests, 99.5% branch-aware coverage, lint and upstream
+conformance), builds, runs `twine check` and `scripts/check_dist.py`,
 publishes to PyPI via Trusted Publishing (OIDC, no stored token) and creates
 the GitHub Release with the artifacts attached (notes = the CHANGELOG
 section). Steps 1-6 are still done by hand before tagging; steps 7 and 9
 are what the workflow automates (the manual commands remain as a fallback).
-`workflow_dispatch` runs the build and checks only, never publishing.
+`workflow_dispatch` runs the checks and build only, never publishing.
+Every external action is pinned by commit and Dependabot proposes updates.
+
+The build job generates GitHub build provenance for both distributions.
+The separate publish job has `id-token: write`, no repository checkout or
+stored PyPI password, and explicitly enables PEP 740 publish attestations.
+The exact archives built and verified are passed between jobs as one artifact.
 
 One-time setup (owner): add a Trusted Publisher at
 <https://pypi.org/manage/project/hermes-memory-pgvector/settings/publishing/>
@@ -15,12 +23,24 @@ with Owner `andreab67`, Repository `hermes-memory-pgvector`, Workflow
 `release.yml`, Environment `pypi`; and create a GitHub Environment named
 `pypi` (optionally with required reviewers) in the repo settings.
 
+The workflow filename and environment name must match the Trusted Publisher
+exactly. An `invalid-publisher` failure means no configured publisher matched
+those claims; fix the publisher, then rerun the failed job. Do not substitute a
+token upload: that would lose the publish provenance this workflow guarantees.
+
+PyPI attaches attestations at upload time. Existing files cannot gain
+attestations retroactively and deleting them does not free their filenames.
+Publish a new version instead; leave older versions available to consumers.
+See [PyPI's upload policy](https://docs.pypi.org/publishing/troubleshooting/)
+and [attestation documentation](https://docs.pypi.org/attestations/producing-attestations/).
+
 ## 1. Version bump
 
 - [ ] `pyproject.toml`: `[project].version`
 - [ ] `hermes_pgvector/plugin.yaml`: `version:`
+- [ ] README.md and ROADMAP.md: `Current version` marker
 - [ ] Both must match exactly. Verify: `python scripts/check_versions.py`
-      (also checks the dependency pins across `pyproject.toml`,
+      (also checks README/ROADMAP version markers and dependency pins across `pyproject.toml`,
       `plugin.yaml`, README's "Option 3: manual" block, and
       `scripts/install.sh` are all in sync).
 
@@ -54,6 +74,7 @@ pip install -e ".[dev]"        # build, twine, ruff
 rm -rf dist/ build/ *.egg-info
 python -m build
 twine check dist/*
+python scripts/check_dist.py
 ```
 
 - [ ] `twine check dist/*` passes (valid long-description / metadata).
@@ -120,8 +141,8 @@ git push origin vX.Y.Z              # triggers release.yml -> PyPI + GitHub Rele
 - [ ] Tag is signed (`-s`) and pushed.
 - [ ] The `Release` workflow run is green (build, publish-pypi,
       github-release).
-- [ ] Fallback only if the workflow cannot be used:
-      `twine upload dist/*` (the real index, not TestPyPI).
+- [ ] Both distributions show provenance on PyPI. Do not bypass the workflow
+      with a token upload if publication fails.
 
 ## 8. Post-release verification (one real host)
 
@@ -147,6 +168,18 @@ have to do it by hand, create it (or `gh release create vX.Y.Z --notes-file <(aw
 which prints only that version's section body), pointing at the pushed tag.
 
 - [ ] GitHub Release created, notes match the CHANGELOG entry.
+- [ ] Download the two published files and verify their build provenance:
+
+```bash
+gh release download vX.Y.Z --repo andreab67/hermes-memory-pgvector --dir /tmp/hpg-verify
+gh attestation verify /tmp/hpg-verify/hermes_memory_pgvector-X.Y.Z.tar.gz --repo andreab67/hermes-memory-pgvector
+gh attestation verify /tmp/hpg-verify/hermes_memory_pgvector-X.Y.Z-py3-none-any.whl --repo andreab67/hermes-memory-pgvector
+```
+
+- [ ] On PyPI, open each file's details and check the attestation names
+      `andreab67/hermes-memory-pgvector`, `release.yml` and the released commit.
+      The [Integrity API](https://docs.pypi.org/api/integrity/) exposes the
+      same provenance at `/integrity/hermes-memory-pgvector/X.Y.Z/FILENAME/provenance`.
 
 ## 10. Downstream bump (reminder only)
 

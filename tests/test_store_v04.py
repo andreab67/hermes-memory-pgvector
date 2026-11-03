@@ -19,7 +19,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from hermes_pgvector.store import MemoryStore  # noqa: E402
 # Per-test throwaway database for tests that act on whole tables.
-from test_v060_migrations_cli import scratch_db, scratch_store  # noqa: E402,F401
+pytest_plugins = ["test_v060_migrations_cli"]
 
 
 @pytest.fixture

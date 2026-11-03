@@ -114,6 +114,30 @@ def test_require_bearer_401_without_200_with(fake_embed_server):
     assert status_ok == 200
 
 
+def test_auth_rejection_consumes_post_body_before_responding(fake_embed_server, monkeypatch):
+    """Unread POST bytes must not reset the connection and discard the 401."""
+    import fake_embed_server as server_module
+
+    consumed = []
+    read_body = server_module._Handler._read_body
+
+    def record_body(handler):
+        body = read_body(handler)
+        consumed.append(body)
+        return body
+
+    monkeypatch.setattr(server_module._Handler, "_read_body", record_body)
+    url = fake_embed_server(dim=8, require_bearer="expected")
+    payload = {"input": "long unauthorized body " * 4000}
+    status, body = _post(
+        f"{url}/v1/embeddings", payload,
+        headers={"Authorization": "Bearer incorrect"},
+    )
+    assert status == 401
+    assert body == {"error": "missing or invalid bearer token"}
+    assert consumed == [payload]
+
+
 def test_delay_is_respected(fake_embed_server):
     url = fake_embed_server(delay=0.3)
     started = time.monotonic()

@@ -119,6 +119,10 @@ class _Handler(BaseHTTPRequestHandler):
 
     def do_POST(self):  # noqa: N802 -- stdlib naming
         cfg = self._config()
+        # Consume the request before an early rejection. Closing an HTTP/1.0
+        # socket with unread POST bytes can send a TCP reset on Windows,
+        # discarding the 401 response before the client can read it.
+        body = self._read_body()
 
         require_bearer = cfg.get("require_bearer")
         if require_bearer:
@@ -131,7 +135,6 @@ class _Handler(BaseHTTPRequestHandler):
         if delay > 0:
             time.sleep(delay)
 
-        body = self._read_body()
         raw_input = body.get("input")
         if raw_input is None:
             self._send_json(400, {"error": "missing 'input'"})
