@@ -39,7 +39,7 @@ def main() -> int:
         return 2
     try:
         import psycopg
-        import hermes_pgvector
+        import hermes_pgvector  # noqa: F401 — verify optional dependency availability
     except ImportError as exc:
         print(f"missing dependency: {exc}", file=sys.stderr)
         return 2

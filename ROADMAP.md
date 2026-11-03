@@ -1,5 +1,7 @@
 # pgvector — Roadmap
 
+Current version: **1.0.2**.
+
 A versioned plan for evolving the plugin from "Postgres storage for a single agent" to "shared memory substrate for a fleet of cooperating hermes-agent minions." The driving constraint throughout is **deliver multi-agent memory on the resources you already have** — your existing Postgres, a single embedding endpoint, no LLM costs in the memory hot path, no third-party services.
 
 The plugin is built around a clear separation of concerns:
@@ -199,6 +201,21 @@ Identities are now case-folded: `Marketing` and `marketing` resolve to the same 
 |---|---|
 | `normalize_identity()` lowercases after strip; alias keys and allow-list entries compared lowercased | v0.6.0 |
 | Raw (pre-normalization) value still recorded as `raw_identity` metadata when it differs | v0.6.0 |
+
+---
+
+### Quality and release integrity (v1.0.2) — DONE
+
+Enforced Ruff rules, local hooks, branch-aware coverage with a 99.5% live CI
+floor, and zero skipped live tests protect the shared memory substrate.
+Behavioral tests cover outages, queue failures, identity isolation, CLI
+maintenance and protocol errors. Releases run every CI check, verify archive
+contents against source, and publish with PyPI attestations and GitHub build
+provenance. See [CONTRIBUTING.md](CONTRIBUTING.md) and the
+[release checklist](docs/release/RELEASING.md).
+
+These controls help cooperating agents rely on isolated, fail-soft storage as
+the code evolves. No schema change or new agent tools are involved.
 
 ---
 

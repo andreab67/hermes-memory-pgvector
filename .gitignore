@@ -19,6 +19,10 @@ env/
 .mypy_cache/
 .ruff_cache/
 .coverage
+.coverage.*
+coverage.xml
+coverage.json
+pytest-*.xml
 htmlcov/
 
 # Local secrets / env

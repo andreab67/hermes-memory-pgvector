@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "hermes-memory-pgvector"
-version = "1.0.1"
+version = "1.0.2"
 description = "Postgres + pgvector memory provider plugin for hermes-agent. Multi-agent storage layer with per-minion themes, identity governance, agent attribution + delegation provenance, async writer, no LLM in the memory hot path."
 readme = "README.md"
 requires-python = ">=3.11"
@@ -47,6 +47,7 @@ dependencies = [
 [project.optional-dependencies]
 test = [
     "pytest>=7.4,<9",
+    "pytest-cov>=5,<8",
 ]
 
 # Release/CI tooling only (build the sdist/wheel, verify it, lint). Not
@@ -55,7 +56,8 @@ test = [
 dev = [
     "build>=1,<2",
     "twine>=5,<7",
-    "ruff>=0.5,<1",
+    "ruff>=0.17.3,<0.18",
+    "pre-commit>=4,<5",
 ]
 
 # Operator maintenance CLI (migrate / backfill / prune / stats / cleanup / remap).
@@ -91,7 +93,25 @@ exclude = ["tests*"]
 [tool.setuptools.package-data]
 hermes_pgvector = ["plugin.yaml", "migrations/*.sql"]
 
-# ai-code-review baseline: rules on top of ruff defaults. CI still runs the
-# narrower "ruff check --select E9,F63,F7,F82 ." gate (no style churn).
+[tool.ruff]
+target-version = "py311"
+
+# Keep this selection explicit: local runs, hooks and CI enforce the same
+# bug-prevention rules. Fail-soft exception boundaries use local BLE001
+# suppressions; never disable the rule for an entire module.
 [tool.ruff.lint]
-extend-select = ["B006", "SIM115", "SIM401", "BLE001"]
+select = ["E4", "E7", "E9", "F", "B", "BLE001", "SIM115", "SIM401"]
+
+[tool.coverage.run]
+source = ["hermes_pgvector"]
+branch = true
+
+[tool.coverage.report]
+precision = 2
+show_missing = true
+# Enforced by the live job. Offline runs legitimately skip PostgreSQL paths.
+fail_under = 99.5
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "--strict-config --strict-markers"

@@ -4,7 +4,7 @@
 Exits 0 iff:
 
 1. `pyproject.toml`'s `[project].version` equals `hermes_pgvector/plugin.yaml`'s
-   `version:`.
+   `version:` and the Current version markers in README.md and ROADMAP.md.
 2. The runtime dependency pins in `pyproject.toml`'s `[project].dependencies`
    match, as a SET (order-independent), the pins in:
      - `plugin.yaml`'s `pip_dependencies:`
@@ -31,6 +31,7 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO_ROOT / "pyproject.toml"
 PLUGIN_YAML = REPO_ROOT / "hermes_pgvector" / "plugin.yaml"
 README = REPO_ROOT / "README.md"
+ROADMAP = REPO_ROOT / "ROADMAP.md"
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
 # name[extras] followed by a version specifier, e.g. psycopg[binary]>=3.3.7,<4
@@ -145,6 +146,20 @@ def main() -> int:
         ok = False
     else:
         print(f"version OK: {pyproject_version}")
+
+    for document in (README, ROADMAP):
+        try:
+            markers = re.findall(
+                r"^Current version: \*\*([^\s*]+)\*\*\.$",
+                document.read_text(encoding="utf-8"),
+                flags=re.MULTILINE,
+            )
+        except OSError as exc:
+            print(f"error reading {document}: {exc}", file=sys.stderr)
+            return 1
+        if markers != [pyproject_version]:
+            print(f"MISMATCH: {document.name} current version {markers!r}; expected {pyproject_version!r}")
+            ok = False
 
     pyproject_set = as_req_set(pyproject_deps)
 

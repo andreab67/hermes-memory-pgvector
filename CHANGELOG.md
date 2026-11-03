@@ -12,6 +12,30 @@ not).
 
 ## [Unreleased]
 
+## [1.0.2] - 2026-11-03
+
+### Fixed
+
+- Memory write hooks log and degrade if writer thread scheduling fails;
+  database pool construction failures leave the provider unavailable instead
+  of escaping initialization into the agent loop.
+- The test embedding server reads rejected POST bodies before closing the
+  connection, avoiding Windows TCP resets that hid HTTP authentication errors.
+
+### Changed
+
+- Enforce the repository Ruff bug-prevention rules in CI and local hooks;
+  document architecture and test requirements in CONTRIBUTING.md.
+- Measure all runtime code with statement and branch coverage. Live CI runs
+  with zero skips and a 99.5% combined coverage floor. Add behavioral tests for
+  hook failures, store maintenance/races, CLI operations, HTTP errors, writer
+  lifecycle and host integration.
+- Releases depend on the complete CI suite, validate wheel/sdist contents
+  against source, and require README/ROADMAP/package/plugin version agreement.
+- Pin GitHub Actions by commit, automate dependency update proposals, explicitly
+  enable PyPI publish attestations and generate GitHub build provenance for
+  both archives. Existing 1.0.1 files remain unchanged.
+
 ## [1.0.1] - 2026-11-03
 
 ### Changed

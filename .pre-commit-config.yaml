@@ -1,0 +1,20 @@
+repos:
+  - repo: local
+    hooks:
+      - id: ruff
+        name: Ruff repository rules
+        entry: python -m ruff check
+        language: system
+        types: [python]
+      - id: versions
+        name: Version and dependency agreement
+        entry: python scripts/check_versions.py
+        language: system
+        pass_filenames: false
+        always_run: true
+      - id: config-docs
+        name: Configuration documentation agreement
+        entry: python scripts/gen_config_doc.py --check
+        language: system
+        pass_filenames: false
+        always_run: true

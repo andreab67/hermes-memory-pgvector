@@ -706,8 +706,8 @@ class PgvectorMemoryProvider(MemoryProvider):
         if self._store is not None or self._writer is not None:
             self.shutdown()
 
-        self._store = MemoryStore(self._config["dsn"])
         try:
+            self._store = MemoryStore(self._config["dsn"])
             # Schema is verify-only at runtime — admin applies the
             # migration out-of-band (see plugin README install step).
             self._store.ensure_schema()
@@ -1472,14 +1472,17 @@ class PgvectorMemoryProvider(MemoryProvider):
         if isinstance(previous_content, str) and previous_content.strip():
             extra["previous_content"] = previous_content
 
-        self._writer.enqueue(
-            action=action,
-            agent_identity=self._agent_identity,
-            target=target,
-            content=content,
-            extra=extra,
-            metadata=meta,
-        )
+        try:
+            self._writer.enqueue(
+                action=action,
+                agent_identity=self._agent_identity,
+                target=target,
+                content=content,
+                extra=extra,
+                metadata=meta,
+            )
+        except Exception as exc:  # noqa: BLE001 — host hook must remain fail-soft
+            logger.warning("pgvector memory write enqueue failed: %s", exc)
 
     def _worker(self, item: "_PendingWrite") -> None:
         """Drain-thread worker: embed + DB write for a single queued item.
