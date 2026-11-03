@@ -12,8 +12,13 @@ not).
 
 ## [Unreleased]
 
+## [1.0.1] - 2026-11-03
+
 ### Changed
 
+- Raise the psycopg dependency floor from 3.3.6 to 3.3.7 across the package
+  metadata, plugin declaration and clone-install path. No public API, schema
+  or migration changes.
 - CI: tag-triggered PyPI release via Trusted Publishing
   (`.github/workflows/release.yml`). Pushing a `vX.Y.Z` tag builds and tests
   the package, publishes it to PyPI over OIDC (no stored token), and creates

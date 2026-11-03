@@ -90,8 +90,14 @@ python -m venv /tmp/hpg-release-smoke
 - [ ] `migrate` applies cleanly against a fresh database.
 - [ ] `stats` runs without error.
 
-## 6. TestPyPI rehearsal (recommended before the first release of a minor,
-      required before any release that touched packaging/`pyproject.toml`)
+## 6. TestPyPI rehearsal
+
+Use TestPyPI before changing the build backend, package discovery, artifact
+contents, or publishing configuration. For a patch that only changes the
+version or dependency bounds, the build, metadata validation, clean-wheel
+installation and fresh-database smoke tests in steps 4-5 are sufficient;
+TestPyPI is optional. The tag-triggered release workflow still runs its
+tests and artifact checks before publishing.
 
 ```bash
 twine upload --repository testpypi dist/*
