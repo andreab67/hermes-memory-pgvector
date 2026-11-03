@@ -33,12 +33,12 @@ PLUGIN_YAML = REPO_ROOT / "hermes_pgvector" / "plugin.yaml"
 README = REPO_ROOT / "README.md"
 INSTALL_SH = REPO_ROOT / "scripts" / "install.sh"
 
-# name[extras] followed by a version specifier, e.g. psycopg[binary]>=3.3.6,<4
+# name[extras] followed by a version specifier, e.g. psycopg[binary]>=3.3.7,<4
 _REQ_RE = re.compile(r"^([A-Za-z0-9_.-]+(?:\[[^\]]*\])?)\s*(.*)$")
 
 
 def normalize_requirement(req: str) -> Tuple[str, str]:
-    """('psycopg[binary]>=3.3.6,<4') -> ('psycopg[binary]', '>=3.3.6,<4')
+    """('psycopg[binary]>=3.3.7,<4') -> ('psycopg[binary]', '>=3.3.7,<4')
 
     Name is lowercased (PyYAML == pyyaml); the specifier is compared verbatim
     (with whitespace stripped) because the whole point of this check is that

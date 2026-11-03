@@ -77,7 +77,7 @@ Installs the pinned Python deps, copies `hermes_pgvector/` into `$HERMES_HOME/pl
 
 ```bash
 # Python deps
-pip install 'psycopg[binary]>=3.3.6,<4' 'psycopg-pool>=3.3.3,<4' 'PyYAML>=6.0,<7'
+pip install 'psycopg[binary]>=3.3.7,<4' 'psycopg-pool>=3.3.3,<4' 'PyYAML>=6.0,<7'
 
 # Plugin module
 mkdir -p ~/.hermes/plugins
