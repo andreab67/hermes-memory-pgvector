@@ -12,6 +12,20 @@ not).
 
 ## [Unreleased]
 
+## [1.0.3] - 2026-11-04
+
+### Changed
+
+- Raise the psycopg dependency floor from 3.3.7 to 3.3.8 across the package
+  metadata, plugin declaration and clone-install path. psycopg 3.3.8 stops the
+  Linux and macOS binary packages from using `/etc/ssl` as their SSL directory,
+  which loaded the system `openssl.cnf` and could break connections, for
+  instance on FIPS-enabled systems (upstream #1476), and fixes the size of the
+  Linux x86_64 binary packages (upstream #1477). No public API, schema or
+  migration changes.
+- CI: update the pinned GitHub Actions and allow pytest 9 and twine 7 in the
+  development dependencies.
+
 ## [1.0.2] - 2026-11-03
 
 ### Fixed
