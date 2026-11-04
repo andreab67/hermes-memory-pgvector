@@ -49,7 +49,7 @@ jobs:
               sys.exit(f"tag {tag} does not match pyproject version {version}")
           PY
       - name: Install package + test deps + build tooling
-        run: pip install -e ".[test]" "build>=1,<2" "twine>=5,<7"
+        run: pip install -e ".[test]" "build>=1,<2" "twine>=5,<8"
       - name: Verify version and dependency agreement
         run: python scripts/check_versions.py
       - name: pytest (DB-gated tests skip; the fake-embed-server tests still run)

@@ -165,7 +165,7 @@ jobs:
         with:
           python-version: "3.12"
       - name: Install build + twine
-        run: pip install "build>=1,<2" "twine>=5,<7"
+        run: pip install "build>=1,<2" "twine>=5,<8"
       - name: python -m build
         run: python -m build
       - name: twine check dist/*
