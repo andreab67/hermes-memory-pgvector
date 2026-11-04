@@ -55,7 +55,7 @@ test = [
 # -e ".[test]"` (the `unit` CI job) stays minimal.
 dev = [
     "build>=1,<2",
-    "twine>=5,<7",
+    "twine>=5,<8",
     "ruff>=0.17.3,<0.18",
     "pre-commit>=4,<5",
 ]
