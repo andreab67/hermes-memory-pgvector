@@ -34,7 +34,7 @@ echo
 echo "==> Installing Python dependencies..."
 PIP="${PIP:-pip}"
 "$PIP" install \
-    'psycopg[binary]>=3.3.7,<4' \
+    'psycopg[binary]>=3.3.8,<4' \
     'psycopg-pool>=3.3.3,<4' \
     'PyYAML>=6.0,<7'
 

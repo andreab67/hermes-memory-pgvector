@@ -1,6 +1,6 @@
 # pgvector — Roadmap
 
-Current version: **1.0.2**.
+Current version: **1.0.3**.
 
 A versioned plan for evolving the plugin from "Postgres storage for a single agent" to "shared memory substrate for a fleet of cooperating hermes-agent minions." The driving constraint throughout is **deliver multi-agent memory on the resources you already have** — your existing Postgres, a single embedding endpoint, no LLM costs in the memory hot path, no third-party services.
 

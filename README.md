@@ -1,6 +1,6 @@
 # hermes-memory-pgvector
 
-Current version: **1.0.2**.
+Current version: **1.0.3**.
 
 **Postgres + pgvector memory provider for [hermes-agent](https://github.com/NousResearch/hermes-agent).** A shared memory substrate for a fleet of cooperating hermes-agent minions — built on Postgres and a single embedding endpoint you probably already run, with no LLM in the memory hot path.
 
@@ -79,7 +79,7 @@ Installs the pinned Python deps, copies `hermes_pgvector/` into `$HERMES_HOME/pl
 
 ```bash
 # Python deps
-pip install 'psycopg[binary]>=3.3.7,<4' 'psycopg-pool>=3.3.3,<4' 'PyYAML>=6.0,<7'
+pip install 'psycopg[binary]>=3.3.8,<4' 'psycopg-pool>=3.3.3,<4' 'PyYAML>=6.0,<7'
 
 # Plugin module
 mkdir -p ~/.hermes/plugins
