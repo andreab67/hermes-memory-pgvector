@@ -12,6 +12,20 @@ not).
 
 ## [Unreleased]
 
+## [1.0.4] - 2026-11-12
+
+### Changed
+
+- Raise the runtime `psycopg[binary]` minimum to 3.3.9 across package metadata,
+  the plugin manifest, the source installer and the manual installation guide.
+  `psycopg-pool` keeps its independently versioned minimum of 3.3.3.
+
+### Upgrade notes
+
+- Install `hermes-memory-pgvector==1.0.4` from PyPI and restart the services
+  that load the provider. No database schema migration or configuration change
+  is required for this patch release.
+
 ## [1.0.3] - 2026-11-04
 
 ### Changed
